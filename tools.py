@@ -10,7 +10,7 @@ from skills import SkillStore
 
 
 class ToolRegistry:
-    """Tool registry and dispatcher with JSON schema support."""
+    """Tool registry and dispatcher with schema support."""
 
     def __init__(self):
         self._tools: Dict[str, Callable] = {}
@@ -36,6 +36,10 @@ class ToolRegistry:
 
     def execute(self, name: str, arguments: Dict[str, Any]) -> str:
         if name not in self._tools:
+            # Check if the model called a skill directly by its name
+            skill_file = skill_store.resolve_skill_file(name)
+            if skill_file:
+                return skill_store.load_skill(name)
             return f"Error: Tool '{name}' not found."
         try:
             result = self._tools[name](**arguments)
@@ -76,7 +80,7 @@ skill_store = SkillStore()
     }
 )
 def run_terminal_command(command: str, timeout: int = 60) -> str:
-    return terminal_session.execute(command=command, timeout=timeout)
+    return terminal_session.execute(command, timeout=timeout)
 
 
 @registry.register(
@@ -159,34 +163,33 @@ def patch_file(file_path: str, search_content: str, replace_content: str) -> str
             content = f.read()
 
         if search_content not in content:
-            return f"Error: Target search string not found in '{file_path}'."
+            return f"Error: search_content string not found in '{file_path}'."
 
-        count = content.count(search_content)
-        if count > 1:
-            return f"Error: Target search string occurs {count} times. Please provide more surrounding context."
+        occurrences = content.count(search_content)
+        if occurrences > 1:
+            return f"Error: search_content matched {occurrences} times. Provide more surrounding context."
 
         new_content = content.replace(search_content, replace_content, 1)
         with open(resolved_path, "w", encoding="utf-8") as f:
             f.write(new_content)
 
-        return f"Successfully patched '{file_path}' (1 substitution made)."
+        return f"Successfully patched '{file_path}'."
     except Exception as e:
         return f"Error patching file '{file_path}': {str(e)}"
 
 
 @registry.register(
     name="list_directory",
-    description="List files and directories in a target directory.",
+    description="List contents of a directory (files, folders, sizes).",
     parameters={
         "type": "object",
         "properties": {
             "directory_path": {
                 "type": "string",
-                "description": "Path to directory (default: current working directory).",
+                "description": "Path of the directory to list (default: current working directory).",
                 "default": "."
             }
-        },
-        "required": []
+        }
     }
 )
 def list_directory(directory_path: str = ".") -> str:
@@ -227,11 +230,11 @@ def save_skill(name: str, description: str, instructions: str) -> str:
 
 @registry.register(
     name="load_skill",
-    description="Load instructions and workflow details for a specific learned skill.",
+    description="Load instructions and workflow details for a specific learned skill from the repository.",
     parameters={
         "type": "object",
         "properties": {
-            "name": {"type": "string", "description": "The name of the skill to load."}
+            "name": {"type": "string", "description": "The name of the skill to load (e.g. 'git_squash' or 'git_squash.md')."}
         },
         "required": ["name"]
     }

@@ -262,7 +262,24 @@ Fix NoneType bug in main.py.
         self.assertIn("fastapi_endpoint_pattern", injected_turns[0]["content"])
         self.assertIn("from fastapi import APIRouter", injected_turns[0]["content"])
 
+    def test_direct_skill_name_as_tool_call(self):
+        from tools import registry as reg, skill_store as global_store
+        global_store.save_skill(
+            name="git_squash_commits",
+            description="Rebase commits",
+            instructions="git rebase -i HEAD~3"
+        )
+
+        # Model calls the skill name directly as a tool: [Tool request]: git_squash_commits Arguments: {}
+        result = reg.execute("git_squash_commits", {})
+        self.assertIn("=== SKILL: git_squash_commits ===", result)
+        self.assertIn("git rebase -i HEAD~3", result)
+        self.assertNotIn("Error: Tool", result)
+
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
 

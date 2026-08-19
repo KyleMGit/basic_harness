@@ -27,9 +27,9 @@ class ToolProtocol:
             f"# Tool Definitions\n"
             f"You have access to the following tools:\n"
             f"<tools>\n{tools_json}\n</tools>\n\n"
-            f"To call a tool, respond with an XML block in this format:\n"
+            f"To call a tool, respond with an XML block specifying the exact tool name from <tools>, for example:\n"
             f"<tool_call>\n"
-            f'{{"name": "tool_name", "arguments": {{"arg_name": "value"}}}}\n'
+            f'{{"name": "read_file", "arguments": {{"file_path": "README.md"}}}}\n'
             f"</tool_call>\n"
         )
 
@@ -59,7 +59,7 @@ class ToolProtocol:
                 })
             return content, tool_calls
 
-        # 2. Hermes XML parsing from text
+        # 2. Hermes XML parsing from text (<tool_call>...</tool_call>)
         if content:
             matches = list(cls.HERMES_TOOL_CALL_REGEX.finditer(content))
             if matches:
@@ -72,14 +72,15 @@ class ToolProtocol:
                         args = parsed.get("arguments", {})
                         if isinstance(args, str):
                             args = json.loads(args)
-                        tool_calls.append({
-                            "id": f"hermes_call_{idx}",
-                            "name": fn_name,
-                            "arguments": args
-                        })
+                        if fn_name:
+                            tool_calls.append({
+                                "id": f"hermes_call_{idx}",
+                                "name": fn_name,
+                                "arguments": args
+                            })
                     except Exception:
                         pass
-                # Strip tool call tags from clean thought text
+                
                 clean_text = cls.HERMES_TOOL_CALL_REGEX.sub("", content).strip()
                 return clean_text, tool_calls
 

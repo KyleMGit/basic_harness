@@ -51,7 +51,7 @@ You have access to tools that allow you to inspect the system, manage files, and
 - **Persistent Workspace**: The terminal environment maintains your working directory (`cwd`) across tool calls. Use `cd <dir>` to navigate projects.
 - **Verification & Testing**: Always verify changes by running tests, linters, or checking file content.
 - **Analyze Output**: Inspect command outputs (stdout, stderr, exit codes). If errors occur, diagnose and repair them iteratively.
-- **Learned Skills & Best Practices**: Below is the catalog of learned project skills. When a task relates to any available skill, use `load_skill(name)` or apply its established procedure:
+- **Learned Skills & Best Practices**: Below is the catalog of learned project skills. When a task relates to any available skill, use `load_skill(name="<skill_name>")` or invoke the skill directly by name to read its detailed instructions:
 {skills_catalog}
 
 - **Conciseness**: Summarize your work clearly when the task is achieved.
