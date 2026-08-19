@@ -3,14 +3,17 @@ Hermes-Refined Coding Agent Harness.
 An open, persistent, multi-protocol coding agent harness in Python.
 
 Key Features:
-1. Automatic Skill Synthesis & Writing (Self-Improvement Loop).
-2. Two-Phase Context Compaction & Summarization (Tool Pruning + LLM Summarization).
-3. Interactive User Prompt for Every Terminal Command (approve, edit, reject, feedback).
-4. Stateful Terminal Execution (persistent cwd, cd management, output clipping).
-5. Dual Protocol Tool Calling (OpenAI JSON API & Hermes XML <tool_call> syntax).
-6. SQLite Trajectory Logging & Export.
+1. Local Model Support without API Keys (Qwen-32b, Ollama, vLLM, LM Studio, llama.cpp).
+2. CLI and Interactive Model / Base URL Selection.
+3. Automatic Skill Synthesis & Writing (Self-Improvement Loop).
+4. Production-Grade Context Checkpoint Compaction & Summarization.
+5. Interactive User Prompt for Every Terminal Command (approve, edit, reject, feedback).
+6. Stateful Terminal Execution (persistent cwd, cd management, output clipping).
+7. Dual Protocol Tool Calling (OpenAI JSON API & Hermes XML <tool_call> syntax).
+8. SQLite Trajectory Logging & Export.
 """
 
+import argparse
 import json
 import os
 import sys
@@ -35,7 +38,7 @@ class HermesCodingAgent:
     Stateful, autonomous coding agent harness supporting both
     OpenAI structured tool calling and Hermes XML function calling protocols,
     with interactive human-in-the-loop confirmation for every system command,
-    automated context compaction/summarization, and automatic skill learning.
+    automated context compaction/summarization, and local model support (Qwen-32b, etc.).
     """
 
     SYSTEM_PROMPT = """You are an autonomous AI software engineer and terminal agent.
@@ -53,7 +56,7 @@ You have access to tools that allow you to inspect the system, manage files, and
 
     def __init__(
         self,
-        model: str = "gpt-4o",
+        model: str = "Qwen-32b",
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         max_iterations: int = 30,
@@ -63,15 +66,20 @@ You have access to tools that allow you to inspect the system, manage files, and
         auto_learn_skills: bool = True,
         use_hermes_xml_protocol: bool = False,
     ):
-        self.model = model
+        self.model = model or "Qwen-32b"
         self.max_iterations = max_iterations
         self.confirm_all_terminal_commands = confirm_all_terminal_commands
         self.auto_learn_skills = auto_learn_skills
         self.use_hermes_xml_protocol = use_hermes_xml_protocol
         
+        # Local models running on Ollama/vLLM/LMStudio do not require a real API key,
+        # but the OpenAI SDK requires a non-empty string.
+        resolved_api_key = api_key or os.environ.get("OPENAI_API_KEY") or "local-no-key-required"
+        resolved_base_url = base_url or os.environ.get("OPENAI_BASE_URL") or "http://localhost:11434/v1"
+
         self.client = OpenAI(
-            api_key=api_key or os.environ.get("OPENAI_API_KEY", "dummy-key"),
-            base_url=base_url or os.environ.get("OPENAI_BASE_URL", None)
+            api_key=resolved_api_key,
+            base_url=resolved_base_url
         )
         
         self.logger = TrajectoryLogger()
@@ -208,6 +216,7 @@ You have access to tools that allow you to inspect the system, manage files, and
 
         print("\n" + "=" * 65)
         print(f"[Agent Session {self.session_id}] Task: {user_task}")
+        print(f"[Model]: {self.model}")
         print(f"[Initial CWD]: {terminal_session.cwd}")
         print("=" * 65)
 
@@ -215,7 +224,7 @@ You have access to tools that allow you to inspect the system, manage files, and
             # Check and compact context before LLM call
             self.manage_context()
 
-            print(f"\n[Iteration {iteration}/{self.max_iterations}] Thinking...")
+            print(f"\n[Iteration {iteration}/{self.max_iterations}] Thinking ({self.model})...")
 
             try:
                 raw_message = self.step()
@@ -304,28 +313,72 @@ You have access to tools that allow you to inspect the system, manage files, and
 
 
 # ==============================================================================
-# INTERACTIVE CLI
+# CLI ARGUMENT PARSER & ENTRY POINT
 # ==============================================================================
 
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Hermes-Refined Coding Agent Harness for Local & Remote LLMs."
+    )
+    parser.add_argument(
+        "-m", "--model",
+        type=str,
+        default=os.environ.get("AGENT_MODEL", "Qwen-32b"),
+        help="Model identifier (e.g. 'Qwen-32b', 'qwen2.5-coder:32b', 'gpt-4o'). Default: Qwen-32b"
+    )
+    parser.add_argument(
+        "-u", "--base-url",
+        type=str,
+        default=os.environ.get("OPENAI_BASE_URL", "http://localhost:11434/v1"),
+        help="Local or remote LLM endpoint (e.g. 'http://localhost:11434/v1' for Ollama, 'http://localhost:8000/v1' for vLLM, 'http://localhost:1234/v1' for LM Studio)."
+    )
+    parser.add_argument(
+        "-k", "--api-key",
+        type=str,
+        default=os.environ.get("OPENAI_API_KEY", "local"),
+        help="API Key (optional for local models, defaults to 'local')."
+    )
+    parser.add_argument(
+        "--xml",
+        action="store_true",
+        default=os.environ.get("HERMES_XML", "false").lower() in ("true", "1"),
+        help="Use Hermes XML <tool_call> format instead of standard OpenAI function calling."
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=int(os.environ.get("AGENT_MAX_TOKENS", "16000")),
+        help="Context window token limit before compaction triggers. Default: 16000"
+    )
+    parser.add_argument(
+        "--no-auto-skills",
+        action="store_true",
+        help="Disable automatic post-task skill synthesis."
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+
     print("=" * 65)
     print(" Hermes-Refined Coding Agent Harness")
     print("=" * 65)
-    print("Features: Auto-Skill Synthesis | Context Compaction | Terminal Prompts\n")
+    print(f"Model:    {args.model}")
+    print(f"Endpoint: {args.base_url}")
+    print(f"Protocol: {'Hermes XML (<tool_call>)' if args.xml else 'OpenAI JSON Tool Calling'}")
+    print("Security: Interactive user review is active for EVERY system command.")
+    print("Features: Auto-Skill Synthesis | Context Compaction | Local LLM Ready\n")
     print("Commands: /skills (list skills) | /compact (force compaction) | /context | exit")
 
-    model_name = os.environ.get("AGENT_MODEL", "gpt-4o")
-    base_url = os.environ.get("OPENAI_BASE_URL", None)
-    use_hermes_xml = os.environ.get("HERMES_XML", "false").lower() in ("true", "1")
-    context_tokens = int(os.environ.get("AGENT_MAX_TOKENS", "16000"))
-
     agent = HermesCodingAgent(
-        model=model_name,
-        base_url=base_url,
-        max_context_tokens=context_tokens,
+        model=args.model,
+        base_url=args.base_url,
+        api_key=args.api_key,
+        max_context_tokens=args.max_tokens,
         confirm_all_terminal_commands=True,
-        auto_learn_skills=True,
-        use_hermes_xml_protocol=use_hermes_xml
+        auto_learn_skills=not args.no_auto_skills,
+        use_hermes_xml_protocol=args.xml
     )
 
     while True:

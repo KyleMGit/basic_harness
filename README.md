@@ -1,53 +1,83 @@
 # Hermes-Refined Coding Agent Harness
 
-An open-source, terminal-native Python agent harness inspired by [**NousResearch/hermes-agent**](https://github.com/nousresearch/hermes-agent).
+An open-source, terminal-native Python agent harness optimized for local models (**Qwen-32b**, etc.) and remote models, inspired by [**NousResearch/hermes-agent**](https://github.com/nousresearch/hermes-agent).
 
 ---
 
-## 🌟 Key Architecture & Context Practices
+## 🌟 Key Features
 
-### 1. Two-Phase Context Compaction & Summarization ([`compaction.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/compaction.py))
-- **Phase 1: Tool Output Pruning**: Verbose outputs from older tool calls (such as large terminal logs or multi-page file reads) are compressed in history to compact stubs while preserving exit codes and head/tail snippets.
-- **Phase 2: LLM Conversation Compaction**: When token budget crosses the configured threshold (default 65%), older turns are summarized into a structured `[CONVERSATION COMPACTION BLOCK]` preserving the user goal, modified files, terminal command history, and pending tasks.
-- **Anti-Thrashing Cooldown**: Enforces cooldown step intervals between compaction passes to prevent infinite compression loops.
-- **Manual `/compact` & `/context`**: Inspect capacity or force compaction on demand.
-
-### 2. Interactive Terminal Review & Human-in-the-Loop ([`agent.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/agent.py))
-- Every terminal command pauses for user approval.
-- Allows executing (`[Enter]/y`), denying (`n`), editing the command (`e`), or sending steering feedback text.
-
-### 3. Stateful Terminal Engine ([`terminal.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/terminal.py))
-- Maintains persistent working directory (`cwd`) and environment variables across multiple tool calls (`cd` persists across steps).
-- Automatic detection of destructive commands.
-
-### 4. Dual Protocol Tool Calling ([`protocol.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/protocol.py))
-- Supports standard OpenAI function calling and Hermes XML ChatML (`<tools>`, `<tool_call>`, `<tool_response>`).
-
-### 5. Persistent Skill Store ([`skills.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/skills.py))
-- Hermes-inspired self-improving skill library (`save_skill`, `load_skill`, `list_skills`).
-
-### 6. Trajectory Storage ([`storage.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/storage.py))
-- Records complete execution graphs and step metadata to SQLite (`.agent_history.db`) with JSONL export support.
+1. **Local Model Support without API Keys**:
+   - Zero configuration needed for local endpoints (Ollama, vLLM, LM Studio, llama.cpp, LocalAI).
+   - Automatically handles dummy API keys required by client SDKs without failing.
+2. **CLI & Environment Variable Model Configuration**:
+   - Easily swap models and endpoints via `-m / --model` and `-u / --base-url`.
+3. **Two-Phase Context Checkpoint Compaction & Summarization ([`compaction.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/compaction.py))**:
+   - Implements the **Security & Provenance Context-Checkpoint Summarizer** contract.
+   - Host-side deterministic extraction for `<EXACT_ANCHORS>` (paths, URLs, error text, commit SHAs) and `<VERBATIM_USER_MESSAGES>`.
+   - Iterative delta checkpointing via `<PREVIOUS_CHECKPOINT>`.
+4. **Automatic Skill Synthesis & Writing ([`skills.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/skills.py))**:
+   - Reflects on successful trajectories and automatically synthesizes newly learned engineering procedures into `.agent_skills/`.
+5. **Interactive Review for Every System Command ([`agent.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/agent.py))**:
+   - Every terminal command pauses for user approval: Run (`[Enter]/y`), Deny (`n`), Edit (`e`), or Steer with feedback text.
+6. **Stateful Terminal Engine ([`terminal.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/terminal.py))**:
+   - `cd <dir>` and working directory state persist across tool calls.
+7. **Dual-Protocol Tool Execution ([`protocol.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/protocol.py))**:
+   - Supports both standard OpenAI JSON tool calling and Hermes XML ChatML (`<tool_call>...`).
+8. **Trajectory Logger ([`storage.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/storage.py))**:
+   - SQLite `.agent_history.db` + JSONL export for dataset creation.
 
 ---
 
-## 📁 Repository Structure
+## 🚀 Running with Qwen-32B Locally
 
-- [`agent.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/agent.py): ReAct orchestrator, interactive CLI, and safety loops.
-- [`compaction.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/compaction.py): Two-phase context pruning and LLM summarization engine.
-- [`terminal.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/terminal.py): Stateful terminal execution session with safety filters.
-- [`tools.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/tools.py): Tool registry with terminal, file patch/read/write, and skill tools.
-- [`skills.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/skills.py): Hermes persistent skill store.
-- [`protocol.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/protocol.py): Dual protocol parser (JSON function calling + Hermes XML).
-- [`storage.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/storage.py): SQLite trajectory logger & JSONL exporter.
-- [`test_tools.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/test_tools.py): Comprehensive unit tests.
+### 1. With Ollama (Default: `http://localhost:11434/v1`)
+```bash
+# Start your local model in Ollama:
+ollama run qwen2.5:32b
+# or: ollama run qwen2.5-coder:32b
+
+# Launch the harness:
+python agent.py --model qwen2.5:32b
+```
+
+### 2. With vLLM (Default: `http://localhost:8000/v1`)
+```bash
+# Launch vLLM server:
+vllm serve Qwen/Qwen2.5-32B-Instruct --port 8000
+
+# Launch the harness:
+python agent.py --model Qwen/Qwen2.5-32B-Instruct --base-url http://localhost:8000/v1
+```
+
+### 3. With LM Studio (Default: `http://localhost:1234/v1`)
+```bash
+python agent.py --model Qwen-32b --base-url http://localhost:1234/v1
+```
+
+### 4. With llama.cpp server (Default: `http://localhost:8080/v1`)
+```bash
+python agent.py --model Qwen-32b --base-url http://localhost:8080/v1
+```
 
 ---
 
-## 🚀 Interactive Commands
+## ⚙️ CLI Arguments
 
-Inside the agent CLI:
+| Argument | Shorthand | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `--model` | `-m` | `Qwen-32b` | Model name or tag |
+| `--base-url` | `-u` | `http://localhost:11434/v1` | LLM HTTP API endpoint |
+| `--api-key` | `-k` | `local` | API Key (optional for local models) |
+| `--xml` | | `False` | Use Hermes XML `<tool_call>` protocol |
+| `--max-tokens` | | `16000` | Context token capacity before compaction |
+| `--no-auto-skills`| | `False` | Disable automatic post-task skill synthesis |
+
+---
+
+## 💬 Interactive In-Session Commands
+
 - `/context` — Show current token count and percentage of maximum context budget.
 - `/compact` — Force an immediate context compaction pass.
+- `/skills` — List all learned and saved skills in the repository.
 - `export-trajectory [filename.jsonl]` — Export current session steps to JSONL.
 - `exit` or `quit` — Exit the session.
