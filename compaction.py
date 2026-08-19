@@ -204,10 +204,10 @@ not new requests. Omit if none were supplied.]
 
     def __init__(
         self,
-        max_context_tokens: int = 131072,  # 128K native context window for Qwen3-32B / Qwen2.5-32B
-        trigger_threshold: float = 0.70,   # Triggers compaction at ~91K tokens
-        keep_recent_turns: int = 8,
-        cooldown_steps: int = 4,
+        max_context_tokens: int = 40960,  # 40K token context window for Qwen-32B
+        trigger_threshold: float = 0.70,  # Triggers compaction at ~28,672 tokens (leaving ~12,288 tokens headroom)
+        keep_recent_turns: int = 6,       # Preserves last 6 turns verbatim
+        cooldown_steps: int = 3,
     ):
         self.max_context_tokens = max_context_tokens
         self.trigger_threshold = trigger_threshold
@@ -240,11 +240,8 @@ not new requests. Omit if none were supplied.]
         """
         text_corpus = " ".join(str(m.get("content") or "") for m in messages)
         
-        # Path regex
         paths = set(re.findall(r'(?:[A-Za-z]:[\\/]|[\./\\])[\w\-\./\\]+\.[a-zA-Z0-9]+', text_corpus))
-        # URL regex
         urls = set(re.findall(r'https?://[^\s<>"]+', text_corpus))
-        # Git commit SHAs
         shas = set(re.findall(r'\b[0-9a-f]{40}\b|\b[0-9a-f]{7,8}\b', text_corpus))
 
         anchors = []

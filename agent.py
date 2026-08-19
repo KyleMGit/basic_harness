@@ -3,14 +3,15 @@ Hermes-Refined Coding Agent Harness.
 An open, persistent, multi-protocol coding agent harness in Python.
 
 Key Features:
-1. Local Model Support without API Keys (Qwen-32b, Ollama, vLLM, LM Studio, llama.cpp).
-2. CLI and Interactive Model / Base URL Selection.
-3. Automatic Skill Synthesis & Writing (Self-Improvement Loop).
-4. Production-Grade Context Checkpoint Compaction & Summarization.
-5. Interactive User Prompt for Every Terminal Command (approve, edit, reject, feedback).
-6. Stateful Terminal Execution (persistent cwd, cd management, output clipping).
-7. Dual Protocol Tool Calling (OpenAI JSON API & Hermes XML <tool_call> syntax).
-8. SQLite Trajectory Logging & Export.
+1. Configured for Qwen-32B with 40K (40,960) Token Context Budget.
+2. Local Model Support without API Keys (Qwen-32b, Ollama, vLLM, LM Studio, llama.cpp).
+3. CLI and Interactive Model / Base URL Selection.
+4. Automatic Skill Synthesis & Writing (Self-Improvement Loop).
+5. Production-Grade Context Checkpoint Compaction & Summarization.
+6. Interactive User Prompt for Every Terminal Command (approve, edit, reject, feedback).
+7. Stateful Terminal Execution (persistent cwd, cd management, output clipping).
+8. Dual Protocol Tool Calling (OpenAI JSON API & Hermes XML <tool_call> syntax).
+9. SQLite Trajectory Logging & Export.
 """
 
 import argparse
@@ -60,8 +61,8 @@ You have access to tools that allow you to inspect the system, manage files, and
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         max_iterations: int = 30,
-        max_context_tokens: int = 131072,  # 128K native context window for Qwen3-32B
-        compaction_threshold: float = 0.70,
+        max_context_tokens: int = 40960,     # Default to 40K (40,960 tokens) for Qwen-32B
+        compaction_threshold: float = 0.70, # Triggers compaction at ~28,672 tokens (leaving ~12,288 tokens headroom)
         confirm_all_terminal_commands: bool = True,
         auto_learn_skills: bool = True,
         use_hermes_xml_protocol: bool = False,
@@ -324,13 +325,13 @@ def parse_args():
         "-m", "--model",
         type=str,
         default=os.environ.get("AGENT_MODEL", "Qwen-32b"),
-        help="Model identifier (e.g. 'Qwen-32b', 'qwen2.5-coder:32b', 'gpt-4o'). Default: Qwen-32b"
+        help="Model identifier (e.g. 'Qwen-32b', 'qwen2.5-coder:32b'). Default: Qwen-32b"
     )
     parser.add_argument(
         "-u", "--base-url",
         type=str,
         default=os.environ.get("OPENAI_BASE_URL", "http://localhost:11434/v1"),
-        help="Local or remote LLM endpoint (e.g. 'http://localhost:11434/v1' for Ollama, 'http://localhost:8000/v1' for vLLM, 'http://localhost:1234/v1' for LM Studio)."
+        help="Local or remote LLM endpoint (default: http://localhost:11434/v1)."
     )
     parser.add_argument(
         "-k", "--api-key",
@@ -347,8 +348,8 @@ def parse_args():
     parser.add_argument(
         "--max-tokens",
         type=int,
-        default=int(os.environ.get("AGENT_MAX_TOKENS", "131072")),
-        help="Context window token limit before compaction triggers (Qwen3-32B native is 128K/131072). Default: 131072"
+        default=int(os.environ.get("AGENT_MAX_TOKENS", "40960")),
+        help="Context window token limit before compaction triggers (default: 40960 / 40K tokens for Qwen-32B)."
     )
     parser.add_argument(
         "--no-auto-skills",
@@ -364,12 +365,13 @@ def main():
     print("=" * 65)
     print(" Hermes-Refined Coding Agent Harness")
     print("=" * 65)
-    print(f"Model:    {args.model}")
-    print(f"Endpoint: {args.base_url}")
-    print(f"Protocol: {'Hermes XML (<tool_call>)' if args.xml else 'OpenAI JSON Tool Calling'}")
-    print("Security: Interactive user review is active for EVERY system command.")
-    print("Features: Auto-Skill Synthesis | Context Compaction | Local LLM Ready\n")
-    print("Commands: /skills (list skills) | /compact (force compaction) | /context | exit")
+    print(f"Model:      {args.model}")
+    print(f"Endpoint:   {args.base_url}")
+    print(f"Max Tokens: {args.max_tokens} (Compaction threshold: ~{int(args.max_tokens * 0.70)} tokens)")
+    print(f"Protocol:   {'Hermes XML (<tool_call>)' if args.xml else 'OpenAI JSON Tool Calling'}")
+    print("Security:   Interactive user review is active for EVERY system command.")
+    print("Features:   Auto-Skill Synthesis | Context Compaction | Local LLM Ready\n")
+    print("Commands:   /skills | /compact (force compaction) | /context | exit")
 
     agent = HermesCodingAgent(
         model=args.model,
