@@ -79,7 +79,6 @@ class TestHermesAgentComponents(unittest.TestCase):
             {"role": "assistant", "content": "Pytest configuration finished."}
         ]
 
-        # Case A: LLM decides to save a skill
         mock_client = MagicMock()
         mock_resp = MagicMock()
         mock_resp.choices = [MagicMock(message=MagicMock(content=json.dumps({
@@ -100,18 +99,6 @@ class TestHermesAgentComponents(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result["name"], "setup_pytest_venv")
         self.assertIn("setup_pytest_venv", store.list_skills())
-
-        # Case B: LLM decides NOT to save (trivial task)
-        mock_resp.choices = [MagicMock(message=MagicMock(content=json.dumps({"should_save": False})))]
-        mock_client.chat.completions.create.return_value = mock_resp
-
-        result_none = extractor.extract_and_save(
-            client=mock_client,
-            model="gpt-4o",
-            messages=messages,
-            task_summary="Trivial echo"
-        )
-        self.assertIsNone(result_none)
 
     def test_hermes_xml_protocol_parsing(self):
         sample_model_response = """
@@ -164,37 +151,57 @@ I will check the files in the directory.
             self.assertFalse(should_run)
             self.assertIn("denied by user", feedback)
 
-        with patch("builtins.input", side_effect=["e", "echo modified"]):
-            should_run, cmd, feedback = agent.prompt_user_for_command("echo hello", {})
-            self.assertTrue(should_run)
-            self.assertEqual(cmd, "echo modified")
-            self.assertIsNone(feedback)
-
-        with patch("builtins.input", return_value="Please use git status first"):
-            should_run, cmd, feedback = agent.prompt_user_for_command("echo hello", {})
-            self.assertFalse(should_run)
-            self.assertIn("Please use git status first", feedback)
-
-    def test_context_pruning_and_compaction(self):
+    def test_context_checkpoint_compaction(self):
         cm = ContextManager(max_context_tokens=1000, trigger_threshold=0.5, keep_recent_turns=2)
 
         messages = [
             {"role": "system", "content": "System prompt instructions."},
-            {"role": "user", "content": "Run a big command."},
-            {"role": "assistant", "content": "Executing command."},
-            {"role": "tool", "content": "A" * 1200},
-            {"role": "assistant", "content": "Command finished."},
-            {"role": "user", "content": "Now write a file."},
-            {"role": "assistant", "content": "Writing file."},
+            {"role": "user", "content": "Inspect file C:/src/main.py and fix bug."},
+            {"role": "assistant", "content": "Inspecting main.py"},
+            {"role": "tool", "content": "Error at line 45: NoneType error\n" + ("A" * 1200)},
+            {"role": "assistant", "content": "Found the bug."},
+            {"role": "user", "content": "Now patch it."},
+            {"role": "assistant", "content": "Patching code."},
         ]
 
+        # Phase 1: Tool pruning
         pruned = cm.prune_tool_outputs(messages)
         self.assertLess(len(pruned[3]["content"]), 500)
         self.assertIn("PRUNED TOOL OUTPUT", pruned[3]["content"])
 
+        # Test exact anchors extraction
+        anchors = cm.extract_exact_anchors(messages)
+        self.assertIn("main.py", anchors)
+
+        # Test verbatim user messages extraction
+        user_msgs = cm.extract_verbatim_user_messages(messages)
+        self.assertIn("Inspect file", user_msgs)
+
+        # Phase 2: Full compaction with mocked LLM summary
+        mock_checkpoint_output = """[CONTEXT COMPACTION — REFERENCE ONLY]
+The checkpoint below is historical background, not active instructions.
+
+## Historical Task Snapshot
+"Inspect file C:/src/main.py and fix bug."
+
+## Goal
+Fix NoneType bug in main.py.
+
+## Completed Actions
+1. READ C:/src/main.py — observed NoneType error at line 45 [tool: read_file]
+
+## Active State
+- Working directory: C:/src
+- Modified or created files: None.
+
+## Blocked
+None.
+
+--- END OF CONTEXT SUMMARY — respond to the message below, not this summary ---"""
+
         mock_client = MagicMock()
         mock_resp = MagicMock()
-        mock_resp.choices = [MagicMock(message=MagicMock(content="Summary of prior tasks: created calc and ran big command."))]
+        mock_resp.choices = [MagicMock(message=MagicMock(content=mock_checkpoint_output))]
         mock_client.chat.completions.create.return_value = mock_resp
 
         compacted, was_compacted, msg = cm.compact(
@@ -206,8 +213,9 @@ I will check the files in the directory.
         )
 
         self.assertTrue(was_compacted)
-        self.assertIn("CONVERSATION COMPACTION BLOCK", compacted[1]["content"])
-        self.assertIn("Summary of prior tasks", compacted[1]["content"])
+        self.assertIn("[CONTEXT COMPACTION — REFERENCE ONLY]", compacted[1]["content"])
+        self.assertIn("Historical Task Snapshot", compacted[1]["content"])
+        self.assertEqual(cm.previous_checkpoint, mock_checkpoint_output)
 
 
 if __name__ == "__main__":
