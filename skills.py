@@ -1,34 +1,36 @@
 """
-Hermes-inspired Persistent Skill Store & Automatic Skill Synthesis.
-Allows the agent to record reusable procedures, scripts, and learned patterns
-into persistent storage automatically upon successful task completions.
+Hermes-inspired Persistent Skill Store, Semantic/Keyword Retrieval,
+and Catalog-Aware Deduplicating Skill Synthesis.
 """
 
 import json
 import os
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 
 class SkillStore:
     """
-    Manages a local library of skills and reusable workflows.
-    Stored as markdown / JSON files in the workspace or user directory.
+    Manages a persistent library of skills and reusable workflows.
+    Provides indexing, keyword/overlap retrieval, deduplication, and catalog formatting.
     """
 
     def __init__(self, storage_dir: Optional[str] = None):
         self.storage_dir = os.path.abspath(storage_dir or os.path.join(os.getcwd(), ".agent_skills"))
         os.makedirs(self.storage_dir, exist_ok=True)
 
+    def _safe_filename(self, name: str) -> str:
+        safe_name = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in name).strip("_").lower()
+        return f"{safe_name}.json"
+
     def save_skill(self, name: str, description: str, instructions: str, tags: Optional[List[str]] = None) -> str:
         """Save a new skill or update an existing one."""
-        safe_name = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in name).lower()
-        file_path = os.path.join(self.storage_dir, f"{safe_name}.json")
-
+        file_path = os.path.join(self.storage_dir, self._safe_filename(name))
+        
         skill_data = {
-            "name": name,
-            "description": description,
-            "instructions": instructions,
+            "name": name.strip(),
+            "description": description.strip(),
+            "instructions": instructions.strip(),
             "tags": tags or [],
         }
 
@@ -41,8 +43,7 @@ class SkillStore:
 
     def load_skill(self, name: str) -> str:
         """Load and read instructions for a specific skill."""
-        safe_name = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in name).lower()
-        file_path = os.path.join(self.storage_dir, f"{safe_name}.json")
+        file_path = os.path.join(self.storage_dir, self._safe_filename(name))
 
         if not os.path.exists(file_path):
             return f"Skill '{name}' not found."
@@ -54,63 +55,156 @@ class SkillStore:
         except Exception as e:
             return f"Error loading skill '{name}': {str(e)}"
 
-    def list_skills(self) -> str:
-        """List all available skills with summaries."""
-        if not os.path.exists(self.storage_dir):
-            return "No skills saved yet."
-
+    def get_all_skills(self) -> List[Dict[str, Any]]:
+        """Retrieve all stored skills with full contents."""
         skills = []
-        for filename in os.listdir(self.storage_dir):
+        if not os.path.exists(self.storage_dir):
+            return skills
+
+        for filename in sorted(os.listdir(self.storage_dir)):
             if filename.endswith(".json"):
                 path = os.path.join(self.storage_dir, filename)
                 try:
                     with open(path, "r", encoding="utf-8") as f:
                         data = json.load(f)
-                        skills.append(f"- **{data.get('name')}**: {data.get('description')}")
+                        if "name" in data and "instructions" in data:
+                            skills.append(data)
                 except Exception:
                     continue
+        return skills
 
+    def get_skills_index(self) -> List[Dict[str, str]]:
+        """Retrieve a lightweight catalog index of all available skills."""
+        return [
+            {
+                "name": s["name"],
+                "description": s.get("description", ""),
+                "tags": ", ".join(s.get("tags", []))
+            }
+            for s in self.get_all_skills()
+        ]
+
+    def format_catalog_prompt(self) -> str:
+        """Format available skills into a prompt-friendly catalog."""
+        skills = self.get_skills_index()
         if not skills:
-            return "No skills found in skill repository."
+            return "<available_skills>\nNone stored yet.\n</available_skills>"
 
-        return "Available Learned Skills:\n" + "\n".join(skills)
+        lines = ["<available_skills>"]
+        for s in skills:
+            lines.append(f'  - skill: "{s["name"]}"')
+            lines.append(f'    when_to_use: "{s["description"]}"')
+        lines.append("</available_skills>")
+        return "\n".join(lines)
+
+    def find_relevant_skills(self, query: str, top_k: int = 2, threshold: float = 0.10) -> List[Dict[str, Any]]:
+        """
+        Find skills relevant to a task query using token overlap and keyword matching.
+        """
+        all_skills = self.get_all_skills()
+        if not all_skills:
+            return []
+
+        def tokenize(text: str) -> Set[str]:
+            # Replace underscores and hyphens with spaces to extract constituent subwords
+            clean_text = re.sub(r"[_\-/\\]", " ", text.lower())
+            words = set(re.findall(r"\b[a-zA-Z0-9]{3,}\b", clean_text))
+            # Also keep exact original tokens
+            words.update(re.findall(r"\b[a-zA-Z0-9_\-]{3,}\b", text.lower()))
+            return words
+
+        query_tokens = tokenize(query)
+        if not query_tokens:
+            return []
+
+        scored_skills = []
+        for skill in all_skills:
+            skill_text = f"{skill['name']} {skill.get('description', '')} {' '.join(skill.get('tags', []))}"
+            skill_tokens = tokenize(skill_text)
+            
+            if not skill_tokens:
+                continue
+
+            intersection = query_tokens.intersection(skill_tokens)
+            score = len(intersection) / len(query_tokens.union(skill_tokens))
+            
+            # Boost score if query words match the skill name subwords directly
+            name_tokens = tokenize(skill["name"])
+            if query_tokens.intersection(name_tokens):
+                score += 0.35
+
+            if score >= threshold:
+                scored_skills.append((score, skill))
+
+        # Sort descending by score
+        scored_skills.sort(key=lambda x: x[0], reverse=True)
+        return [skill for _, skill in scored_skills[:top_k]]
+
+    def list_skills(self) -> str:
+        """List all available skills with summaries."""
+        skills = self.get_all_skills()
+        if not skills:
+            return "No skills found in skill repository (.agent_skills/)."
+
+        output = ["Available Learned Skills:"]
+        for s in skills:
+            output.append(f"- **{s['name']}**: {s.get('description', 'No description')}")
+        return "\n".join(output)
+
+    def delete_skill(self, name: str) -> bool:
+        """Delete a skill by name."""
+        file_path = os.path.join(self.storage_dir, self._safe_filename(name))
+        if os.path.exists(file_path):
+            os.remove(file_path)
+            return True
+        return False
 
 
 class AutoSkillExtractor:
     """
-    Analyzes finished agent trajectories to automatically synthesize
-    and save reusable procedures into the SkillStore.
+    Catalog-aware skill synthesis & curation engine.
+    Analyzes finished trajectories against existing skills to:
+    1. Avoid duplicate/redundant skills.
+    2. Merge & update existing skills when better techniques are discovered.
+    3. Synthesize novel skills only when genuinely new capabilities are formed.
     """
 
-    REFLECTION_PROMPT = """You are an autonomous AI skill synthesis and learning engine.
-Review the completed conversation and determine if a reusable, non-trivial engineering procedure, debugging method, setup recipe, or script pattern was discovered or created.
+    REFLECTION_PROMPT = """You are an autonomous AI Skill Curator and Synthesis Engine.
+Review the completed conversation trajectory against the existing library of skills.
 
-Criteria for creating a skill:
-- Multi-step build, testing, or environment configuration sequence.
-- Diagnostic pattern or error resolution technique that could apply to future tasks.
-- Reusable script or automation pattern.
+Your goal is to maintain a high-quality, non-redundant, durable library of engineering skills.
 
-Do NOT create a skill for:
-- Simple one-off questions, basic chit-chat, or trivial commands (e.g. echo, ls).
-- Failed tasks or trivial non-reusable edits.
+=== EXISTING SKILLS IN REPOSITORY ===
+{existing_skills_catalog}
+=====================================
+
+### Instructions:
+1. **DEDUPLICATION RULE**: Carefully check if the completed procedure is already covered by an existing skill (even if worded differently).
+   - If an existing skill already covers this: choose action "NONE".
+   - If an existing skill covers this BUT the current session discovered a better method, fixed a bug, or added important edge cases: choose action "UPDATE" and refine that specific skill.
+   - Only choose action "CREATE" if this is a genuinely novel, non-trivial, reusable workflow not represented in the repository.
+2. **QUALITY RULE**: Do NOT save skills for trivial one-off tasks (e.g. 'echo', simple questions, basic file viewing, or failed attempts).
+3. **INSTRUCTION QUALITY**: Instructions must be concrete, step-by-step markdown with exact commands, code snippets, and configuration caveats.
 
 Respond ONLY with a JSON object in this format:
-If a skill should be created:
 {
-  "should_save": true,
+  "action": "CREATE" | "UPDATE" | "NONE",
+  "target_skill_name": "name_of_existing_skill_to_update_or_blank",
   "name": "concise_snake_case_name",
-  "description": "Clear 1-2 sentence description of what this skill does and when to use it.",
-  "instructions": "Markdown formatted step-by-step procedure, code template, commands, and caveats."
-}
-
-If no skill should be created:
-{
-  "should_save": false
+  "description": "Clear explanation of what this skill accomplishes and when to use it.",
+  "instructions": "Step-by-step markdown instructions, commands, code patterns, and caveats."
 }
 """
 
     def __init__(self, skill_store: SkillStore):
         self.skill_store = skill_store
+
+    def _compute_text_similarity(self, text_a: str, text_b: str) -> float:
+        words_a = set(re.findall(r"\b\w{3,}\b", text_a.lower()))
+        words_b = set(re.findall(r"\b\w{3,}\b", text_b.lower()))
+        if not words_a or not words_b:
+            return 0.0
+        return len(words_a & words_b) / len(words_a | words_b)
 
     def extract_and_save(
         self,
@@ -120,54 +214,78 @@ If no skill should be created:
         task_summary: str
     ) -> Optional[Dict[str, str]]:
         """
-        Runs an evaluation pass over the trajectory to automatically extract and save a skill.
-        Returns the skill metadata dict if a skill was saved, otherwise None.
+        Runs a catalog-aware evaluation pass over the trajectory to synthesize or refine skills.
         """
-        # Skip if session is too short (fewer than 3 messages)
+        # Skip trivial or empty sessions
         if len(messages) < 4:
             return None
 
         # Build transcript excerpt
-        transcript_parts = [f"Task: {task_summary}\n"]
+        transcript_parts = [f"User Goal: {task_summary}\n"]
         for msg in messages:
             role = msg.get("role", "").upper()
-            content = msg.get("content") or ""
+            content = str(msg.get("content") or "")
+            if len(content) > 800:
+                content = content[:400] + "\n...[TRUNCATED]...\n" + content[-300:]
             if msg.get("tool_calls"):
                 content += f"\n[Tool Calls: {json.dumps(msg.get('tool_calls'))}]"
             transcript_parts.append(f"[{role}]:\n{content}")
 
         transcript_text = "\n\n".join(transcript_parts)
-        # Limit transcript size for extraction prompt
         if len(transcript_text) > 8000:
             transcript_text = transcript_text[:4000] + "\n...[TRUNCATED]...\n" + transcript_text[-4000:]
+
+        existing_catalog = self.skill_store.format_catalog_prompt()
+        prompt = self.REFLECTION_PROMPT.replace("{existing_skills_catalog}", existing_catalog)
 
         try:
             response = client.chat.completions.create(
                 model=model,
                 messages=[
-                    {"role": "system", "content": self.REFLECTION_PROMPT},
-                    {"role": "user", "content": f"Analyze this session and extract a skill if applicable:\n\n{transcript_text}"}
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": f"Evaluate and curate skills for this session:\n\n{transcript_text}"}
                 ],
                 temperature=0.1,
             )
 
             raw_resp = response.choices[0].message.content or ""
-            # Extract JSON block
             json_match = re.search(r"\{.*\}", raw_resp, re.DOTALL)
             if not json_match:
                 return None
 
             data = json.loads(json_match.group(0))
-            if data.get("should_save") and data.get("name") and data.get("instructions"):
-                name = data["name"]
-                desc = data.get("description", "Learned procedure.")
-                instr = data["instructions"]
+            action = data.get("action", "").upper()
+
+            if action in ("CREATE", "UPDATE"):
+                name = (data.get("target_skill_name") if action == "UPDATE" and data.get("target_skill_name") else data.get("name", "")).strip()
+                desc = data.get("description", "").strip()
+                instr = data.get("instructions", "").strip()
+
+                if not name or not instr:
+                    return None
+
+                # Additional host-side deduplication guard:
+                # If creating, check if an existing skill has very high similarity (> 0.55)
+                if action == "CREATE":
+                    for existing in self.skill_store.get_all_skills():
+                        sim = self._compute_text_similarity(
+                            f"{name} {desc}",
+                            f"{existing['name']} {existing.get('description', '')}"
+                        )
+                        if sim > 0.55:
+                            # Re-route to updating the existing skill rather than creating duplicate
+                            name = existing["name"]
+                            action = "UPDATE"
+                            break
 
                 self.skill_store.save_skill(name, desc, instr)
-                return {"name": name, "description": desc}
+                return {
+                    "action": action,
+                    "name": name,
+                    "description": desc
+                }
 
-        except Exception as e:
-            # Silent fallback if reflection fails
+        except Exception:
             return None
 
         return None

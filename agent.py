@@ -3,10 +3,10 @@ Hermes-Refined Coding Agent Harness.
 An open, persistent, multi-protocol coding agent harness in Python.
 
 Key Features:
-1. Configured for Qwen-32B with 40K (40,960) Token Context Budget.
-2. Local Model Support without API Keys (Qwen-32b, Ollama, vLLM, LM Studio, llama.cpp).
-3. CLI and Interactive Model / Base URL Selection.
-4. Automatic Skill Synthesis & Writing (Self-Improvement Loop).
+1. Dynamic Skill Catalog & Pre-Turn Relevant Skill Auto-Injection.
+2. Catalog-Aware Skill Deduplication & Merging (Hermes Learning Loop).
+3. Configured for Qwen-32B with 40K (40,960) Token Context Budget.
+4. Local Model Support without API Keys (Qwen-32b, Ollama, vLLM, LM Studio, llama.cpp).
 5. Production-Grade Context Checkpoint Compaction & Summarization.
 6. Interactive User Prompt for Every Terminal Command (approve, edit, reject, feedback).
 7. Stateful Terminal Execution (persistent cwd, cd management, output clipping).
@@ -42,7 +42,7 @@ class HermesCodingAgent:
     automated context compaction/summarization, and local model support (Qwen-32b, etc.).
     """
 
-    SYSTEM_PROMPT = """You are an autonomous AI software engineer and terminal agent.
+    SYSTEM_PROMPT_TEMPLATE = """You are an autonomous AI software engineer and terminal agent.
 You have access to tools that allow you to inspect the system, manage files, and execute terminal commands.
 
 ### Important Protocol:
@@ -51,7 +51,9 @@ You have access to tools that allow you to inspect the system, manage files, and
 - **Persistent Workspace**: The terminal environment maintains your working directory (`cwd`) across tool calls. Use `cd <dir>` to navigate projects.
 - **Verification & Testing**: Always verify changes by running tests, linters, or checking file content.
 - **Analyze Output**: Inspect command outputs (stdout, stderr, exit codes). If errors occur, diagnose and repair them iteratively.
-- **Skill Utilization & Auto-Learning**: You have access to a persistent skill repository (`save_skill`, `load_skill`, `list_skills`). Furthermore, novel workflows you discover are automatically extracted into skills upon task completion.
+- **Learned Skills & Best Practices**: Below is the catalog of learned project skills. When a task relates to any available skill, use `load_skill(name)` or apply its established procedure:
+{skills_catalog}
+
 - **Conciseness**: Summarize your work clearly when the task is achieved.
 """
 
@@ -93,14 +95,27 @@ You have access to tools that allow you to inspect the system, manage files, and
         self.session_id = str(uuid.uuid4())[:8]
         self.step_counter = 0
 
-        # Construct system prompt
-        system_content = self.SYSTEM_PROMPT
+        # Construct system prompt with live skill catalog
+        system_content = self._build_system_prompt()
         if self.use_hermes_xml_protocol:
             system_content = ToolProtocol.format_hermes_system_prompt(system_content, registry.schemas)
 
         self.messages: List[Dict[str, Any]] = [
             {"role": "system", "content": system_content}
         ]
+
+    def _build_system_prompt(self) -> str:
+        """Build system prompt embedding the live catalog of available skills."""
+        catalog_xml = skill_store.format_catalog_prompt()
+        return self.SYSTEM_PROMPT_TEMPLATE.format(skills_catalog=catalog_xml)
+
+    def refresh_system_prompt(self):
+        """Update system prompt with newly learned skills."""
+        new_prompt = self._build_system_prompt()
+        if self.use_hermes_xml_protocol:
+            new_prompt = ToolProtocol.format_hermes_system_prompt(new_prompt, registry.schemas)
+        if self.messages and self.messages[0].get("role") == "system":
+            self.messages[0]["content"] = new_prompt
 
     def prompt_user_for_command(self, command: str, args: Dict[str, Any]) -> Tuple[bool, str, Optional[str]]:
         """
@@ -168,24 +183,33 @@ You have access to tools that allow you to inspect the system, manage files, and
             print(f"\n[Info] {msg}")
 
     def run_auto_skill_synthesis(self, task_summary: str):
-        """Analyze trajectory to automatically extract and write newly learned skills."""
+        """Analyze trajectory against catalog to automatically extract or refine skills."""
         if not self.auto_learn_skills:
             return
 
-        learned = self.skill_extractor.extract_and_save(
+        result = self.skill_extractor.extract_and_save(
             client=self.client,
             model=self.model,
             messages=self.messages,
             task_summary=task_summary
         )
-        if learned:
-            print(f"\n[Self-Improvement] Automatically synthesized new skill: '{learned['name']}'")
-            print(f"  Description: {learned['description']}")
+        if result:
+            action = result.get("action", "SAVED")
+            name = result["name"]
+            desc = result.get("description", "")
+            action_label = "Refined existing skill" if action == "UPDATE" else "Synthesized new skill"
+            
+            print(f"\n[Self-Improvement] {action_label}: '{name}'")
+            print(f"  Description: {desc}")
+            
+            # Refresh system prompt with updated skills catalog
+            self.refresh_system_prompt()
+            
             self.logger.log_step(
                 self.session_id,
                 self.step_counter,
                 "skill_synthesis",
-                content=f"Auto-saved skill: {learned['name']}"
+                content=f"{action_label}: {name}"
             )
 
     def step(self) -> Any:
@@ -210,7 +234,28 @@ You have access to tools that allow you to inspect the system, manage files, and
         self.step_counter = 0
         self.logger.start_session(self.session_id, user_task)
 
-        # Append user task
+        # 1. Pre-Turn Skill Matching: Automatically search for relevant skills
+        relevant_skills = skill_store.find_relevant_skills(user_task)
+        if relevant_skills:
+            skill_blocks = []
+            for sk in relevant_skills:
+                skill_blocks.append(
+                    f"=== RELEVANT SKILL: {sk['name']} ===\n"
+                    f"Description: {sk.get('description', '')}\n"
+                    f"Instructions to Follow:\n{sk.get('instructions', '')}\n"
+                    f"======================================"
+                )
+            
+            skill_injection = (
+                "[RELEVANT LEARNED SKILLS AUTO-INJECTED]:\n"
+                "The following established skills directly match this task. Apply their procedures:\n\n"
+                + "\n\n".join(skill_blocks)
+            )
+            print(f"\n[Skill Retrieval] Found {len(relevant_skills)} matching skill(s): {', '.join(s['name'] for s in relevant_skills)}")
+            self.messages.append({"role": "user", "content": skill_injection})
+            self.step_counter += 1
+
+        # 2. Append user task
         self.messages.append({"role": "user", "content": user_task})
         self.step_counter += 1
         self.logger.log_step(self.session_id, self.step_counter, "user", content=user_task)
@@ -303,7 +348,7 @@ You have access to tools that allow you to inspect the system, manage files, and
                 print(f"\n[Task Complete]:\n{final_answer}\n" + "=" * 65)
                 self.logger.end_session(self.session_id, status="COMPLETED")
 
-                # Run post-task automatic skill synthesis reflection
+                # Run post-task automatic skill synthesis & deduplicating reflection
                 self.run_auto_skill_synthesis(user_task)
 
                 return final_answer
@@ -370,7 +415,7 @@ def main():
     print(f"Max Tokens: {args.max_tokens} (Compaction threshold: ~{int(args.max_tokens * 0.70)} tokens)")
     print(f"Protocol:   {'Hermes XML (<tool_call>)' if args.xml else 'OpenAI JSON Tool Calling'}")
     print("Security:   Interactive user review is active for EVERY system command.")
-    print("Features:   Auto-Skill Synthesis | Context Compaction | Local LLM Ready\n")
+    print("Features:   Auto-Skill Synthesis & Deduplication | Skill Auto-Retrieval\n")
     print("Commands:   /skills | /compact (force compaction) | /context | exit")
 
     agent = HermesCodingAgent(

@@ -50,42 +50,64 @@ class TestHermesAgentComponents(unittest.TestCase):
         self.assertFalse(term.is_destructive("git status"))
         self.assertFalse(term.is_destructive("ls -la"))
 
-    def test_skill_store(self):
+    def test_skill_store_and_search(self):
         skill_dir = os.path.join(self.test_dir, "skills")
         store = SkillStore(storage_dir=skill_dir)
 
-        save_res = store.save_skill(
-            name="git_squash",
-            description="How to squash commits",
+        # Save
+        store.save_skill(
+            name="git_squash_commits",
+            description="How to rebase and squash git commits together",
             instructions="Run git rebase -i HEAD~3"
         )
-        self.assertIn("successfully saved", save_res)
+        store.save_skill(
+            name="setup_pytest_env",
+            description="Configure python virtual environment for pytest suites",
+            instructions="python -m venv venv && pip install pytest"
+        )
 
-        load_res = store.load_skill("git_squash")
-        self.assertIn("Run git rebase -i HEAD~3", load_res)
+        # Test catalog formatting
+        catalog = store.format_catalog_prompt()
+        self.assertIn("git_squash_commits", catalog)
+        self.assertIn("setup_pytest_env", catalog)
 
-        list_res = store.list_skills()
-        self.assertIn("git_squash", list_res)
+        # Test relevant skill retrieval
+        matches = store.find_relevant_skills("I need to squash my last 3 commits in git")
+        self.assertTrue(len(matches) > 0)
+        self.assertEqual(matches[0]["name"], "git_squash_commits")
 
-    def test_auto_skill_extractor(self):
+        pytest_matches = store.find_relevant_skills("Run the pytest test suite")
+        self.assertTrue(len(pytest_matches) > 0)
+        self.assertEqual(pytest_matches[0]["name"], "setup_pytest_env")
+
+    def test_auto_skill_extractor_deduplication(self):
         skill_dir = os.path.join(self.test_dir, "skills_auto")
         store = SkillStore(storage_dir=skill_dir)
         extractor = AutoSkillExtractor(skill_store=store)
 
+        # Save initial skill
+        store.save_skill(
+            name="setup_pytest_env",
+            description="Configure python virtual environment for pytest",
+            instructions="1. python -m venv venv"
+        )
+
         messages = [
-            {"role": "user", "content": "Set up a virtual environment and run pytest."},
-            {"role": "assistant", "content": "Running setup commands."},
-            {"role": "tool", "content": "Virtual environment created successfully."},
-            {"role": "assistant", "content": "Pytest configuration finished."}
+            {"role": "user", "content": "Set up virtualenv with pytest and coverage."},
+            {"role": "assistant", "content": "Running setup."},
+            {"role": "tool", "content": "venv created and coverage added."},
+            {"role": "assistant", "content": "Configured."}
         ]
 
+        # Case A: LLM updates existing skill instead of duplicating
         mock_client = MagicMock()
         mock_resp = MagicMock()
         mock_resp.choices = [MagicMock(message=MagicMock(content=json.dumps({
-            "should_save": True,
-            "name": "setup_pytest_venv",
-            "description": "How to configure a virtual environment for pytest",
-            "instructions": "1. python -m venv venv\n2. pip install pytest"
+            "action": "UPDATE",
+            "target_skill_name": "setup_pytest_env",
+            "name": "setup_pytest_env",
+            "description": "Configure python virtual environment with pytest and coverage",
+            "instructions": "1. python -m venv venv\n2. pip install pytest pytest-cov"
         })))]
         mock_client.chat.completions.create.return_value = mock_resp
 
@@ -93,12 +115,27 @@ class TestHermesAgentComponents(unittest.TestCase):
             client=mock_client,
             model="Qwen-32b",
             messages=messages,
-            task_summary="Set up venv"
+            task_summary="Set up venv with coverage"
         )
 
         self.assertIsNotNone(result)
-        self.assertEqual(result["name"], "setup_pytest_venv")
-        self.assertIn("setup_pytest_venv", store.list_skills())
+        self.assertEqual(result["action"], "UPDATE")
+        self.assertEqual(result["name"], "setup_pytest_env")
+        
+        # Verify only 1 skill file exists (no duplicates)
+        all_skills = store.get_all_skills()
+        self.assertEqual(len(all_skills), 1)
+        self.assertIn("pytest-cov", all_skills[0]["instructions"])
+
+        # Case B: LLM action NONE (trivial / duplicate)
+        mock_resp.choices = [MagicMock(message=MagicMock(content=json.dumps({"action": "NONE"})))]
+        result_none = extractor.extract_and_save(
+            client=mock_client,
+            model="Qwen-32b",
+            messages=messages,
+            task_summary="Routine test"
+        )
+        self.assertIsNone(result_none)
 
     def test_hermes_xml_protocol_parsing(self):
         sample_model_response = """
@@ -197,6 +234,28 @@ Fix NoneType bug in main.py.
         self.assertIn("[CONTEXT COMPACTION — REFERENCE ONLY]", compacted[1]["content"])
         self.assertEqual(cm.previous_checkpoint, mock_checkpoint_output)
 
+    def test_agent_skill_auto_injection(self):
+        from tools import skill_store as global_store
+        # Save a skill into the store
+        global_store.save_skill(
+            name="fastapi_endpoint_pattern",
+            description="How to write a standard FastAPI router with Pydantic schemas",
+            instructions="from fastapi import APIRouter\nrouter = APIRouter()"
+        )
+
+        agent = HermesCodingAgent(auto_learn_skills=False)
+        mock_response = MagicMock(choices=[MagicMock(message=MagicMock(content="Done building endpoint.", tool_calls=None))])
+        agent.client.chat.completions.create = MagicMock(return_value=mock_response)
+
+        agent.run("Create a new FastAPI router endpoint")
+
+        # Verify that the skill was retrieved and pre-injected into messages
+        injected_turns = [m for m in agent.messages if "[RELEVANT LEARNED SKILLS AUTO-INJECTED]" in str(m.get("content"))]
+        self.assertEqual(len(injected_turns), 1)
+        self.assertIn("fastapi_endpoint_pattern", injected_turns[0]["content"])
+        self.assertIn("from fastapi import APIRouter", injected_turns[0]["content"])
+
 
 if __name__ == "__main__":
     unittest.main()
+

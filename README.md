@@ -15,8 +15,10 @@ An open-source, terminal-native Python agent harness optimized for local models 
    - Implements the **Security & Provenance Context-Checkpoint Summarizer** contract.
    - Host-side deterministic extraction for `<EXACT_ANCHORS>` (paths, URLs, error text, commit SHAs) and `<VERBATIM_USER_MESSAGES>`.
    - Iterative delta checkpointing via `<PREVIOUS_CHECKPOINT>`.
-4. **Automatic Skill Synthesis & Writing ([`skills.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/skills.py))**:
-   - Reflects on successful trajectories and automatically synthesizes newly learned engineering procedures into `.agent_skills/`.
+4. **Hermes Skill System & Intelligent Deduplication ([`skills.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/skills.py))**:
+   - **Dynamic Skill Catalog**: Injects an `<available_skills>` index into the system prompt so the agent is constantly aware of repository skills.
+   - **Pre-Turn Auto-Retrieval**: Performs keyword/token overlap search on the user's task and automatically pre-injects matching skill instructions into active memory.
+   - **Catalog-Aware Deduplication & Merging**: Compares finished sessions against existing skills. Refines/updates existing skills (`UPDATE`) instead of creating redundant duplicate files, or ignores trivial repeats (`NONE`).
 5. **Interactive Review for Every System Command ([`agent.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/agent.py))**:
    - Every terminal command pauses for user approval: Run (`[Enter]/y`), Deny (`n`), Edit (`e`), or Steer with feedback text.
 6. **Stateful Terminal Engine ([`terminal.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/terminal.py))**:
