@@ -204,10 +204,10 @@ not new requests. Omit if none were supplied.]
 
     def __init__(
         self,
-        max_context_tokens: int = 16000,
-        trigger_threshold: float = 0.65,
-        keep_recent_turns: int = 6,
-        cooldown_steps: int = 3,
+        max_context_tokens: int = 131072,  # 128K native context window for Qwen3-32B / Qwen2.5-32B
+        trigger_threshold: float = 0.70,   # Triggers compaction at ~91K tokens
+        keep_recent_turns: int = 8,
+        cooldown_steps: int = 4,
     ):
         self.max_context_tokens = max_context_tokens
         self.trigger_threshold = trigger_threshold

@@ -69,7 +69,7 @@ python agent.py --model Qwen-32b --base-url http://localhost:8080/v1
 | `--base-url` | `-u` | `http://localhost:11434/v1` | LLM HTTP API endpoint |
 | `--api-key` | `-k` | `local` | API Key (optional for local models) |
 | `--xml` | | `False` | Use Hermes XML `<tool_call>` protocol |
-| `--max-tokens` | | `16000` | Context token capacity before compaction |
+| `--max-tokens` | | `131072` | Context capacity limit (128K native for Qwen3-32B) |
 | `--no-auto-skills`| | `False` | Disable automatic post-task skill synthesis |
 
 ---

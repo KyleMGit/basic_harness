@@ -60,8 +60,8 @@ You have access to tools that allow you to inspect the system, manage files, and
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         max_iterations: int = 30,
-        max_context_tokens: int = 16000,
-        compaction_threshold: float = 0.65,
+        max_context_tokens: int = 131072,  # 128K native context window for Qwen3-32B
+        compaction_threshold: float = 0.70,
         confirm_all_terminal_commands: bool = True,
         auto_learn_skills: bool = True,
         use_hermes_xml_protocol: bool = False,
@@ -347,8 +347,8 @@ def parse_args():
     parser.add_argument(
         "--max-tokens",
         type=int,
-        default=int(os.environ.get("AGENT_MAX_TOKENS", "16000")),
-        help="Context window token limit before compaction triggers. Default: 16000"
+        default=int(os.environ.get("AGENT_MAX_TOKENS", "131072")),
+        help="Context window token limit before compaction triggers (Qwen3-32B native is 128K/131072). Default: 131072"
     )
     parser.add_argument(
         "--no-auto-skills",
