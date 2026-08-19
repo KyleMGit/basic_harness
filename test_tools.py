@@ -71,6 +71,13 @@ class TestHermesAgentComponents(unittest.TestCase):
         self.assertIn("git_squash_commits", catalog)
         self.assertIn("setup_pytest_env", catalog)
 
+        # Test loading by plain name, .md, and .json
+        load_plain = store.load_skill("git_squash_commits")
+        self.assertIn("Run git rebase -i HEAD~3", load_plain)
+        
+        load_md = store.load_skill("git_squash_commits.md")
+        self.assertIn("Run git rebase -i HEAD~3", load_md)
+
         # Test relevant skill retrieval
         matches = store.find_relevant_skills("I need to squash my last 3 commits in git")
         self.assertTrue(len(matches) > 0)

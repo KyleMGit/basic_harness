@@ -1,6 +1,7 @@
 """
 Hermes-inspired Persistent Skill Store, Semantic/Keyword Retrieval,
 and Catalog-Aware Deduplicating Skill Synthesis.
+Supports native Markdown (SKILL.md, .md with YAML frontmatter) and JSON format.
 """
 
 import json
@@ -12,66 +13,195 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 class SkillStore:
     """
     Manages a persistent library of skills and reusable workflows.
-    Provides indexing, keyword/overlap retrieval, deduplication, and catalog formatting.
+    Supports native Hermes Markdown (.md, SKILL.md with YAML frontmatter)
+    and JSON formats interchangeably.
     """
 
     def __init__(self, storage_dir: Optional[str] = None):
         self.storage_dir = os.path.abspath(storage_dir or os.path.join(os.getcwd(), ".agent_skills"))
         os.makedirs(self.storage_dir, exist_ok=True)
 
-    def _safe_filename(self, name: str) -> str:
-        safe_name = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in name).strip("_").lower()
-        return f"{safe_name}.json"
+    def _safe_name(self, name: str) -> str:
+        base = os.path.basename(name)
+        for ext in (".md", ".json", ".yaml", ".yml"):
+            if base.lower().endswith(ext):
+                base = base[:-len(ext)]
+        return "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in base).strip("_").lower()
 
-    def save_skill(self, name: str, description: str, instructions: str, tags: Optional[List[str]] = None) -> str:
-        """Save a new skill or update an existing one."""
-        file_path = os.path.join(self.storage_dir, self._safe_filename(name))
-        
-        skill_data = {
-            "name": name.strip(),
-            "description": description.strip(),
-            "instructions": instructions.strip(),
-            "tags": tags or [],
+    @staticmethod
+    def parse_markdown_skill(content: str, default_name: str = "") -> Dict[str, Any]:
+        """Parse Markdown file with optional YAML frontmatter into a skill dictionary."""
+        name = default_name
+        description = ""
+        tags = []
+        instructions = content.strip()
+
+        # Check for YAML frontmatter block (--- ... ---)
+        fm_match = re.match(r"^---\s*\n(.*?)\n---\s*\n?(.*)$", content, re.DOTALL)
+        if fm_match:
+            frontmatter_text = fm_match.group(1)
+            instructions = fm_match.group(2).strip()
+
+            for line in frontmatter_text.splitlines():
+                line = line.strip()
+                if line.startswith("name:"):
+                    name = line.split(":", 1)[1].strip().strip('"').strip("'")
+                elif line.startswith("description:"):
+                    description = line.split(":", 1)[1].strip().strip('"').strip("'")
+                elif line.startswith("tags:"):
+                    raw_tags = line.split(":", 1)[1].strip().strip("[]")
+                    tags = [t.strip().strip('"').strip("'") for t in raw_tags.split(",") if t.strip()]
+
+        # If description was not in frontmatter, extract from ## Description section
+        if not description:
+            desc_match = re.search(r"##\s*Description\s*\n+([^\n#]+)", instructions, re.IGNORECASE)
+            if desc_match:
+                description = desc_match.group(1).strip()
+
+        # If instructions contain ## Instructions header, keep clean body
+        return {
+            "name": name or default_name or "unnamed_skill",
+            "description": description or f"Skill: {name or default_name}",
+            "instructions": instructions,
+            "tags": tags,
         }
 
+    @staticmethod
+    def format_markdown_skill(name: str, description: str, instructions: str, tags: Optional[List[str]] = None) -> str:
+        """Format skill data into standard Hermes Markdown with YAML frontmatter."""
+        tags_str = f"[{', '.join(tags)}]" if tags else "[]"
+        return f"""---
+name: {name}
+description: {description}
+tags: {tags_str}
+---
+
+# {name}
+
+## Description
+{description}
+
+## Instructions
+{instructions}
+"""
+
+    def resolve_skill_file(self, name: str) -> Optional[str]:
+        """
+        Locate the skill file across various naming and extension conventions (.md, .json, SKILL.md).
+        """
+        safe = self._safe_name(name)
+        candidates = [
+            os.path.join(self.storage_dir, f"{safe}.md"),
+            os.path.join(self.storage_dir, safe, "SKILL.md"),
+            os.path.join(self.storage_dir, f"{safe}.json"),
+            os.path.join(self.storage_dir, name),
+            os.path.abspath(name) if os.path.exists(name) else None,
+        ]
+
+        for cand in candidates:
+            if cand and os.path.isfile(cand):
+                return cand
+        return None
+
+    def save_skill(self, name: str, description: str, instructions: str, tags: Optional[List[str]] = None) -> str:
+        """
+        Save skill as standard Hermes Markdown (.md) and JSON for full backward & tool compatibility.
+        """
+        safe = self._safe_name(name)
+        md_path = os.path.join(self.storage_dir, f"{safe}.md")
+        json_path = os.path.join(self.storage_dir, f"{safe}.json")
+
+        clean_name = name.strip()
+        clean_desc = description.strip()
+        clean_instr = instructions.strip()
+
+        # 1. Write Markdown format (.md)
+        md_content = self.format_markdown_skill(clean_name, clean_desc, clean_instr, tags)
         try:
-            with open(file_path, "w", encoding="utf-8") as f:
-                json.dump(skill_data, f, indent=2)
-            return f"Skill '{name}' successfully saved to '{file_path}'."
+            with open(md_path, "w", encoding="utf-8") as f:
+                f.write(md_content)
         except Exception as e:
-            return f"Error saving skill '{name}': {str(e)}"
+            return f"Error saving markdown skill '{name}': {str(e)}"
+
+        # 2. Write JSON format (.json) for tool/JSON interoperability
+        skill_dict = {
+            "name": clean_name,
+            "description": clean_desc,
+            "instructions": clean_instr,
+            "tags": tags or [],
+            "format": "markdown",
+            "file": f"{safe}.md"
+        }
+        try:
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(skill_dict, f, indent=2)
+        except Exception:
+            pass
+
+        return f"Skill '{clean_name}' successfully saved as '{md_path}' and '{json_path}'."
 
     def load_skill(self, name: str) -> str:
-        """Load and read instructions for a specific skill."""
-        file_path = os.path.join(self.storage_dir, self._safe_filename(name))
-
-        if not os.path.exists(file_path):
-            return f"Skill '{name}' not found."
+        """Load and read instructions for a specific skill from .md or .json file."""
+        file_path = self.resolve_skill_file(name)
+        if not file_path:
+            return f"Skill '{name}' not found in '{self.storage_dir}' (checked .md, .json, and SKILL.md)."
 
         try:
             with open(file_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            return f"=== SKILL: {data.get('name')} ===\nDescription: {data.get('description')}\n\nInstructions:\n{data.get('instructions')}"
+                content = f.read()
+
+            if file_path.endswith(".json"):
+                data = json.loads(content)
+                skill_name = data.get("name", name)
+                desc = data.get("description", "")
+                instr = data.get("instructions", "")
+            else:
+                data = self.parse_markdown_skill(content, default_name=self._safe_name(name))
+                skill_name = data.get("name")
+                desc = data.get("description")
+                instr = data.get("instructions")
+
+            return f"=== SKILL: {skill_name} ===\nFile: {file_path}\nDescription: {desc}\n\nInstructions:\n{instr}"
         except Exception as e:
-            return f"Error loading skill '{name}': {str(e)}"
+            return f"Error loading skill from '{file_path}': {str(e)}"
 
     def get_all_skills(self) -> List[Dict[str, Any]]:
-        """Retrieve all stored skills with full contents."""
-        skills = []
+        """Retrieve all stored skills with full contents from .md, .json, and SKILL.md files."""
+        skills_map: Dict[str, Dict[str, Any]] = {}
         if not os.path.exists(self.storage_dir):
-            return skills
+            return []
 
-        for filename in sorted(os.listdir(self.storage_dir)):
-            if filename.endswith(".json"):
-                path = os.path.join(self.storage_dir, filename)
-                try:
-                    with open(path, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                        if "name" in data and "instructions" in data:
-                            skills.append(data)
-                except Exception:
-                    continue
-        return skills
+        # 1. Scan storage directory (and subdirectories for SKILL.md)
+        for root, _, files in os.walk(self.storage_dir):
+            for filename in sorted(files):
+                full_path = os.path.join(root, filename)
+                
+                # Check markdown files (.md, SKILL.md)
+                if filename.endswith(".md"):
+                    try:
+                        with open(full_path, "r", encoding="utf-8") as f:
+                            content = f.read()
+                        parsed = self.parse_markdown_skill(content, default_name=self._safe_name(filename))
+                        norm_name = self._safe_name(parsed["name"])
+                        parsed["file_path"] = full_path
+                        skills_map[norm_name] = parsed
+                    except Exception:
+                        continue
+
+                # Check JSON files (.json) only if not already loaded from .md
+                elif filename.endswith(".json"):
+                    norm_name = self._safe_name(filename)
+                    if norm_name not in skills_map:
+                        try:
+                            with open(full_path, "r", encoding="utf-8") as f:
+                                data = json.load(f)
+                            if "name" in data and "instructions" in data:
+                                data["file_path"] = full_path
+                                skills_map[norm_name] = data
+                        except Exception:
+                            continue
+
+        return list(skills_map.values())
 
     def get_skills_index(self) -> List[Dict[str, str]]:
         """Retrieve a lightweight catalog index of all available skills."""
@@ -106,10 +236,8 @@ class SkillStore:
             return []
 
         def tokenize(text: str) -> Set[str]:
-            # Replace underscores and hyphens with spaces to extract constituent subwords
             clean_text = re.sub(r"[_\-/\\]", " ", text.lower())
             words = set(re.findall(r"\b[a-zA-Z0-9]{3,}\b", clean_text))
-            # Also keep exact original tokens
             words.update(re.findall(r"\b[a-zA-Z0-9_\-]{3,}\b", text.lower()))
             return words
 
@@ -136,28 +264,31 @@ class SkillStore:
             if score >= threshold:
                 scored_skills.append((score, skill))
 
-        # Sort descending by score
         scored_skills.sort(key=lambda x: x[0], reverse=True)
         return [skill for _, skill in scored_skills[:top_k]]
 
     def list_skills(self) -> str:
-        """List all available skills with summaries."""
+        """List all available skills with summaries and file formats."""
         skills = self.get_all_skills()
         if not skills:
             return "No skills found in skill repository (.agent_skills/)."
 
         output = ["Available Learned Skills:"]
         for s in skills:
-            output.append(f"- **{s['name']}**: {s.get('description', 'No description')}")
+            rel_file = os.path.basename(s.get("file_path", ""))
+            output.append(f"- **{s['name']}** (`{rel_file}`): {s.get('description', 'No description')}")
         return "\n".join(output)
 
     def delete_skill(self, name: str) -> bool:
-        """Delete a skill by name."""
-        file_path = os.path.join(self.storage_dir, self._safe_filename(name))
-        if os.path.exists(file_path):
-            os.remove(file_path)
-            return True
-        return False
+        """Delete a skill and its corresponding .md and .json files."""
+        safe = self._safe_name(name)
+        deleted = False
+        for ext in (".md", ".json"):
+            path = os.path.join(self.storage_dir, f"{safe}{ext}")
+            if os.path.exists(path):
+                os.remove(path)
+                deleted = True
+        return deleted
 
 
 class AutoSkillExtractor:
@@ -166,7 +297,7 @@ class AutoSkillExtractor:
     Analyzes finished trajectories against existing skills to:
     1. Avoid duplicate/redundant skills.
     2. Merge & update existing skills when better techniques are discovered.
-    3. Synthesize novel skills only when genuinely new capabilities are formed.
+    3. Synthesize novel skills into standard Markdown & JSON.
     """
 
     REFLECTION_PROMPT = """You are an autonomous AI Skill Curator and Synthesis Engine.
@@ -273,7 +404,6 @@ Respond ONLY with a JSON object in this format:
                             f"{existing['name']} {existing.get('description', '')}"
                         )
                         if sim > 0.55:
-                            # Re-route to updating the existing skill rather than creating duplicate
                             name = existing["name"]
                             action = "UPDATE"
                             break
