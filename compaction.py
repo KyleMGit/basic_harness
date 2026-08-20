@@ -329,6 +329,15 @@ not new requests. Omit if none were supplied.]
         exact_anchors = self.extract_exact_anchors(messages_to_summarize)
         verbatim_user_msgs = self.extract_verbatim_user_messages(messages_to_summarize)
 
+        try:
+            from memory import project_memory_manager, user_profile_manager
+            memory_provider_ctx = (
+                f"Project Memory (MEMORY.md):\n{project_memory_manager.load_memory()}\n\n"
+                f"User Profile (USER.md):\n{user_profile_manager.load_profile()}"
+            )
+        except Exception:
+            memory_provider_ctx = "None."
+
         user_prompt = f"""<CURRENT_DATE>
 {current_date_str}
 </CURRENT_DATE>
@@ -342,7 +351,7 @@ not new requests. Omit if none were supplied.]
 </PREVIOUS_CHECKPOINT>
 
 <MEMORY_PROVIDER_CONTEXT>
-None.
+{memory_provider_ctx}
 </MEMORY_PROVIDER_CONTEXT>
 
 <TURNS_TO_COMPACT>

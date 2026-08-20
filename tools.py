@@ -1,12 +1,16 @@
 """
 Coding Agent Tools and Registry.
-Includes file manipulation, stateful terminal execution, and persistent skills.
+Includes file manipulation, stateful terminal execution, codebase search,
+persistent skills, user profile (USER.md), and project facts (MEMORY.md).
 """
 
+import fnmatch
 import os
+import re
 from typing import Any, Callable, Dict, List, Optional
 from terminal import TerminalSession
 from skills import SkillStore
+from memory import user_profile_manager, project_memory_manager
 
 
 class ToolRegistry:
@@ -57,7 +61,7 @@ skill_store = SkillStore()
 
 
 # ==============================================================================
-# TOOL DEFINITIONS
+# TOOL DEFINITIONS: TERMINAL & PROCESS EXECUTION
 # ==============================================================================
 
 @registry.register(
@@ -82,6 +86,10 @@ skill_store = SkillStore()
 def run_terminal_command(command: str, timeout: int = 60) -> str:
     return terminal_session.execute(command, timeout=timeout)
 
+
+# ==============================================================================
+# TOOL DEFINITIONS: FILE MANIPULATION & CODEBASE SEARCH
+# ==============================================================================
 
 @registry.register(
     name="read_file",
@@ -212,6 +220,124 @@ def list_directory(directory_path: str = ".") -> str:
 
 
 @registry.register(
+    name="grep_search",
+    description="Fast regex or literal text search across files in the codebase (ripgrep-style). Returns file paths, line numbers, and matching snippets.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Text substring or regex pattern to search for."},
+            "search_path": {"type": "string", "description": "Root directory or file to search within (default: current working directory).", "default": "."},
+            "is_regex": {"type": "boolean", "description": "True to treat query as regex, False for literal text match.", "default": False},
+            "file_pattern": {"type": "string", "description": "Optional file glob filter (e.g. '*.py', '*.js', '*.md')."},
+            "max_results": {"type": "integer", "description": "Maximum matching lines to return (default: 30).", "default": 30}
+        },
+        "required": ["query"]
+    }
+)
+def grep_search(
+    query: str,
+    search_path: str = ".",
+    is_regex: bool = False,
+    file_pattern: Optional[str] = None,
+    max_results: int = 30
+) -> str:
+    resolved_root = os.path.abspath(os.path.join(terminal_session.cwd, search_path))
+    if not os.path.exists(resolved_root):
+        return f"Error: Path '{search_path}' not found."
+
+    ignored_dirs = {".git", "node_modules", "__pycache__", "venv", ".venv", ".agent_history.db", ".pytest_cache"}
+    
+    try:
+        matcher = re.compile(query, re.IGNORECASE) if is_regex else None
+    except Exception as e:
+        return f"Error in regex query: {str(e)}"
+
+    matches = []
+    
+    def search_file(fpath: str):
+        try:
+            with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                for line_idx, line in enumerate(f, 1):
+                    is_match = bool(matcher.search(line)) if is_regex else (query.lower() in line.lower())
+                    if is_match:
+                        rel_path = os.path.relpath(fpath, terminal_session.cwd)
+                        matches.append(f"{rel_path}:{line_idx}: {line.strip()}")
+                        if len(matches) >= max_results:
+                            return True
+        except Exception:
+            pass
+        return False
+
+    if os.path.isfile(resolved_root):
+        search_file(resolved_root)
+    else:
+        for root, dirs, files in os.walk(resolved_root):
+            dirs[:] = [d for d in dirs if d not in ignored_dirs and not d.startswith(".")]
+            for filename in files:
+                if file_pattern and not fnmatch.fnmatch(filename, file_pattern):
+                    continue
+                full_path = os.path.join(root, filename)
+                if search_file(full_path):
+                    break
+            if len(matches) >= max_results:
+                break
+
+    if not matches:
+        return f"No matches found for '{query}' in '{search_path}'."
+
+    output = [f"Found {len(matches)} match(es):"] + matches
+    if len(matches) >= max_results:
+        output.append(f"... [Capped at {max_results} results]")
+    return "\n".join(output)
+
+
+@registry.register(
+    name="find_files_by_pattern",
+    description="Find files and directories matching a glob pattern across the workspace (e.g. '*.py', '*test*', 'src/**/*.ts').",
+    parameters={
+        "type": "object",
+        "properties": {
+            "pattern": {"type": "string", "description": "Glob pattern (e.g. '*.py', '*agent*', '*.json')."},
+            "search_path": {"type": "string", "description": "Root directory to start searching from (default: .).", "default": "."},
+            "max_results": {"type": "integer", "description": "Maximum files to return (default: 40).", "default": 40}
+        },
+        "required": ["pattern"]
+    }
+)
+def find_files_by_pattern(pattern: str, search_path: str = ".", max_results: int = 40) -> str:
+    resolved_root = os.path.abspath(os.path.join(terminal_session.cwd, search_path))
+    if not os.path.exists(resolved_root):
+        return f"Error: Directory '{search_path}' not found."
+
+    ignored_dirs = {".git", "node_modules", "__pycache__", "venv", ".venv", ".pytest_cache"}
+    matched_files = []
+
+    for root, dirs, files in os.walk(resolved_root):
+        dirs[:] = [d for d in dirs if d not in ignored_dirs and not d.startswith(".")]
+        for f in files:
+            if fnmatch.fnmatch(f, pattern):
+                full_path = os.path.join(root, f)
+                rel_path = os.path.relpath(full_path, terminal_session.cwd)
+                matched_files.append(rel_path)
+                if len(matched_files) >= max_results:
+                    break
+        if len(matched_files) >= max_results:
+            break
+
+    if not matched_files:
+        return f"No files matching '{pattern}' found in '{search_path}'."
+
+    output = [f"Found {len(matched_files)} file(s) matching '{pattern}':"] + [f"- {p}" for p in matched_files]
+    if len(matched_files) >= max_results:
+        output.append(f"... [Capped at {max_results} files]")
+    return "\n".join(output)
+
+
+# ==============================================================================
+# TOOL DEFINITIONS: SKILLS & PERSISTENT MEMORY (USER.MD / MEMORY.MD)
+# ==============================================================================
+
+@registry.register(
     name="save_skill",
     description="Save a newly learned procedure, command workflow, or script to the agent's persistent skill library.",
     parameters={
@@ -250,3 +376,65 @@ def load_skill(name: str) -> str:
 )
 def list_skills() -> str:
     return skill_store.list_skills()
+
+
+@registry.register(
+    name="read_user_profile",
+    description="Read the current user profile (USER.md) containing operator background, preferred tools, and conventions.",
+    parameters={"type": "object", "properties": {}}
+)
+def read_user_profile() -> str:
+    return user_profile_manager.load_profile()
+
+
+@registry.register(
+    name="update_user_profile",
+    description="Update or append persistent preferences, technical background, or operational constraints in USER.md.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "category": {
+                "type": "string",
+                "description": "Category heading in USER.md (e.g. 'Communication Preferences', 'Technical Preferences & Conventions', 'Operational Constraints & Safety')."
+            },
+            "preference": {
+                "type": "string",
+                "description": "The specific user preference, background detail, or rule to record."
+            }
+        },
+        "required": ["category", "preference"]
+    }
+)
+def update_user_profile(category: str, preference: str) -> str:
+    return user_profile_manager.update_preference(category=category, note=preference)
+
+
+@registry.register(
+    name="read_project_memory",
+    description="Read the current project memory (MEMORY.md) containing architecture facts, environment notes, and codebase conventions.",
+    parameters={"type": "object", "properties": {}}
+)
+def read_project_memory() -> str:
+    return project_memory_manager.load_memory()
+
+
+@registry.register(
+    name="update_project_memory",
+    description="Update or append persistent architectural facts, environment notes, or resolved bug patterns in MEMORY.md.",
+    parameters={
+        "type": "object",
+        "properties": {
+            "category": {
+                "type": "string",
+                "description": "Category heading in MEMORY.md (e.g. 'Codebase Architecture & Tech Stack', 'Environment & Configuration', 'Key Patterns & Conventions', 'Known Gotchas & Resolved Issues')."
+            },
+            "fact": {
+                "type": "string",
+                "description": "The specific technical fact, architectural note, or convention to record."
+            }
+        },
+        "required": ["category", "fact"]
+    }
+)
+def update_project_memory(category: str, fact: str) -> str:
+    return project_memory_manager.update_fact(category=category, fact=fact)

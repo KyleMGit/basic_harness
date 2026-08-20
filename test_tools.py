@@ -276,9 +276,138 @@ Fix NoneType bug in main.py.
         self.assertIn("git rebase -i HEAD~3", result)
         self.assertNotIn("Error: Tool", result)
 
+    def test_user_profile_management(self):
+        from memory import UserProfileManager
+        mem_dir = os.path.join(self.test_dir, "memories")
+        mgr = UserProfileManager(storage_dir=mem_dir)
+
+        # 1. Load initial profile
+        initial = mgr.load_profile()
+        self.assertIn("User Profile & Preferences", initial)
+        self.assertIn("Communication Preferences", initial)
+
+        # 2. Append new preference under section
+        update_res = mgr.update_preference("Technical Preferences & Conventions", "Prefers strict type hints and Pydantic v2")
+        self.assertIn("Successfully updated USER.md", update_res)
+
+        updated = mgr.load_profile()
+        self.assertIn("Prefers strict type hints and Pydantic v2", updated)
+
+        # 3. System prompt XML block formatting
+        block = mgr.format_system_prompt_block()
+        self.assertTrue(block.startswith("<user_profile>"))
+        self.assertTrue(block.endswith("</user_profile>"))
+
+    def test_user_profile_tools(self):
+        from tools import registry as reg
+        read_res = reg.execute("read_user_profile", {})
+        self.assertIn("User Profile", read_res)
+
+        # Test updating with a new preference
+        unique_pref = f"Format terminal outputs with clean headers (run_id_{id(self)})"
+        update_res = reg.execute("update_user_profile", {
+            "category": "Communication Preferences",
+            "preference": unique_pref
+        })
+        self.assertIn("Successfully updated USER.md", update_res)
+
+        # Test deduplication when adding the exact same preference again
+        repeat_res = reg.execute("update_user_profile", {
+            "category": "Communication Preferences",
+            "preference": unique_pref
+        })
+        self.assertIn("Preference already recorded in USER.md", repeat_res)
+
+    def test_project_memory_management(self):
+        from memory import ProjectMemoryManager
+        mem_dir = os.path.join(self.test_dir, "proj_mem")
+        mgr = ProjectMemoryManager(storage_dir=mem_dir)
+
+        # 1. Load initial MEMORY.md
+        initial = mgr.load_memory()
+        self.assertIn("Project Memory & Architecture Facts", initial)
+        self.assertIn("Codebase Architecture & Tech Stack", initial)
+
+        # 2. Append fact
+        update_res = mgr.update_fact("Codebase Architecture & Tech Stack", "PostgreSQL database running on port 5432")
+        self.assertIn("Successfully updated MEMORY.md", update_res)
+
+        updated = mgr.load_memory()
+        self.assertIn("PostgreSQL database running on port 5432", updated)
+
+        # 3. System prompt XML block formatting
+        block = mgr.format_system_prompt_block()
+        self.assertTrue(block.startswith("<project_memory>"))
+        self.assertTrue(block.endswith("</project_memory>"))
+
+    def test_session_resumption_and_listing(self):
+        db_path = os.path.join(self.test_dir, "resume_test.db")
+        logger = TrajectoryLogger(db_path=db_path)
+
+        # Create sample session
+        s_id = "sess_res_001"
+        logger.start_session(s_id, "Build authentication system")
+        logger.log_step(s_id, 1, "user", content="Create user login API")
+        logger.log_step(s_id, 2, "assistant", content="Working on auth.py")
+        logger.log_step(s_id, 3, "tool", content="auth.py written successfully")
+        logger.end_session(s_id, "COMPLETED")
+
+        # 1. Test listing sessions
+        sessions = logger.list_sessions()
+        self.assertTrue(len(sessions) > 0)
+        self.assertEqual(sessions[0]["session_id"], s_id)
+        self.assertEqual(sessions[0]["status"], "COMPLETED")
+        self.assertEqual(sessions[0]["step_count"], 3)
+
+        # 2. Test session resumption trajectory loading
+        task, msgs = logger.load_session_messages(s_id)
+        self.assertEqual(task, "Build authentication system")
+        self.assertEqual(len(msgs), 3)
+        self.assertEqual(msgs[0]["role"], "user")
+        self.assertEqual(msgs[0]["content"], "Create user login API")
+
+        # 3. Test agent resume_session
+        agent = HermesCodingAgent(auto_learn_skills=False)
+        agent.logger = logger
+        resumed = agent.resume_session(s_id)
+        self.assertTrue(resumed)
+        self.assertEqual(agent.session_id, s_id)
+        self.assertTrue(len(agent.messages) >= 4)  # 1 system + 3 turns
+
+    def test_codebase_search_grep_and_find(self):
+        from tools import registry as reg, terminal_session as ts
+        ts.cwd = self.test_dir
+
+        # Create mock file structure
+        src_dir = os.path.join(self.test_dir, "src")
+        os.makedirs(src_dir, exist_ok=True)
+        
+        file1 = os.path.join(src_dir, "auth_service.py")
+        with open(file1, "w", encoding="utf-8") as f:
+            f.write("def authenticate_user(token: str):\n    if not token:\n        return False\n    return True\n")
+
+        file2 = os.path.join(src_dir, "database.py")
+        with open(file2, "w", encoding="utf-8") as f:
+            f.write("DB_HOST = 'localhost'\nDB_PORT = 5432\n")
+
+        # 1. Test find_files_by_pattern
+        find_res = reg.execute("find_files_by_pattern", {"pattern": "*.py", "search_path": "."})
+        self.assertIn("auth_service.py", find_res)
+        self.assertIn("database.py", find_res)
+
+        # 2. Test grep_search literal
+        grep_res = reg.execute("grep_search", {"query": "authenticate_user", "search_path": "."})
+        self.assertIn("auth_service.py:1: def authenticate_user", grep_res)
+
+        # 3. Test grep_search regex
+        regex_res = reg.execute("grep_search", {"query": r"DB_\w+\s*=", "is_regex": True, "search_path": "."})
+        self.assertIn("DB_HOST", regex_res)
+        self.assertIn("DB_PORT", regex_res)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 
 

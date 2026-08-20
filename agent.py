@@ -3,15 +3,18 @@ Hermes-Refined Coding Agent Harness.
 An open, persistent, multi-protocol coding agent harness in Python.
 
 Key Features:
-1. Dynamic Skill Catalog & Pre-Turn Relevant Skill Auto-Injection.
-2. Catalog-Aware Skill Deduplication & Merging (Hermes Learning Loop).
-3. Configured for Qwen-32B with 40K (40,960) Token Context Budget.
-4. Local Model Support without API Keys (Qwen-32b, Ollama, vLLM, LM Studio, llama.cpp).
-5. Production-Grade Context Checkpoint Compaction & Summarization.
-6. Interactive User Prompt for Every Terminal Command (approve, edit, reject, feedback).
-7. Stateful Terminal Execution (persistent cwd, cd management, output clipping).
-8. Dual Protocol Tool Calling (OpenAI JSON API & Hermes XML <tool_call> syntax).
-9. SQLite Trajectory Logging & Export.
+1. Codebase Navigation & Search (grep_search, find_files_by_pattern).
+2. Dual Persistent Memory System: USER.md (operator profile) & MEMORY.md (project architecture facts).
+3. Session Continuity & Resumption (--resume <session_id> or /resume command).
+4. Dynamic Skill Catalog & Pre-Turn Relevant Skill Auto-Injection.
+5. Catalog-Aware Skill Deduplication & Merging (Hermes Learning Loop).
+6. Configured for Qwen-32B with 40K (40,960) Token Context Budget.
+7. Local Model Support without API Keys (Qwen-32b, Ollama, vLLM, LM Studio, llama.cpp).
+8. Production-Grade Context Checkpoint Compaction & Summarization.
+9. Interactive User Prompt for Every Terminal Command (approve, edit, reject, feedback).
+10. Stateful Terminal Execution (persistent cwd, cd management, output clipping).
+11. Dual Protocol Tool Calling (OpenAI JSON API & Hermes XML <tool_call> syntax).
+12. SQLite Trajectory Logging & Export.
 """
 
 import argparse
@@ -32,6 +35,7 @@ from skills import AutoSkillExtractor
 from protocol import ToolProtocol
 from storage import TrajectoryLogger
 from compaction import ContextManager
+from memory import user_profile_manager, project_memory_manager
 
 
 class HermesCodingAgent:
@@ -39,19 +43,29 @@ class HermesCodingAgent:
     Stateful, autonomous coding agent harness supporting both
     OpenAI structured tool calling and Hermes XML function calling protocols,
     with interactive human-in-the-loop confirmation for every system command,
-    automated context compaction/summarization, and local model support (Qwen-32b, etc.).
+    automated context compaction/summarization, local model support (Qwen-32b, etc.),
+    dual memory snapshots (USER.md / MEMORY.md), and session resumption.
     """
 
     SYSTEM_PROMPT_TEMPLATE = """You are an autonomous AI software engineer and terminal agent.
-You have access to tools that allow you to inspect the system, manage files, and execute terminal commands.
+You have access to tools that allow you to inspect the system, manage files, search codebases, and execute terminal commands.
 
 ### Important Protocol:
 - **Interactive Terminal Commands**: Every system/terminal command you propose will be reviewed interactively by the user before execution. The user may approve it, modify it, or provide feedback.
 - **Context Compaction**: In long-running tasks, earlier conversation segments may be compressed into structured summary blocks. Use the summary to maintain continuity.
 - **Persistent Workspace**: The terminal environment maintains your working directory (`cwd`) across tool calls. Use `cd <dir>` to navigate projects.
+- **Codebase Exploration**: Use `grep_search` and `find_files_by_pattern` for fast multi-file navigation instead of reading entire files repeatedly.
 - **Verification & Testing**: Always verify changes by running tests, linters, or checking file content.
 - **Analyze Output**: Inspect command outputs (stdout, stderr, exit codes). If errors occur, diagnose and repair them iteratively.
-- **Learned Skills & Best Practices**: Below is the catalog of learned project skills. When a task relates to any available skill, use `load_skill(name="<skill_name>")` or invoke the skill directly by name to read its detailed instructions:
+
+### Operator Profile & Preferences (USER.md):
+{user_profile}
+
+### Project Architecture & Environment Facts (MEMORY.md):
+{project_memory}
+
+### Learned Skills & Best Practices:
+Below is the catalog of learned project skills. When a task relates to any available skill, use `load_skill(name="<skill_name>")` or invoke the skill directly by name:
 {skills_catalog}
 
 - **Conciseness**: Summarize your work clearly when the task is achieved.
@@ -95,7 +109,7 @@ You have access to tools that allow you to inspect the system, manage files, and
         self.session_id = str(uuid.uuid4())[:8]
         self.step_counter = 0
 
-        # Construct system prompt with live skill catalog
+        # Construct system prompt with live skill catalog & memory snapshots
         system_content = self._build_system_prompt()
         if self.use_hermes_xml_protocol:
             system_content = ToolProtocol.format_hermes_system_prompt(system_content, registry.schemas)
@@ -105,24 +119,45 @@ You have access to tools that allow you to inspect the system, manage files, and
         ]
 
     def _build_system_prompt(self) -> str:
-        """Build system prompt embedding the live catalog of available skills."""
+        """Build system prompt embedding live skills, USER.md, and MEMORY.md."""
         catalog_xml = skill_store.format_catalog_prompt()
-        return self.SYSTEM_PROMPT_TEMPLATE.format(skills_catalog=catalog_xml)
+        user_profile_xml = user_profile_manager.format_system_prompt_block()
+        project_mem_xml = project_memory_manager.format_system_prompt_block()
+        return self.SYSTEM_PROMPT_TEMPLATE.format(
+            skills_catalog=catalog_xml,
+            user_profile=user_profile_xml,
+            project_memory=project_mem_xml
+        )
 
     def refresh_system_prompt(self):
-        """Update system prompt with newly learned skills."""
+        """Update system prompt with newly learned skills or updated memories."""
         new_prompt = self._build_system_prompt()
         if self.use_hermes_xml_protocol:
             new_prompt = ToolProtocol.format_hermes_system_prompt(new_prompt, registry.schemas)
         if self.messages and self.messages[0].get("role") == "system":
             self.messages[0]["content"] = new_prompt
 
+    def resume_session(self, target_session_id: str) -> bool:
+        """Resume a past conversation session from .agent_history.db."""
+        task, restored_msgs = self.logger.load_session_messages(target_session_id)
+        if not restored_msgs:
+            return False
+
+        self.session_id = target_session_id
+        self.step_counter = len(restored_msgs)
+
+        system_content = self._build_system_prompt()
+        if self.use_hermes_xml_protocol:
+            system_content = ToolProtocol.format_hermes_system_prompt(system_content, registry.schemas)
+
+        self.messages = [{"role": "system", "content": system_content}] + restored_msgs
+        print(f"\n[Session Resumed] Successfully reloaded session '{target_session_id}' ({len(restored_msgs)} turns restored).")
+        if task:
+            print(f"  Original Task: {task}")
+        return True
+
     def prompt_user_for_command(self, command: str, args: Dict[str, Any]) -> Tuple[bool, str, Optional[str]]:
-        """
-        Interactive prompt for every system command.
-        Returns:
-            (should_execute: bool, final_command: str, custom_feedback: Optional[str])
-        """
+        """Interactive prompt for every system command."""
         print("\n" + "-" * 60)
         print("[SYSTEM COMMAND REVIEW]")
         print(f"   Command: {command}")
@@ -230,9 +265,11 @@ You have access to tools that allow you to inspect the system, manage files, and
 
     def run(self, user_task: str) -> str:
         """Execute the autonomous agent loop for a given task."""
-        self.session_id = str(uuid.uuid4())[:8]
-        self.step_counter = 0
-        self.logger.start_session(self.session_id, user_task)
+        # Only start new session if not continuing an active/resumed one
+        if not self.messages or len(self.messages) <= 1:
+            self.session_id = str(uuid.uuid4())[:8]
+            self.step_counter = 0
+            self.logger.start_session(self.session_id, user_task)
 
         # 1. Pre-Turn Skill Matching: Automatically search for relevant skills
         relevant_skills = skill_store.find_relevant_skills(user_task)
@@ -270,7 +307,10 @@ You have access to tools that allow you to inspect the system, manage files, and
             # Check and compact context before LLM call
             self.manage_context()
 
-            print(f"\n[Iteration {iteration}/{self.max_iterations}] Thinking ({self.model})...")
+            curr_tokens = self.context_manager.estimate_tokens(self.messages)
+            max_t = self.context_manager.max_context_tokens
+            pct = (curr_tokens / max_t) * 100
+            print(f"\n[Iteration {iteration}/{self.max_iterations}] Thinking ({self.model}) [Context: ~{curr_tokens:,}/{max_t:,} tokens ({pct:.1f}%)]...")
 
             try:
                 raw_message = self.step()
@@ -327,6 +367,10 @@ You have access to tools that allow you to inspect the system, manage files, and
                     # Display result preview
                     preview = tool_result if len(tool_result) < 350 else tool_result[:350] + "\n... [TRUNCATED]"
                     print(f"[Tool Result]:\n{preview}\n" + "-" * 50)
+
+                    # If memory or skills were modified mid-turn, refresh system prompt immediately
+                    if fn_name in ("update_user_profile", "update_project_memory", "save_skill"):
+                        self.refresh_system_prompt()
 
                     # Append tool result in appropriate protocol format
                     self.step_counter += 1
@@ -397,6 +441,12 @@ def parse_args():
         help="Context window token limit before compaction triggers (default: 40960 / 40K tokens for Qwen-32B)."
     )
     parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Session ID to resume from .agent_history.db."
+    )
+    parser.add_argument(
         "--no-auto-skills",
         action="store_true",
         help="Disable automatic post-task skill synthesis."
@@ -415,8 +465,8 @@ def main():
     print(f"Max Tokens: {args.max_tokens} (Compaction threshold: ~{int(args.max_tokens * 0.70)} tokens)")
     print(f"Protocol:   {'Hermes XML (<tool_call>)' if args.xml else 'OpenAI JSON Tool Calling'}")
     print("Security:   Interactive user review is active for EVERY system command.")
-    print("Features:   Auto-Skill Synthesis & Deduplication | Skill Auto-Retrieval\n")
-    print("Commands:   /skills | /compact (force compaction) | /context | exit")
+    print("Features:   Code Search | USER.md / MEMORY.md | Session Resumption | Skills\n")
+    print("Commands:   /skills | /user | /memory | /sessions | /resume <id> | /compact | exit")
 
     agent = HermesCodingAgent(
         model=args.model,
@@ -428,6 +478,11 @@ def main():
         use_hermes_xml_protocol=args.xml
     )
 
+    if args.resume:
+        resumed = agent.resume_session(args.resume)
+        if not resumed:
+            print(f"[!] Warning: Could not find session '{args.resume}' to resume. Starting new session.")
+
     while True:
         try:
             prompt = input("\nUser > ").strip()
@@ -436,14 +491,68 @@ def main():
             if prompt.lower() in ("exit", "quit"):
                 print("Exiting agent harness. Trajectories saved.")
                 break
+            if prompt.lower() in ("/user", "/profile", "user", "profile"):
+                print("\n=== USER.md Profile ===")
+                print(user_profile_manager.load_profile())
+                continue
+            if prompt.lower() in ("/memory", "memory"):
+                print("\n=== MEMORY.md Project Facts ===")
+                print(project_memory_manager.load_memory())
+                continue
             if prompt.lower() in ("/skills", "skills"):
                 print("\n" + skill_store.list_skills())
                 continue
+            if prompt.lower() in ("/sessions", "sessions"):
+                past_sessions = agent.logger.list_sessions(limit=10)
+                if not past_sessions:
+                    print("No past sessions found in database.")
+                else:
+                    print("\nPast Recorded Sessions:")
+                    for ps in past_sessions:
+                        print(f"  [{ps['session_id']}] {ps['date']} | Status: {ps['status']:<10} | Steps: {ps['step_count']:<3} | Task: {ps['task'][:45]}")
+                continue
+            if prompt.lower().startswith("/resume") or prompt.lower().startswith("resume"):
+                parts = prompt.split()
+                if len(parts) > 1:
+                    target_id = parts[1]
+                    res = agent.resume_session(target_id)
+                    if not res:
+                        print(f"[!] Session '{target_id}' not found.")
+                else:
+                    print("Usage: /resume <session_id>")
+                continue
             if prompt.lower() in ("/context", "context"):
-                tokens = agent.context_manager.estimate_tokens(agent.messages)
+                total_tokens = agent.context_manager.estimate_tokens(agent.messages)
                 max_t = agent.context_manager.max_context_tokens
-                pct = (tokens / max_t) * 100
-                print(f"\n[Context Status]: ~{tokens}/{max_t} tokens ({pct:.1f}% capacity) across {len(agent.messages)} messages.")
+                trigger_t = int(max_t * agent.context_manager.trigger_threshold)
+                pct = (total_tokens / max_t) * 100
+                bar_len = 25
+                filled = int(bar_len * (total_tokens / max_t))
+                bar = "█" * filled + "░" * (bar_len - filled)
+
+                # Component breakdowns
+                sys_tokens = agent.context_manager.estimate_tokens([agent.messages[0]]) if agent.messages else 0
+                history_msgs = agent.messages[1:] if len(agent.messages) > 1 else []
+                compaction_msgs = [m for m in history_msgs if "[CONTEXT COMPACTION" in str(m.get("content", ""))]
+                turn_msgs = [m for m in history_msgs if "[CONTEXT COMPACTION" not in str(m.get("content", ""))]
+                
+                compaction_tokens = agent.context_manager.estimate_tokens(compaction_msgs)
+                turn_tokens = agent.context_manager.estimate_tokens(turn_msgs)
+                headroom = max(0, trigger_t - total_tokens)
+
+                print("\n" + "=" * 55)
+                print("CONTEXT WINDOW BUDGET & BREAKDOWN")
+                print("=" * 55)
+                print(f"Usage:       [{bar}] {pct:.1f}%")
+                print(f"Total:       ~{total_tokens:,} / {max_t:,} tokens")
+                print(f"Threshold:   ~{trigger_t:,} tokens (70.0% compaction trigger)")
+                print(f"Headroom:    ~{headroom:,} tokens remaining before compaction\n")
+                print("Breakdown:")
+                print(f"  • System Prompt (Base + Skills + USER/MEMORY.md): ~{sys_tokens:,} tokens")
+                if compaction_tokens > 0:
+                    print(f"  • Historical Compaction Summary:                  ~{compaction_tokens:,} tokens")
+                print(f"  • Active Conversation Turns ({len(turn_msgs)} turns):            ~{turn_tokens:,} tokens")
+                print("=" * 55)
                 continue
             if prompt.lower() in ("/compact", "compact"):
                 agent.manage_context(force=True)
