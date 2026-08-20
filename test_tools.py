@@ -404,9 +404,55 @@ Fix NoneType bug in main.py.
         self.assertIn("DB_HOST", regex_res)
         self.assertIn("DB_PORT", regex_res)
 
+    def test_auto_memory_extractor(self):
+        from memory import UserProfileManager, ProjectMemoryManager, AutoMemoryExtractor
+        mem_dir = os.path.join(self.test_dir, "auto_mem")
+        u_mgr = UserProfileManager(storage_dir=mem_dir)
+        p_mgr = ProjectMemoryManager(storage_dir=mem_dir)
+        extractor = AutoMemoryExtractor(user_manager=u_mgr, project_manager=p_mgr)
+
+        mock_client = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.choices = [
+            MagicMock(
+                message=MagicMock(
+                    content=json.dumps({
+                        "user_profile_update": {
+                            "category": "Technical Preferences & Conventions",
+                            "preference": "Prefers uv instead of pip"
+                        },
+                        "project_memory_update": {
+                            "category": "Environment & Configuration",
+                            "fact": "Redis cache running on port 6379"
+                        }
+                    })
+                )
+            )
+        ]
+        mock_client.chat.completions.create.return_value = mock_resp
+
+        messages = [
+            {"role": "user", "content": "Please remember that I prefer uv over pip, and our redis runs on port 6379."},
+            {"role": "assistant", "content": "Understood, I will use uv and redis on 6379."}
+        ]
+
+        result = extractor.extract_and_update(
+            client=mock_client,
+            model="Qwen-32b",
+            messages=messages,
+            task_summary="Configure package manager and redis"
+        )
+
+        self.assertIsNotNone(result.get("user_updated"))
+        self.assertIn("Prefers uv instead of pip", u_mgr.load_profile())
+
+        self.assertIsNotNone(result.get("project_updated"))
+        self.assertIn("Redis cache running on port 6379", p_mgr.load_memory())
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 
 

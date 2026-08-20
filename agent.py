@@ -35,7 +35,7 @@ from skills import AutoSkillExtractor
 from protocol import ToolProtocol
 from storage import TrajectoryLogger
 from compaction import ContextManager
-from memory import user_profile_manager, project_memory_manager
+from memory import user_profile_manager, project_memory_manager, auto_memory_extractor
 
 
 class HermesCodingAgent:
@@ -57,6 +57,10 @@ You have access to tools that allow you to inspect the system, manage files, sea
 - **Codebase Exploration**: Use `grep_search` and `find_files_by_pattern` for fast multi-file navigation instead of reading entire files repeatedly.
 - **Verification & Testing**: Always verify changes by running tests, linters, or checking file content.
 - **Analyze Output**: Inspect command outputs (stdout, stderr, exit codes). If errors occur, diagnose and repair them iteratively.
+
+### Memory Evolution & Learning Protocol:
+- **Operator Preferences (USER.md)**: When the user expresses a personal preference, workflow habit, formatting requirement, or gives you a correction (e.g. "I prefer pytest", "don't use pip", "keep answers under 3 bullets"), immediately call `update_user_profile(category, preference)`.
+- **Project Architecture & Facts (MEMORY.md)**: When you discover new architectural facts, environment variables, server ports, or resolve recurring bug patterns, immediately call `update_project_memory(category, fact)`.
 
 ### Operator Profile & Preferences (USER.md):
 {user_profile}
@@ -105,6 +109,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
             trigger_threshold=compaction_threshold
         )
         self.skill_extractor = AutoSkillExtractor(skill_store=skill_store)
+        self.memory_extractor = auto_memory_extractor
         
         self.session_id = str(uuid.uuid4())[:8]
         self.step_counter = 0
@@ -216,6 +221,25 @@ Below is the catalog of learned project skills. When a task relates to any avail
             )
         elif force:
             print(f"\n[Info] {msg}")
+
+    def run_auto_memory_reflection(self, task_summary: str):
+        """Analyze trajectory to automatically extract and record user preferences and project facts."""
+        result = self.memory_extractor.extract_and_update(
+            client=self.client,
+            model=self.model,
+            messages=self.messages,
+            task_summary=task_summary
+        )
+        refreshed = False
+        if result.get("user_updated"):
+            print(f"\n[Memory Evolution] User preference recorded in USER.md: {result['user_updated']}")
+            refreshed = True
+        if result.get("project_updated"):
+            print(f"\n[Memory Evolution] Project fact recorded in MEMORY.md: {result['project_updated']}")
+            refreshed = True
+
+        if refreshed:
+            self.refresh_system_prompt()
 
     def run_auto_skill_synthesis(self, task_summary: str):
         """Analyze trajectory against catalog to automatically extract or refine skills."""
@@ -392,7 +416,8 @@ Below is the catalog of learned project skills. When a task relates to any avail
                 print(f"\n[Task Complete]:\n{final_answer}\n" + "=" * 65)
                 self.logger.end_session(self.session_id, status="COMPLETED")
 
-                # Run post-task automatic skill synthesis & deduplicating reflection
+                # Run post-task automatic memory evolution & skill synthesis
+                self.run_auto_memory_reflection(user_task)
                 self.run_auto_skill_synthesis(user_task)
 
                 return final_answer

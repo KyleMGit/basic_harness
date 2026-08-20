@@ -12,6 +12,8 @@
 - Format terminal outputs with clean headers (run_id_2254847901520)
 - Format terminal outputs with clean headers (run_id_1513328115344)
 - Format terminal outputs with clean headers (run_id_2298355008720)
+- Format terminal outputs with clean headers (run_id_2303020449936)
+- Format terminal outputs with clean headers (run_id_2542811313872)
 
 ## Technical Preferences & Conventions
 - Environment: Windows (PowerShell / Command Prompt)
