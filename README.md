@@ -12,7 +12,7 @@ An open-source, terminal-native Python agent harness optimized for local models 
 2. **Dual Persistent Memory System (`USER.md` & `MEMORY.md` / [`memory.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/memory.py))**:
    - `USER.md`: Stores operator profile, communication style, technical background, and safety constraints (`<user_profile>`).
    - `MEMORY.md`: Stores project architecture facts, tech stack details, and environment conventions (`<project_memory>`).
-   - Tools `read_user_profile`, `update_user_profile`, `read_project_memory`, `update_project_memory`.
+   - Tools: `read_user_profile`, `update_user_profile`, `read_project_memory`, `update_project_memory`.
 3. **Session Resumption & Trajectory Continuity ([`storage.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/storage.py))**:
    - Pick up past sessions directly via `--resume <session_id>` or interactive `/resume <session_id>`.
    - View past session logs, dates, and step counts with `/sessions`.
@@ -58,28 +58,63 @@ python agent.py --model Qwen-32b --resume <session_id>
 
 ---
 
-## ⚙️ CLI Arguments
+## 💬 1. In-Session Chat Commands (Typed at `User >`)
 
-| Argument | Shorthand | Default | Description |
-| :--- | :--- | :--- | :--- |
-| `--model` | `-m` | `Qwen-32b` | Model name or tag |
-| `--base-url` | `-u` | `http://localhost:11434/v1` | LLM HTTP API endpoint |
-| `--api-key` | `-k` | `local` | API Key (optional for local models) |
-| `--xml` | | `False` | Use Hermes XML `<tool_call>` protocol |
-| `--max-tokens` | | `40960` | Context capacity limit (40K tokens for Qwen-32B) |
-| `--resume` | | `None` | Session ID to resume from `.agent_history.db` |
-| `--no-auto-skills`| | `False` | Disable automatic post-task skill synthesis |
+| Command | Aliases | Description |
+| :--- | :--- | :--- |
+| **`/context`** | `context` | Displays a visual progress bar, total token usage, compaction headroom, and breakdown (System Prompt vs. History vs. Checkpoints). |
+| **`/compact`** | `compact` | Forces an immediate 2-phase context checkpoint compaction without waiting for the 70% threshold. |
+| **`/user`** | `/profile`, `user` | Displays the active operator profile and preferences contract ([`USER.md`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/.agent_memories/USER.md)). |
+| **`/memory`** | `memory` | Displays the persistent project architecture and environment facts ([`MEMORY.md`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/.agent_memories/MEMORY.md)). |
+| **`/skills`** | `skills` | Lists all learned procedures and recipes stored in the repository ([`.agent_skills/`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/.agent_skills)). |
+| **`/sessions`** | `sessions` | Displays past recorded sessions from [`.agent_history.db`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/.agent_history.db) with dates, status, and turn counts. |
+| **`/resume <id>`** | `resume <id>` | Switches to and resumes a past conversation session by its ID. |
+| **`export-trajectory [file.jsonl]`** | | Exports the current session trajectory to a JSONL dataset file. |
+| **`exit`** | `quit` | Saves the active trajectory and gracefully exits the harness. |
 
 ---
 
-## 💬 Interactive In-Session Commands
+## 🛡️ 2. Interactive Safety Review (Human-in-the-Loop)
 
-- `/user` — View active operator profile (`USER.md`).
-- `/memory` — View project architecture and environment facts (`MEMORY.md`).
-- `/sessions` — List past recorded sessions with status and step counts.
-- `/resume <id>` — Switch to and resume a past conversation trajectory.
-- `/skills` — List all available learned skills.
-- `/context` — Show current token count and percentage of maximum context budget.
-- `/compact` — Force an immediate context compaction pass.
-- `export-trajectory [filename.jsonl]` — Export current session steps to JSONL.
-- `exit` or `quit` — Exit the session.
+Whenever the agent proposes a system or terminal command, execution pauses for review:
+
+| Option | Input | Action |
+| :--- | :--- | :--- |
+| **Approve & Run** | `[Enter]` or `y` / `yes` | Executes the command in the persistent terminal session. |
+| **Deny** | `n` or `no` / `cancel` | Cancels execution and informs the agent the command was rejected. |
+| **Edit** | `e` or `edit` | Prompts you to modify the command string before running it. |
+| **Send Feedback** | Any custom text | Sends your text as guidance/feedback back to the model without running the command. |
+
+---
+
+## ⚙️ 3. CLI Startup Flags (`python agent.py [OPTIONS]`)
+
+| Flag | Short | Default | Description |
+| :--- | :--- | :--- | :--- |
+| **`--model`** | `-m` | `Qwen-32b` | Model identifier (e.g. `Qwen-32b`, `qwen2.5-coder:32b`, `Qwen/Qwen2.5-32B-Instruct`). |
+| **`--base-url`** | `-u` | `http://localhost:11434/v1` | LLM HTTP API endpoint (vLLM `:8000/v1`, Ollama `:11434/v1`, LM Studio `:1234/v1`). |
+| **`--api-key`** | `-k` | `local` | API Key (optional for local models). |
+| **`--max-tokens`** | | `40960` | Max context token capacity (compaction triggers at 70% $\approx$ 28,672 tokens). |
+| **`--resume <id>`** | | `None` | Session ID to resume from `.agent_history.db` on startup. |
+| **`--xml`** | | `False` | Switches from OpenAI JSON tool calling to Hermes XML `<tool_call>` syntax. |
+| **`--no-auto-skills`**| | `False` | Disables post-task automatic skill reflection and synthesis. |
+
+---
+
+## 🛠️ 4. Agent Tools (Autonomous Capabilities)
+
+| Tool Name | Parameters | Description |
+| :--- | :--- | :--- |
+| **`grep_search`** | `query`, `search_path`, `is_regex`, `file_pattern`, `max_results` | Fast ripgrep-style regex/literal code search returning file paths, line numbers, and snippets. |
+| **`find_files_by_pattern`** | `pattern`, `search_path`, `max_results` | Glob file search (`*.py`, `src/**/*.ts`, `*router*`) across workspace folders. |
+| **`run_terminal_command`** | `command`, `timeout` | Executes terminal commands with persistent `cwd` across turns. |
+| **`read_file`** | `file_path`, `start_line`, `end_line` | Reads file contents with optional line range slicing (1-indexed). |
+| **`write_file`** | `file_path`, `content` | Writes/creates files (automatically creating missing parent directories). |
+| **`patch_file`** | `file_path`, `search_content`, `replace_content` | Performs targeted search-and-replace on existing files. |
+| **`list_directory`** | `directory_path` | Inspects directory contents and file sizes. |
+| **`load_skill` / `<skill_name>()`** | `name` | Reads instructions and workflow details for any learned project skill. |
+| **`save_skill`** | `name`, `description`, `instructions` | Saves a newly discovered procedural workflow to `.agent_skills/`. |
+| **`read_user_profile`** | *(none)* | Reads operator profile from `USER.md`. |
+| **`update_user_profile`** | `category`, `preference` | Appends or updates preferences in `USER.md`. |
+| **`read_project_memory`** | *(none)* | Reads project architecture facts from `MEMORY.md`. |
+| **`update_project_memory`** | `category`, `fact` | Appends or updates technical facts in `MEMORY.md`. |
