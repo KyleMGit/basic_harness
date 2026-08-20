@@ -449,9 +449,40 @@ Fix NoneType bug in main.py.
         self.assertIsNotNone(result.get("project_updated"))
         self.assertIn("Redis cache running on port 6379", p_mgr.load_memory())
 
+    def test_testing_modes_read_only_and_stateless(self):
+        from tools import registry as reg
+
+        # 1. Test Read-Only Mode
+        agent_ro = HermesCodingAgent(read_only=True)
+        self.assertTrue(agent_ro.read_only)
+        self.assertTrue(reg.read_only)
+
+        save_res = reg.execute("save_skill", {
+            "name": "test_ro_skill",
+            "description": "desc",
+            "instructions": "inst"
+        })
+        self.assertIn("Read-only active", save_res)
+
+        user_res = reg.execute("update_user_profile", {
+            "category": "Communication Preferences",
+            "preference": "Test pref"
+        })
+        self.assertIn("Read-only active", user_res)
+
+        # 2. Test Stateless Benchmark Mode
+        agent_stateless = HermesCodingAgent(enable_skills=False, enable_memory=False, read_only=True)
+        sys_prompt = agent_stateless.messages[0]["content"]
+        self.assertIn("Skills disabled for testing", sys_prompt)
+        self.assertIn("Default testing profile", sys_prompt)
+
+        # Reset registry read-only state for other tests
+        reg.read_only = False
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 
 

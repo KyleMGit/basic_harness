@@ -62,6 +62,7 @@ python agent.py --model Qwen-32b --resume <session_id>
 
 | Command | Aliases | Description |
 | :--- | :--- | :--- |
+| **`/mode`** | | Shows current testing mode or switches mode: `/mode [normal \| read-only \| stateless]`. |
 | **`/context`** | `context` | Displays a visual progress bar, total token usage, compaction headroom, and breakdown (System Prompt vs. History vs. Checkpoints). |
 | **`/compact`** | `compact` | Forces an immediate 2-phase context checkpoint compaction without waiting for the 70% threshold. |
 | **`/user`** | `/profile`, `user` | Displays the active operator profile and preferences contract ([`USER.md`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/.agent_memories/USER.md)). |
@@ -96,8 +97,13 @@ Whenever the agent proposes a system or terminal command, execution pauses for r
 | **`--api-key`** | `-k` | `local` | API Key (optional for local models). |
 | **`--max-tokens`** | | `40960` | Max context token capacity (compaction triggers at 70% $\approx$ 28,672 tokens). |
 | **`--resume <id>`** | | `None` | Session ID to resume from `.agent_history.db` on startup. |
+| **`--read-only`** | `--freeze` | `False` | **Testing Mode**: Existing memories/skills are readable, but zero writes/saves to disk. |
+| **`--stateless`** | `--benchmark` | `False` | **Benchmark Baseline**: Disables skills, memory, and disk saving (pure zero-shot). |
+| **`--no-skills`** | | `False` | Completely disables skill catalog and skill retrieval. |
+| **`--no-memory`** | | `False` | Completely disables USER.md and MEMORY.md injection. |
+| **`--no-auto-skills`**| | `False` | Disables post-task automatic skill synthesis. |
+| **`--no-auto-memory`**| | `False` | Disables post-task automatic memory reflection. |
 | **`--xml`** | | `False` | Switches from OpenAI JSON tool calling to Hermes XML `<tool_call>` syntax. |
-| **`--no-auto-skills`**| | `False` | Disables post-task automatic skill reflection and synthesis. |
 
 ---
 

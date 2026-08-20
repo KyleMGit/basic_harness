@@ -19,6 +19,7 @@ class ToolRegistry:
     def __init__(self):
         self._tools: Dict[str, Callable] = {}
         self._schemas: List[Dict[str, Any]] = []
+        self.read_only: bool = False
 
     def register(self, name: str, description: str, parameters: Dict[str, Any]):
         def decorator(func: Callable):
@@ -351,6 +352,8 @@ def find_files_by_pattern(pattern: str, search_path: str = ".", max_results: int
     }
 )
 def save_skill(name: str, description: str, instructions: str) -> str:
+    if registry.read_only:
+        return f"[Testing Mode] Read-only active: Skill '{name}' was not saved to disk."
     return skill_store.save_skill(name=name, description=description, instructions=instructions)
 
 
@@ -406,6 +409,8 @@ def read_user_profile() -> str:
     }
 )
 def update_user_profile(category: str, preference: str) -> str:
+    if registry.read_only:
+        return "[Testing Mode] Read-only active: USER.md was not modified."
     return user_profile_manager.update_preference(category=category, note=preference)
 
 
@@ -437,4 +442,6 @@ def read_project_memory() -> str:
     }
 )
 def update_project_memory(category: str, fact: str) -> str:
+    if registry.read_only:
+        return "[Testing Mode] Read-only active: MEMORY.md was not modified."
     return project_memory_manager.update_fact(category=category, fact=fact)

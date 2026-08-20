@@ -5,9 +5,9 @@ An open, persistent, multi-protocol coding agent harness in Python.
 Key Features:
 1. Codebase Navigation & Search (grep_search, find_files_by_pattern).
 2. Dual Persistent Memory System: USER.md (operator profile) & MEMORY.md (project architecture facts).
-3. Session Continuity & Resumption (--resume <session_id> or /resume command).
-4. Dynamic Skill Catalog & Pre-Turn Relevant Skill Auto-Injection.
-5. Catalog-Aware Skill Deduplication & Merging (Hermes Learning Loop).
+3. Configurable Testing & Benchmark Modes (--read-only, --stateless, --no-skills, --no-memory).
+4. Autonomous Reflection Engines: AutoSkillExtractor & AutoMemoryExtractor.
+5. Session Continuity & Resumption (--resume <session_id> or /resume command).
 6. Configured for Qwen-32B with 40K (40,960) Token Context Budget.
 7. Local Model Support without API Keys (Qwen-32b, Ollama, vLLM, LM Studio, llama.cpp).
 8. Production-Grade Context Checkpoint Compaction & Summarization.
@@ -20,6 +20,7 @@ Key Features:
 import argparse
 import json
 import os
+import re
 import sys
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
@@ -44,7 +45,8 @@ class HermesCodingAgent:
     OpenAI structured tool calling and Hermes XML function calling protocols,
     with interactive human-in-the-loop confirmation for every system command,
     automated context compaction/summarization, local model support (Qwen-32b, etc.),
-    dual memory snapshots (USER.md / MEMORY.md), and session resumption.
+    dual memory snapshots (USER.md / MEMORY.md), session resumption,
+    and flexible testing modes (read-only, stateless, no-skills, no-memory).
     """
 
     SYSTEM_PROMPT_TEMPLATE = """You are an autonomous AI software engineer and terminal agent.
@@ -82,17 +84,28 @@ Below is the catalog of learned project skills. When a task relates to any avail
         base_url: Optional[str] = None,
         max_iterations: int = 30,
         max_context_tokens: int = 40960,     # Default to 40K (40,960 tokens) for Qwen-32B
-        compaction_threshold: float = 0.70, # Triggers compaction at ~28,672 tokens (leaving ~12,288 tokens headroom)
+        compaction_threshold: float = 0.70, # Triggers compaction at ~28,672 tokens
         confirm_all_terminal_commands: bool = True,
+        enable_skills: bool = True,
+        enable_memory: bool = True,
         auto_learn_skills: bool = True,
+        auto_learn_memory: bool = True,
+        read_only: bool = False,
         use_hermes_xml_protocol: bool = False,
     ):
         self.model = model or "Qwen-32b"
         self.max_iterations = max_iterations
         self.confirm_all_terminal_commands = confirm_all_terminal_commands
-        self.auto_learn_skills = auto_learn_skills
+        self.enable_skills = enable_skills
+        self.enable_memory = enable_memory
+        self.read_only = read_only
+        self.auto_learn_skills = auto_learn_skills and not read_only
+        self.auto_learn_memory = auto_learn_memory and not read_only
         self.use_hermes_xml_protocol = use_hermes_xml_protocol
         
+        # Configure tool registry read-only mode
+        registry.read_only = self.read_only
+
         # Local models running on Ollama/vLLM/LMStudio do not require a real API key,
         # but the OpenAI SDK requires a non-empty string.
         resolved_api_key = api_key or os.environ.get("OPENAI_API_KEY") or "local-no-key-required"
@@ -125,9 +138,9 @@ Below is the catalog of learned project skills. When a task relates to any avail
 
     def _build_system_prompt(self) -> str:
         """Build system prompt embedding live skills, USER.md, and MEMORY.md."""
-        catalog_xml = skill_store.format_catalog_prompt()
-        user_profile_xml = user_profile_manager.format_system_prompt_block()
-        project_mem_xml = project_memory_manager.format_system_prompt_block()
+        catalog_xml = skill_store.format_catalog_prompt() if self.enable_skills else "<available_skills>\nNone (Skills disabled for testing).\n</available_skills>"
+        user_profile_xml = user_profile_manager.format_system_prompt_block() if self.enable_memory else "<user_profile>\nDefault testing profile.\n</user_profile>"
+        project_mem_xml = project_memory_manager.format_system_prompt_block() if self.enable_memory else "<project_memory>\nDefault testing memory.\n</project_memory>"
         return self.SYSTEM_PROMPT_TEMPLATE.format(
             skills_catalog=catalog_xml,
             user_profile=user_profile_xml,
@@ -141,6 +154,39 @@ Below is the catalog of learned project skills. When a task relates to any avail
             new_prompt = ToolProtocol.format_hermes_system_prompt(new_prompt, registry.schemas)
         if self.messages and self.messages[0].get("role") == "system":
             self.messages[0]["content"] = new_prompt
+
+    def set_testing_mode(self, mode: str):
+        """Configure agent testing/learning modes dynamically."""
+        mode_clean = mode.lower().strip()
+        if mode_clean == "normal":
+            self.enable_skills = True
+            self.enable_memory = True
+            self.read_only = False
+            self.auto_learn_skills = True
+            self.auto_learn_memory = True
+            registry.read_only = False
+            print("[Mode Updated] Normal mode: Full Skills, Memory, and Auto-Learning active.")
+        elif mode_clean in ("read-only", "readonly", "freeze"):
+            self.enable_skills = True
+            self.enable_memory = True
+            self.read_only = True
+            self.auto_learn_skills = False
+            self.auto_learn_memory = False
+            registry.read_only = True
+            print("[Mode Updated] Read-Only mode: Existing skills & memories readable, but ZERO saving/writing to disk.")
+        elif mode_clean in ("stateless", "benchmark", "isolated"):
+            self.enable_skills = False
+            self.enable_memory = False
+            self.read_only = True
+            self.auto_learn_skills = False
+            self.auto_learn_memory = False
+            registry.read_only = True
+            print("[Mode Updated] Stateless Benchmark mode: No skills, No memories, Zero writes to disk.")
+        else:
+            print(f"Unknown mode '{mode}'. Options: normal | read-only | stateless")
+            return
+        
+        self.refresh_system_prompt()
 
     def resume_session(self, target_session_id: str) -> bool:
         """Resume a past conversation session from .agent_history.db."""
@@ -178,16 +224,11 @@ Below is the catalog of learned project skills. When a task relates to any avail
             print("\n[!] Command aborted.")
             return False, command, "User interrupted command execution."
 
-        # Case 1: Approve (Enter / y / yes)
         if user_input.lower() in ("", "y", "yes"):
             return True, command, None
-
-        # Case 2: Reject (n / no / cancel / skip)
         elif user_input.lower() in ("n", "no", "cancel", "skip"):
             print("[-] Command rejected by user.")
             return False, command, "Execution denied by user."
-
-        # Case 3: Edit command before running (e / edit)
         elif user_input.lower() in ("e", "edit"):
             print(f"Current command: {command}")
             new_cmd = input(">> Enter new command: ").strip()
@@ -195,8 +236,6 @@ Below is the catalog of learned project skills. When a task relates to any avail
                 print("[-] Empty command. Cancelled.")
                 return False, command, "Execution cancelled (empty edit)."
             return True, new_cmd, None
-
-        # Case 4: Custom guidance / feedback message
         else:
             print(f"[+] Sending user feedback to agent: '{user_input}'")
             return False, command, f"User declined to run this command and provided feedback: '{user_input}'. Adjust your plan accordingly."
@@ -224,6 +263,9 @@ Below is the catalog of learned project skills. When a task relates to any avail
 
     def run_auto_memory_reflection(self, task_summary: str):
         """Analyze trajectory to automatically extract and record user preferences and project facts."""
+        if not self.auto_learn_memory or self.read_only:
+            return
+
         result = self.memory_extractor.extract_and_update(
             client=self.client,
             model=self.model,
@@ -243,7 +285,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
 
     def run_auto_skill_synthesis(self, task_summary: str):
         """Analyze trajectory against catalog to automatically extract or refine skills."""
-        if not self.auto_learn_skills:
+        if not self.auto_learn_skills or self.read_only:
             return
 
         result = self.skill_extractor.extract_and_save(
@@ -261,7 +303,6 @@ Below is the catalog of learned project skills. When a task relates to any avail
             print(f"\n[Self-Improvement] {action_label}: '{name}'")
             print(f"  Description: {desc}")
             
-            # Refresh system prompt with updated skills catalog
             self.refresh_system_prompt()
             
             self.logger.log_step(
@@ -289,32 +330,32 @@ Below is the catalog of learned project skills. When a task relates to any avail
 
     def run(self, user_task: str) -> str:
         """Execute the autonomous agent loop for a given task."""
-        # Only start new session if not continuing an active/resumed one
         if not self.messages or len(self.messages) <= 1:
             self.session_id = str(uuid.uuid4())[:8]
             self.step_counter = 0
             self.logger.start_session(self.session_id, user_task)
 
-        # 1. Pre-Turn Skill Matching: Automatically search for relevant skills
-        relevant_skills = skill_store.find_relevant_skills(user_task)
-        if relevant_skills:
-            skill_blocks = []
-            for sk in relevant_skills:
-                skill_blocks.append(
-                    f"=== RELEVANT SKILL: {sk['name']} ===\n"
-                    f"Description: {sk.get('description', '')}\n"
-                    f"Instructions to Follow:\n{sk.get('instructions', '')}\n"
-                    f"======================================"
+        # 1. Pre-Turn Skill Matching (if enabled)
+        if self.enable_skills:
+            relevant_skills = skill_store.find_relevant_skills(user_task)
+            if relevant_skills:
+                skill_blocks = []
+                for sk in relevant_skills:
+                    skill_blocks.append(
+                        f"=== RELEVANT SKILL: {sk['name']} ===\n"
+                        f"Description: {sk.get('description', '')}\n"
+                        f"Instructions to Follow:\n{sk.get('instructions', '')}\n"
+                        f"======================================"
+                    )
+                
+                skill_injection = (
+                    "[RELEVANT LEARNED SKILLS AUTO-INJECTED]:\n"
+                    "The following established skills directly match this task. Apply their procedures:\n\n"
+                    + "\n\n".join(skill_blocks)
                 )
-            
-            skill_injection = (
-                "[RELEVANT LEARNED SKILLS AUTO-INJECTED]:\n"
-                "The following established skills directly match this task. Apply their procedures:\n\n"
-                + "\n\n".join(skill_blocks)
-            )
-            print(f"\n[Skill Retrieval] Found {len(relevant_skills)} matching skill(s): {', '.join(s['name'] for s in relevant_skills)}")
-            self.messages.append({"role": "user", "content": skill_injection})
-            self.step_counter += 1
+                print(f"\n[Skill Retrieval] Found {len(relevant_skills)} matching skill(s): {', '.join(s['name'] for s in relevant_skills)}")
+                self.messages.append({"role": "user", "content": skill_injection})
+                self.step_counter += 1
 
         # 2. Append user task
         self.messages.append({"role": "user", "content": user_task})
@@ -324,11 +365,11 @@ Below is the catalog of learned project skills. When a task relates to any avail
         print("\n" + "=" * 65)
         print(f"[Agent Session {self.session_id}] Task: {user_task}")
         print(f"[Model]: {self.model}")
+        print(f"[Mode]:  {'Read-Only (Saving Disabled)' if self.read_only else ('Stateless Benchmark' if not self.enable_skills and not self.enable_memory else 'Full Persistence')}")
         print(f"[Initial CWD]: {terminal_session.cwd}")
         print("=" * 65)
 
         for iteration in range(1, self.max_iterations + 1):
-            # Check and compact context before LLM call
             self.manage_context()
 
             curr_tokens = self.context_manager.estimate_tokens(self.messages)
@@ -344,10 +385,8 @@ Below is the catalog of learned project skills. When a task relates to any avail
                 self.logger.end_session(self.session_id, status="FAILED")
                 return err_msg
 
-            # Parse content and tool calls using dual protocol parser
             thought_content, tool_calls = ToolProtocol.extract_tool_calls(raw_message)
 
-            # Record assistant turn in history
             self.step_counter += 1
             if self.use_hermes_xml_protocol:
                 assistant_text = raw_message.content or ""
@@ -373,7 +412,6 @@ Below is the catalog of learned project skills. When a task relates to any avail
                     fn_args = tc["arguments"]
                     call_id = tc["id"]
 
-                    # If this is a terminal / system command, prompt user for input/confirmation
                     if fn_name == "run_terminal_command" and self.confirm_all_terminal_commands:
                         orig_cmd = fn_args.get("command", "")
                         should_run, final_cmd, feedback = self.prompt_user_for_command(orig_cmd, fn_args)
@@ -388,15 +426,12 @@ Below is the catalog of learned project skills. When a task relates to any avail
                         print(f"    Arguments: {json.dumps(fn_args, indent=2)}")
                         tool_result = registry.execute(fn_name, fn_args)
 
-                    # Display result preview
                     preview = tool_result if len(tool_result) < 350 else tool_result[:350] + "\n... [TRUNCATED]"
                     print(f"[Tool Result]:\n{preview}\n" + "-" * 50)
 
-                    # If memory or skills were modified mid-turn, refresh system prompt immediately
-                    if fn_name in ("update_user_profile", "update_project_memory", "save_skill"):
+                    if fn_name in ("update_user_profile", "update_project_memory", "save_skill") and not self.read_only:
                         self.refresh_system_prompt()
 
-                    # Append tool result in appropriate protocol format
                     self.step_counter += 1
                     if self.use_hermes_xml_protocol:
                         tool_resp_str = ToolProtocol.format_hermes_tool_response(fn_name, tool_result)
@@ -410,13 +445,13 @@ Below is the catalog of learned project skills. When a task relates to any avail
                         })
                         self.logger.log_step(self.session_id, self.step_counter, "tool", content=tool_result)
 
-            # Case 2: Agent completed its work and provided final response
+            # Case 2: Final response
             else:
                 final_answer = thought_content or "[Task Finished]"
                 print(f"\n[Task Complete]:\n{final_answer}\n" + "=" * 65)
                 self.logger.end_session(self.session_id, status="COMPLETED")
 
-                # Run post-task automatic memory evolution & skill synthesis
+                # Run post-task reflection (if not disabled/read-only)
                 self.run_auto_memory_reflection(user_task)
                 self.run_auto_skill_synthesis(user_task)
 
@@ -471,16 +506,50 @@ def parse_args():
         default=None,
         help="Session ID to resume from .agent_history.db."
     )
+    # Testing & Evaluation Modes
+    parser.add_argument(
+        "--read-only", "--freeze",
+        action="store_true",
+        help="Freeze skills and memories: readable, but disables all saving/writing to disk."
+    )
+    parser.add_argument(
+        "--stateless", "--benchmark",
+        action="store_true",
+        help="Run in pure stateless benchmark mode: zero skills, zero memories, and zero writes to disk."
+    )
+    parser.add_argument(
+        "--no-skills",
+        action="store_true",
+        help="Disable skill catalog injection and pre-turn skill retrieval."
+    )
+    parser.add_argument(
+        "--no-memory",
+        action="store_true",
+        help="Disable USER.md and MEMORY.md injection."
+    )
     parser.add_argument(
         "--no-auto-skills",
         action="store_true",
         help="Disable automatic post-task skill synthesis."
+    )
+    parser.add_argument(
+        "--no-auto-memory",
+        action="store_true",
+        help="Disable automatic post-task memory reflection."
     )
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
+
+    # Determine testing modes
+    is_stateless = args.stateless
+    is_read_only = args.read_only or is_stateless
+    enable_skills = not (args.no_skills or is_stateless)
+    enable_memory = not (args.no_memory or is_stateless)
+    auto_learn_skills = not (args.no_auto_skills or is_read_only)
+    auto_learn_memory = not (args.no_auto_memory or is_read_only)
 
     print("=" * 65)
     print(" Hermes-Refined Coding Agent Harness")
@@ -489,9 +558,9 @@ def main():
     print(f"Endpoint:   {args.base_url}")
     print(f"Max Tokens: {args.max_tokens} (Compaction threshold: ~{int(args.max_tokens * 0.70)} tokens)")
     print(f"Protocol:   {'Hermes XML (<tool_call>)' if args.xml else 'OpenAI JSON Tool Calling'}")
-    print("Security:   Interactive user review is active for EVERY system command.")
-    print("Features:   Code Search | USER.md / MEMORY.md | Session Resumption | Skills\n")
-    print("Commands:   /skills | /user | /memory | /sessions | /resume <id> | /compact | exit")
+    print(f"Mode:       {'Stateless Benchmark' if is_stateless else ('Read-Only (No Saving)' if is_read_only else 'Normal Persistence')}")
+    print("Security:   Interactive user review is active for EVERY system command.\n")
+    print("Commands:   /skills | /user | /memory | /mode [normal|read-only|stateless] | /context | exit")
 
     agent = HermesCodingAgent(
         model=args.model,
@@ -499,7 +568,11 @@ def main():
         api_key=args.api_key,
         max_context_tokens=args.max_tokens,
         confirm_all_terminal_commands=True,
-        auto_learn_skills=not args.no_auto_skills,
+        enable_skills=enable_skills,
+        enable_memory=enable_memory,
+        auto_learn_skills=auto_learn_skills,
+        auto_learn_memory=auto_learn_memory,
+        read_only=is_read_only,
         use_hermes_xml_protocol=args.xml
     )
 
@@ -516,6 +589,20 @@ def main():
             if prompt.lower() in ("exit", "quit"):
                 print("Exiting agent harness. Trajectories saved.")
                 break
+            if prompt.lower().startswith("/mode"):
+                parts = prompt.split()
+                if len(parts) > 1:
+                    agent.set_testing_mode(parts[1])
+                else:
+                    curr_mode = "Stateless Benchmark" if not agent.enable_skills and not agent.enable_memory else ("Read-Only" if agent.read_only else "Normal")
+                    print(f"\nCurrent Mode: {curr_mode}")
+                    print(f"  • Skills Enabled:     {agent.enable_skills}")
+                    print(f"  • Memory Enabled:     {agent.enable_memory}")
+                    print(f"  • Read-Only (Freeze): {agent.read_only}")
+                    print(f"  • Auto-Learn Skills:  {agent.auto_learn_skills}")
+                    print(f"  • Auto-Learn Memory:  {agent.auto_learn_memory}")
+                    print("\nChange mode with: /mode [normal | read-only | stateless]")
+                continue
             if prompt.lower() in ("/user", "/profile", "user", "profile"):
                 print("\n=== USER.md Profile ===")
                 print(user_profile_manager.load_profile())
@@ -555,7 +642,6 @@ def main():
                 filled = int(bar_len * (total_tokens / max_t))
                 bar = "█" * filled + "░" * (bar_len - filled)
 
-                # Component breakdowns
                 sys_tokens = agent.context_manager.estimate_tokens([agent.messages[0]]) if agent.messages else 0
                 history_msgs = agent.messages[1:] if len(agent.messages) > 1 else []
                 compaction_msgs = [m for m in history_msgs if "[CONTEXT COMPACTION" in str(m.get("content", ""))]
