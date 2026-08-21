@@ -19,7 +19,14 @@ class ToolRegistry:
     def __init__(self):
         self._tools: Dict[str, Callable] = {}
         self._schemas: List[Dict[str, Any]] = []
-        self.read_only: bool = False
+        self._write_tools = {
+            "run_terminal_command",
+            "write_file",
+            "patch_file",
+            "save_skill",
+            "update_user_profile",
+            "update_project_memory",
+        }
 
     def register(self, name: str, description: str, parameters: Dict[str, Any]):
         def decorator(func: Callable):
@@ -39,7 +46,13 @@ class ToolRegistry:
     def schemas(self) -> List[Dict[str, Any]]:
         return self._schemas
 
-    def execute(self, name: str, arguments: Dict[str, Any]) -> str:
+    def is_write_tool(self, name: str) -> bool:
+        """Return whether a registered tool can mutate external state."""
+        return name in self._write_tools
+
+    def execute(self, name: str, arguments: Dict[str, Any], read_only: bool = False) -> str:
+        if read_only and self.is_write_tool(name):
+            return f"[Testing Mode] Read-only active: Tool '{name}' was not executed."
         if name not in self._tools:
             # Check if the model called a skill directly by its name
             skill_file = skill_store.resolve_skill_file(name)
@@ -67,7 +80,7 @@ skill_store = SkillStore()
 
 @registry.register(
     name="run_terminal_command",
-    description="Execute a bash/cmd/PowerShell command in the persistent shell session. Maintains working directory across calls.",
+    description="Execute a bash/cmd/PowerShell command. Only the working directory (cwd) persists between calls; environment variables, shell functions, and activated virtualenvs do not.",
     parameters={
         "type": "object",
         "properties": {
@@ -316,8 +329,14 @@ def find_files_by_pattern(pattern: str, search_path: str = ".", max_results: int
     for root, dirs, files in os.walk(resolved_root):
         dirs[:] = [d for d in dirs if d not in ignored_dirs and not d.startswith(".")]
         for f in files:
-            if fnmatch.fnmatch(f, pattern):
-                full_path = os.path.join(root, f)
+            full_path = os.path.join(root, f)
+            relative_to_root = os.path.relpath(full_path, resolved_root).replace(os.sep, "/")
+            normalized_pattern = pattern.replace("\\", "/")
+            patterns = {normalized_pattern}
+            while "**/" in normalized_pattern:
+                normalized_pattern = normalized_pattern.replace("**/", "", 1)
+                patterns.add(normalized_pattern)
+            if any(fnmatch.fnmatchcase(relative_to_root, candidate) for candidate in patterns):
                 rel_path = os.path.relpath(full_path, terminal_session.cwd)
                 matched_files.append(rel_path)
                 if len(matched_files) >= max_results:
@@ -352,8 +371,6 @@ def find_files_by_pattern(pattern: str, search_path: str = ".", max_results: int
     }
 )
 def save_skill(name: str, description: str, instructions: str) -> str:
-    if registry.read_only:
-        return f"[Testing Mode] Read-only active: Skill '{name}' was not saved to disk."
     return skill_store.save_skill(name=name, description=description, instructions=instructions)
 
 
@@ -409,8 +426,6 @@ def read_user_profile() -> str:
     }
 )
 def update_user_profile(category: str, preference: str) -> str:
-    if registry.read_only:
-        return "[Testing Mode] Read-only active: USER.md was not modified."
     return user_profile_manager.update_preference(category=category, note=preference)
 
 
@@ -442,6 +457,4 @@ def read_project_memory() -> str:
     }
 )
 def update_project_memory(category: str, fact: str) -> str:
-    if registry.read_only:
-        return "[Testing Mode] Read-only active: MEMORY.md was not modified."
     return project_memory_manager.update_fact(category=category, fact=fact)

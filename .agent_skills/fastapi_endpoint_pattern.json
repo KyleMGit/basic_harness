@@ -1,8 +1,0 @@
-{
-  "name": "fastapi_endpoint_pattern",
-  "description": "How to write a standard FastAPI router with Pydantic schemas",
-  "instructions": "from fastapi import APIRouter\nrouter = APIRouter()",
-  "tags": [],
-  "format": "markdown",
-  "file": "fastapi_endpoint_pattern.md"
-}

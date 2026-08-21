@@ -1,2 +1,6 @@
-/__pycache__
-/_test_tmp
+__pycache__/
+*.py[cod]
+.agent_history.db
+.agent_memories/
+.agent_skills/
+_test_tmp/

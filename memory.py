@@ -41,9 +41,7 @@ class UserProfileManager:
 
     def __init__(self, storage_dir: Optional[str] = None):
         self.storage_dir = os.path.abspath(storage_dir or os.path.join(os.getcwd(), ".agent_memories"))
-        os.makedirs(self.storage_dir, exist_ok=True)
         self.file_path = os.path.join(self.storage_dir, "USER.md")
-        self._ensure_file_exists()
 
     def _ensure_file_exists(self):
         """Create default USER.md if it doesn't already exist."""
@@ -54,6 +52,7 @@ class UserProfileManager:
 
         if not os.path.exists(self.file_path):
             try:
+                os.makedirs(self.storage_dir, exist_ok=True)
                 with open(self.file_path, "w", encoding="utf-8") as f:
                     f.write(self.DEFAULT_TEMPLATE.strip() + "\n")
             except Exception:
@@ -62,7 +61,11 @@ class UserProfileManager:
     def load_profile(self) -> str:
         """Load raw USER.md content."""
         if not os.path.exists(self.file_path):
-            self._ensure_file_exists()
+            root_user_md = os.path.join(os.getcwd(), "USER.md")
+            if os.path.isfile(root_user_md):
+                self.file_path = root_user_md
+            else:
+                return self.DEFAULT_TEMPLATE.strip()
 
         try:
             with open(self.file_path, "r", encoding="utf-8") as f:
@@ -74,17 +77,18 @@ class UserProfileManager:
     def save_profile(self, content: str) -> str:
         """Save updated content to USER.md with character budget enforcement."""
         content = content.strip()
-        
+
         if len(content) > self.MAX_CHAR_BUDGET:
-            content = content[:self.MAX_CHAR_BUDGET]
-            warning = f"\n[!] Note: Content truncated to fit within the {self.MAX_CHAR_BUDGET} character budget."
-        else:
-            warning = ""
+            return (
+                f"Error: USER.md update exceeds the {self.MAX_CHAR_BUDGET} character "
+                "budget; existing content was not modified."
+            )
 
         try:
+            os.makedirs(os.path.dirname(self.file_path) or ".", exist_ok=True)
             with open(self.file_path, "w", encoding="utf-8") as f:
                 f.write(content + "\n")
-            return f"Successfully updated USER.md ({len(content)} chars).{warning}"
+            return f"Successfully updated USER.md ({len(content)} chars)."
         except Exception as e:
             return f"Error saving USER.md: {str(e)}"
 
@@ -146,9 +150,7 @@ class ProjectMemoryManager:
 
     def __init__(self, storage_dir: Optional[str] = None):
         self.storage_dir = os.path.abspath(storage_dir or os.path.join(os.getcwd(), ".agent_memories"))
-        os.makedirs(self.storage_dir, exist_ok=True)
         self.file_path = os.path.join(self.storage_dir, "MEMORY.md")
-        self._ensure_file_exists()
 
     def _ensure_file_exists(self):
         """Create default MEMORY.md if it doesn't already exist."""
@@ -159,6 +161,7 @@ class ProjectMemoryManager:
 
         if not os.path.exists(self.file_path):
             try:
+                os.makedirs(self.storage_dir, exist_ok=True)
                 with open(self.file_path, "w", encoding="utf-8") as f:
                     f.write(self.DEFAULT_TEMPLATE.strip() + "\n")
             except Exception:
@@ -167,7 +170,11 @@ class ProjectMemoryManager:
     def load_memory(self) -> str:
         """Load raw MEMORY.md content."""
         if not os.path.exists(self.file_path):
-            self._ensure_file_exists()
+            root_mem_md = os.path.join(os.getcwd(), "MEMORY.md")
+            if os.path.isfile(root_mem_md):
+                self.file_path = root_mem_md
+            else:
+                return self.DEFAULT_TEMPLATE.strip()
 
         try:
             with open(self.file_path, "r", encoding="utf-8") as f:
@@ -179,17 +186,18 @@ class ProjectMemoryManager:
     def save_memory(self, content: str) -> str:
         """Save updated content to MEMORY.md with character budget enforcement."""
         content = content.strip()
-        
+
         if len(content) > self.MAX_CHAR_BUDGET:
-            content = content[:self.MAX_CHAR_BUDGET]
-            warning = f"\n[!] Note: Content truncated to fit within the {self.MAX_CHAR_BUDGET} character budget."
-        else:
-            warning = ""
+            return (
+                f"Error: MEMORY.md update exceeds the {self.MAX_CHAR_BUDGET} character "
+                "budget; existing content was not modified."
+            )
 
         try:
+            os.makedirs(os.path.dirname(self.file_path) or ".", exist_ok=True)
             with open(self.file_path, "w", encoding="utf-8") as f:
                 f.write(content + "\n")
-            return f"Successfully updated MEMORY.md ({len(content)} chars).{warning}"
+            return f"Successfully updated MEMORY.md ({len(content)} chars)."
         except Exception as e:
             return f"Error saving MEMORY.md: {str(e)}"
 

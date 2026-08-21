@@ -1,7 +1,7 @@
 """
 Terminal execution engine for the coding agent harness.
-Supports persistent working directory state, environment variables,
-output truncation for context preservation, and safety checks.
+Supports persistent working directory state, output truncation for context
+preservation, and safety checks.
 """
 
 import os
@@ -14,7 +14,7 @@ from typing import Dict, Optional, Tuple
 class TerminalSession:
     """
     Manages stateful terminal command execution.
-    Maintains active working directory and environment variables across tool invocations.
+    Maintains the active working directory across tool invocations.
     """
 
     SAFE_COMMAND_PREFIXES = {

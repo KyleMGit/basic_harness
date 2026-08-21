@@ -217,6 +217,21 @@ not new requests. Omit if none were supplied.]
         self.compaction_count = 0
         self.previous_checkpoint: Optional[str] = None
 
+    def snapshot_state(self) -> Dict[str, Any]:
+        """Return only the session-scoped compaction state needed for resumption."""
+        return {
+            "previous_checkpoint": self.previous_checkpoint,
+            "last_compaction_step": self.last_compaction_step,
+            "compaction_count": self.compaction_count,
+        }
+
+    def restore_state(self, state: Optional[Dict[str, Any]] = None):
+        """Reset state, then restore a checkpoint owned by the resumed session."""
+        state = state or {}
+        self.previous_checkpoint = state.get("previous_checkpoint")
+        self.last_compaction_step = int(state.get("last_compaction_step", -100))
+        self.compaction_count = int(state.get("compaction_count", 0))
+
     @staticmethod
     def estimate_tokens(messages: List[Dict[str, Any]]) -> int:
         """
@@ -384,18 +399,48 @@ None.
                 ],
                 temperature=0.1,
             )
-            checkpoint = response.choices[0].message.content or "Checkpoint generation returned empty."
-            self.previous_checkpoint = checkpoint.strip()
-            return checkpoint.strip()
+            checkpoint = (response.choices[0].message.content or "").strip()
+            if not checkpoint:
+                raise RuntimeError("checkpoint generation returned empty")
+            return checkpoint
         except Exception as e:
-            fallback = (
-                f"[CONTEXT COMPACTION — REFERENCE ONLY]\n"
-                f"Historical checkpoint for {len(messages_to_summarize)} prior turns.\n"
-                f"Status: Summarizer unavailable ({str(e)}).\n"
-                f"--- END OF CONTEXT SUMMARY ---"
-            )
-            self.previous_checkpoint = fallback
-            return fallback
+            raise RuntimeError(f"checkpoint summarization failed: {e}") from e
+
+    @staticmethod
+    def _safe_recent_boundary(messages: List[Dict[str, Any]], desired: int) -> int:
+        """Move a tail boundary backward rather than split a tool exchange."""
+        boundary = max(1, min(desired, len(messages)))
+        for index, message in enumerate(messages):
+            if message.get("role") != "assistant":
+                continue
+            native_calls = message.get("tool_calls") or []
+            is_xml_call = "<tool_call>" in str(message.get("content") or "")
+            if not native_calls and not is_xml_call:
+                continue
+
+            end = index + 1
+            if native_calls:
+                call_ids = {call.get("id") for call in native_calls if call.get("id")}
+                while end < len(messages):
+                    candidate = messages[end]
+                    if candidate.get("role") != "tool":
+                        break
+                    if call_ids and candidate.get("tool_call_id") not in call_ids:
+                        break
+                    end += 1
+            else:
+                while end < len(messages):
+                    candidate = messages[end]
+                    if candidate.get("role") != "user" or "<tool_response>" not in str(
+                        candidate.get("content") or ""
+                    ):
+                        break
+                    end += 1
+
+            if index < boundary < end:
+                boundary = index
+                break
+        return boundary
 
     def compact(
         self,
@@ -436,15 +481,25 @@ None.
             return pruned_messages, False, "Not enough message depth to compact."
 
         system_msg = pruned_messages[0]
-        older_messages = pruned_messages[1:-self.keep_recent_turns]
-        recent_messages = pruned_messages[-self.keep_recent_turns:]
+        desired_boundary = len(pruned_messages) - self.keep_recent_turns
+        recent_boundary = self._safe_recent_boundary(pruned_messages, desired_boundary)
+        older_messages = pruned_messages[1:recent_boundary]
+        recent_messages = pruned_messages[recent_boundary:]
+        if not older_messages:
+            return messages, False, "Not enough protocol-safe message depth to compact."
 
-        checkpoint_text = self.summarize_history(
-            client=client,
-            model=model,
-            messages_to_summarize=older_messages,
-            focus_topic=focus_topic
-        )
+        try:
+            checkpoint_text = self.summarize_history(
+                client=client,
+                model=model,
+                messages_to_summarize=older_messages,
+                focus_topic=focus_topic
+            )
+        except Exception as exc:
+            return messages, False, f"Checkpoint compaction failed; original context retained: {exc}"
+
+        if not checkpoint_text.startswith("[CONTEXT COMPACTION"):
+            return messages, False, "Checkpoint compaction failed validation; original context retained."
 
         compaction_block = {
             "role": "user",
@@ -457,7 +512,13 @@ None.
 
         compacted = [system_msg, compaction_block, ack_block] + recent_messages
         final_tokens = self.estimate_tokens(compacted)
+        if final_tokens >= initial_tokens or final_tokens >= self.max_context_tokens:
+            return messages, False, (
+                "Checkpoint was ineffective or oversized; original context retained "
+                f"({final_tokens}/{initial_tokens} est. tokens)."
+            )
         
+        self.previous_checkpoint = checkpoint_text
         self.compaction_count += 1
         self.last_compaction_step = current_step
         saved = initial_tokens - final_tokens

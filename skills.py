@@ -19,7 +19,6 @@ class SkillStore:
 
     def __init__(self, storage_dir: Optional[str] = None):
         self.storage_dir = os.path.abspath(storage_dir or os.path.join(os.getcwd(), ".agent_skills"))
-        os.makedirs(self.storage_dir, exist_ok=True)
 
     def _safe_name(self, name: str) -> str:
         base = os.path.basename(name)
@@ -94,8 +93,6 @@ tags: {tags_str}
             os.path.join(self.storage_dir, f"{safe}.md"),
             os.path.join(self.storage_dir, safe, "SKILL.md"),
             os.path.join(self.storage_dir, f"{safe}.json"),
-            os.path.join(self.storage_dir, name),
-            os.path.abspath(name) if os.path.exists(name) else None,
         ]
 
         for cand in candidates:
@@ -108,6 +105,7 @@ tags: {tags_str}
         Save skill as standard Hermes Markdown (.md) and JSON for full backward & tool compatibility.
         """
         safe = self._safe_name(name)
+        os.makedirs(self.storage_dir, exist_ok=True)
         md_path = os.path.join(self.storage_dir, f"{safe}.md")
         json_path = os.path.join(self.storage_dir, f"{safe}.json")
 

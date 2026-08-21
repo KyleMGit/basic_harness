@@ -87,7 +87,12 @@ class ToolProtocol:
         return content, []
 
     @classmethod
-    def format_hermes_tool_response(cls, tool_name: str, content: str) -> str:
+    def format_hermes_tool_response(
+        cls, tool_name: str, content: str, tool_call_id: Optional[str] = None
+    ) -> str:
         """Format tool result for Hermes ChatML <tool_response>."""
-        payload = json.dumps({"name": tool_name, "content": content})
+        payload_data = {"name": tool_name, "content": content}
+        if tool_call_id:
+            payload_data["tool_call_id"] = tool_call_id
+        payload = json.dumps(payload_data)
         return f"<tool_response>\n{payload}\n</tool_response>"

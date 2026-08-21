@@ -4,8 +4,8 @@ Unit tests for the refined Hermes Coding Agent components.
 
 import json
 import os
-import shutil
 import sys
+import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -23,12 +23,42 @@ from tools import registry
 class TestHermesAgentComponents(unittest.TestCase):
 
     def setUp(self):
-        self.test_dir = os.path.join(os.path.dirname(__file__), "_test_tmp")
-        os.makedirs(self.test_dir, exist_ok=True)
+        from memory import user_profile_manager, project_memory_manager
+        from tools import skill_store, terminal_session
+
+        self._temporary_directory = tempfile.TemporaryDirectory()
+        self.test_dir = self._temporary_directory.name
+        self._previous_cwd = os.getcwd()
+        self._previous_paths = (
+            skill_store.storage_dir,
+            user_profile_manager.storage_dir,
+            user_profile_manager.file_path,
+            project_memory_manager.storage_dir,
+            project_memory_manager.file_path,
+            terminal_session.cwd,
+        )
+        os.chdir(self.test_dir)
+        skill_store.storage_dir = os.path.join(self.test_dir, ".agent_skills")
+        user_profile_manager.storage_dir = os.path.join(self.test_dir, ".agent_memories")
+        user_profile_manager.file_path = os.path.join(user_profile_manager.storage_dir, "USER.md")
+        project_memory_manager.storage_dir = user_profile_manager.storage_dir
+        project_memory_manager.file_path = os.path.join(project_memory_manager.storage_dir, "MEMORY.md")
+        terminal_session.cwd = self.test_dir
 
     def tearDown(self):
-        if os.path.exists(self.test_dir):
-            shutil.rmtree(self.test_dir, ignore_errors=True)
+        from memory import user_profile_manager, project_memory_manager
+        from tools import skill_store, terminal_session
+
+        (
+            skill_store.storage_dir,
+            user_profile_manager.storage_dir,
+            user_profile_manager.file_path,
+            project_memory_manager.storage_dir,
+            project_memory_manager.file_path,
+            terminal_session.cwd,
+        ) = self._previous_paths
+        os.chdir(self._previous_cwd)
+        self._temporary_directory.cleanup()
 
     def test_stateful_terminal_cd(self):
         term = TerminalSession(cwd=self.test_dir)
@@ -455,19 +485,18 @@ Fix NoneType bug in main.py.
         # 1. Test Read-Only Mode
         agent_ro = HermesCodingAgent(read_only=True)
         self.assertTrue(agent_ro.read_only)
-        self.assertTrue(reg.read_only)
 
         save_res = reg.execute("save_skill", {
             "name": "test_ro_skill",
             "description": "desc",
             "instructions": "inst"
-        })
+        }, read_only=agent_ro.read_only)
         self.assertIn("Read-only active", save_res)
 
         user_res = reg.execute("update_user_profile", {
             "category": "Communication Preferences",
             "preference": "Test pref"
-        })
+        }, read_only=agent_ro.read_only)
         self.assertIn("Read-only active", user_res)
 
         # 2. Test Stateless Benchmark Mode
@@ -475,16 +504,8 @@ Fix NoneType bug in main.py.
         sys_prompt = agent_stateless.messages[0]["content"]
         self.assertIn("Skills disabled for testing", sys_prompt)
         self.assertIn("Default testing profile", sys_prompt)
-
-        # Reset registry read-only state for other tests
-        reg.read_only = False
-
-
 if __name__ == "__main__":
     unittest.main()
-
-
-
 
 
 

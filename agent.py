@@ -103,9 +103,6 @@ Below is the catalog of learned project skills. When a task relates to any avail
         self.auto_learn_memory = auto_learn_memory and not read_only
         self.use_hermes_xml_protocol = use_hermes_xml_protocol
         
-        # Configure tool registry read-only mode
-        registry.read_only = self.read_only
-
         # Local models running on Ollama/vLLM/LMStudio do not require a real API key,
         # but the OpenAI SDK requires a non-empty string.
         resolved_api_key = api_key or os.environ.get("OPENAI_API_KEY") or "local-no-key-required"
@@ -116,7 +113,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
             base_url=resolved_base_url
         )
         
-        self.logger = TrajectoryLogger()
+        self.logger = TrajectoryLogger(write_enabled=not self.read_only)
         self.context_manager = ContextManager(
             max_context_tokens=max_context_tokens,
             trigger_threshold=compaction_threshold
@@ -155,6 +152,16 @@ Below is the catalog of learned project skills. When a task relates to any avail
         if self.messages and self.messages[0].get("role") == "system":
             self.messages[0]["content"] = new_prompt
 
+    def _persist_session_state(self):
+        """Persist the active transcript without the rebuildable system prompt."""
+        active_messages = self.messages[1:] if self.messages else []
+        self.logger.save_session_state(
+            self.session_id,
+            active_messages,
+            self.step_counter,
+            self.context_manager.snapshot_state(),
+        )
+
     def set_testing_mode(self, mode: str):
         """Configure agent testing/learning modes dynamically."""
         mode_clean = mode.lower().strip()
@@ -164,7 +171,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
             self.read_only = False
             self.auto_learn_skills = True
             self.auto_learn_memory = True
-            registry.read_only = False
+            self.logger.set_write_enabled(True)
             print("[Mode Updated] Normal mode: Full Skills, Memory, and Auto-Learning active.")
         elif mode_clean in ("read-only", "readonly", "freeze"):
             self.enable_skills = True
@@ -172,7 +179,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
             self.read_only = True
             self.auto_learn_skills = False
             self.auto_learn_memory = False
-            registry.read_only = True
+            self.logger.set_write_enabled(False)
             print("[Mode Updated] Read-Only mode: Existing skills & memories readable, but ZERO saving/writing to disk.")
         elif mode_clean in ("stateless", "benchmark", "isolated"):
             self.enable_skills = False
@@ -180,7 +187,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
             self.read_only = True
             self.auto_learn_skills = False
             self.auto_learn_memory = False
-            registry.read_only = True
+            self.logger.set_write_enabled(False)
             print("[Mode Updated] Stateless Benchmark mode: No skills, No memories, Zero writes to disk.")
         else:
             print(f"Unknown mode '{mode}'. Options: normal | read-only | stateless")
@@ -190,12 +197,21 @@ Below is the catalog of learned project skills. When a task relates to any avail
 
     def resume_session(self, target_session_id: str) -> bool:
         """Resume a past conversation session from .agent_history.db."""
-        task, restored_msgs = self.logger.load_session_messages(target_session_id)
+        task, legacy_messages = self.logger.load_session_messages(target_session_id)
+        saved_state = self.logger.load_session_state(target_session_id)
+        if saved_state:
+            restored_msgs = saved_state.get("messages") or []
+            restored_step = int(saved_state.get("step_counter", len(restored_msgs)))
+            self.context_manager.restore_state(saved_state.get("context_state"))
+        else:
+            restored_msgs = legacy_messages
+            restored_step = len(restored_msgs)
+            self.context_manager.restore_state()
         if not restored_msgs:
             return False
 
         self.session_id = target_session_id
-        self.step_counter = len(restored_msgs)
+        self.step_counter = restored_step
 
         system_content = self._build_system_prompt()
         if self.use_hermes_xml_protocol:
@@ -258,6 +274,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
                 "system_compaction",
                 content=msg
             )
+            self._persist_session_state()
         elif force:
             print(f"\n[Info] {msg}")
 
@@ -330,9 +347,11 @@ Below is the catalog of learned project skills. When a task relates to any avail
 
     def run(self, user_task: str) -> str:
         """Execute the autonomous agent loop for a given task."""
+        user_message_content = user_task
         if not self.messages or len(self.messages) <= 1:
             self.session_id = str(uuid.uuid4())[:8]
             self.step_counter = 0
+            self.context_manager.restore_state()
             self.logger.start_session(self.session_id, user_task)
 
         # 1. Pre-Turn Skill Matching (if enabled)
@@ -354,13 +373,17 @@ Below is the catalog of learned project skills. When a task relates to any avail
                     + "\n\n".join(skill_blocks)
                 )
                 print(f"\n[Skill Retrieval] Found {len(relevant_skills)} matching skill(s): {', '.join(s['name'] for s in relevant_skills)}")
-                self.messages.append({"role": "user", "content": skill_injection})
-                self.step_counter += 1
+                user_message_content = (
+                    f"{skill_injection}\n\n[ACTIVE USER TASK]:\n{user_task}"
+                )
 
         # 2. Append user task
-        self.messages.append({"role": "user", "content": user_task})
+        self.messages.append({"role": "user", "content": user_message_content})
         self.step_counter += 1
-        self.logger.log_step(self.session_id, self.step_counter, "user", content=user_task)
+        self.logger.log_step(
+            self.session_id, self.step_counter, "user", content=user_message_content
+        )
+        self._persist_session_state()
 
         print("\n" + "=" * 65)
         print(f"[Agent Session {self.session_id}] Task: {user_task}")
@@ -393,13 +416,16 @@ Below is the catalog of learned project skills. When a task relates to any avail
                 self.messages.append({"role": "assistant", "content": assistant_text})
                 self.logger.log_step(self.session_id, self.step_counter, "assistant", content=assistant_text)
             else:
-                self.messages.append(raw_message.model_dump(exclude_none=True))
+                assistant_message = raw_message.model_dump(exclude_none=True)
+                if not isinstance(assistant_message, dict):
+                    assistant_message = {"role": "assistant", "content": raw_message.content or ""}
+                self.messages.append(assistant_message)
                 self.logger.log_step(
                     self.session_id,
                     self.step_counter,
                     "assistant",
                     content=raw_message.content,
-                    tool_calls=[{"name": tc["name"], "args": tc["arguments"]} for tc in tool_calls]
+                    tool_calls=assistant_message.get("tool_calls")
                 )
 
             # Case 1: Agent invokes tools
@@ -407,6 +433,9 @@ Below is the catalog of learned project skills. When a task relates to any avail
                 if thought_content:
                     print(f"\n[Agent Thought]:\n{thought_content.strip()}")
 
+                assistant_message_ref = self.messages[-1]
+                assistant_step_index = self.step_counter
+                xml_tool_responses = []
                 for tc in tool_calls:
                     fn_name = tc["name"]
                     fn_args = tc["arguments"]
@@ -418,13 +447,36 @@ Below is the catalog of learned project skills. When a task relates to any avail
                         
                         if should_run:
                             fn_args["command"] = final_cmd
-                            tool_result = registry.execute(fn_name, fn_args)
+                            message_calls = assistant_message_ref.get("tool_calls") or []
+                            for message_call in message_calls:
+                                if message_call.get("id") == call_id:
+                                    message_call["function"]["arguments"] = json.dumps(fn_args)
+                            if message_calls:
+                                self.logger.update_step_tool_calls(
+                                    self.session_id,
+                                    assistant_step_index,
+                                    message_calls,
+                                )
+                            tool_result = registry.execute(fn_name, fn_args, read_only=self.read_only)
+                            if final_cmd != orig_cmd:
+                                if self.read_only and registry.is_write_tool(fn_name):
+                                    provenance = (
+                                        "[Command provenance]\n"
+                                        f"Proposed: {orig_cmd}\nApproved: {final_cmd}\n"
+                                        "Not executed: blocked by read-only policy"
+                                    )
+                                else:
+                                    provenance = (
+                                        "[Command provenance]\n"
+                                        f"Proposed: {orig_cmd}\nExecuted: {final_cmd}"
+                                    )
+                                tool_result = f"{provenance}\n\n{tool_result}"
                         else:
                             tool_result = feedback or "Execution aborted by user."
                     else:
                         print(f"\n[Tool Request]: {fn_name}")
                         print(f"    Arguments: {json.dumps(fn_args, indent=2)}")
-                        tool_result = registry.execute(fn_name, fn_args)
+                        tool_result = registry.execute(fn_name, fn_args, read_only=self.read_only)
 
                     preview = tool_result if len(tool_result) < 350 else tool_result[:350] + "\n... [TRUNCATED]"
                     print(f"[Tool Result]:\n{preview}\n" + "-" * 50)
@@ -432,23 +484,39 @@ Below is the catalog of learned project skills. When a task relates to any avail
                     if fn_name in ("update_user_profile", "update_project_memory", "save_skill") and not self.read_only:
                         self.refresh_system_prompt()
 
-                    self.step_counter += 1
                     if self.use_hermes_xml_protocol:
-                        tool_resp_str = ToolProtocol.format_hermes_tool_response(fn_name, tool_result)
-                        self.messages.append({"role": "user", "content": tool_resp_str})
-                        self.logger.log_step(self.session_id, self.step_counter, "tool_response", content=tool_resp_str)
+                        tool_resp_str = ToolProtocol.format_hermes_tool_response(
+                            fn_name, tool_result, tool_call_id=call_id
+                        )
+                        xml_tool_responses.append(tool_resp_str)
                     else:
+                        self.step_counter += 1
                         self.messages.append({
                             "role": "tool",
                             "tool_call_id": call_id,
                             "content": tool_result
                         })
-                        self.logger.log_step(self.session_id, self.step_counter, "tool", content=tool_result)
+                        self.logger.log_step(
+                            self.session_id,
+                            self.step_counter,
+                            "tool",
+                            content=tool_result,
+                            tool_call_id=call_id,
+                        )
+                if self.use_hermes_xml_protocol and xml_tool_responses:
+                    self.step_counter += 1
+                    combined_response = "\n".join(xml_tool_responses)
+                    self.messages.append({"role": "user", "content": combined_response})
+                    self.logger.log_step(
+                        self.session_id, self.step_counter, "user", content=combined_response
+                    )
+                self._persist_session_state()
 
             # Case 2: Final response
             else:
                 final_answer = thought_content or "[Task Finished]"
                 print(f"\n[Task Complete]:\n{final_answer}\n" + "=" * 65)
+                self._persist_session_state()
                 self.logger.end_session(self.session_id, status="COMPLETED")
 
                 # Run post-task reflection (if not disabled/read-only)
@@ -465,6 +533,13 @@ Below is the catalog of learned project skills. When a task relates to any avail
 # ==============================================================================
 # CLI ARGUMENT PARSER & ENTRY POINT
 # ==============================================================================
+
+def export_current_trajectory(agent: "HermesCodingAgent", filename: str) -> str:
+    """Export one session and report whether a file was actually written."""
+    if agent.logger.export_jsonl(agent.session_id, filename):
+        return f"Exported session trajectory to {filename}"
+    return "[!] Export skipped: trajectory writes are disabled or no history exists."
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -671,8 +746,7 @@ def main():
             if prompt.lower().startswith("export-trajectory"):
                 parts = prompt.split()
                 filename = parts[1] if len(parts) > 1 else "trajectory.jsonl"
-                agent.logger.export_jsonl(agent.session_id, filename)
-                print(f"Exported session trajectory to {filename}")
+                print(export_current_trajectory(agent, filename))
                 continue
 
             agent.run(prompt)

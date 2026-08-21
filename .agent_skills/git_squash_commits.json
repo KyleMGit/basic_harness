@@ -1,8 +1,0 @@
-{
-  "name": "git_squash_commits",
-  "description": "Rebase commits",
-  "instructions": "git rebase -i HEAD~3",
-  "tags": [],
-  "format": "markdown",
-  "file": "git_squash_commits.md"
-}
