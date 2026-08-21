@@ -72,16 +72,21 @@ class ToolProtocol:
                     raw_json = match.group(1).strip()
                     try:
                         parsed = json.loads(raw_json)
+                        if not isinstance(parsed, dict):
+                            raise ValueError("tool call must decode to an object")
                         fn_name = parsed.get("name")
+                        if not isinstance(fn_name, str) or not fn_name.strip():
+                            raise ValueError("tool name must be a non-empty string")
                         args = parsed.get("arguments", {})
                         if isinstance(args, str):
                             args = json.loads(args)
-                        if fn_name:
-                            tool_calls.append({
-                                "id": f"hermes_call_{idx}",
-                                "name": fn_name,
-                                "arguments": args
-                            })
+                        if not isinstance(args, dict):
+                            raise ValueError("arguments must decode to an object")
+                        tool_calls.append({
+                            "id": f"hermes_call_{idx}",
+                            "name": fn_name,
+                            "arguments": args
+                        })
                     except Exception as exc:
                         tool_calls.append({"id": f"hermes_call_{idx}", "name": "__protocol_error__",
                                            "arguments": {"error": f"Malformed Hermes tool call: {exc}"}})

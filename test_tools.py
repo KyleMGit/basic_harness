@@ -269,7 +269,9 @@ Fix NoneType bug in main.py.
 
         self.assertTrue(was_compacted)
         self.assertIn("[CONTEXT COMPACTION — REFERENCE ONLY]", compacted[1]["content"])
-        self.assertEqual(cm.previous_checkpoint, mock_checkpoint_output)
+        self.assertTrue(cm.previous_checkpoint.startswith(mock_checkpoint_output))
+        self.assertIn("## Exact Recovery Anchors", cm.previous_checkpoint)
+        self.assertIn("## Verbatim Historical User Messages", cm.previous_checkpoint)
 
     def test_agent_skill_auto_injection(self):
         from tools import skill_store as global_store
@@ -506,6 +508,5 @@ Fix NoneType bug in main.py.
         self.assertIn("Default testing profile", sys_prompt)
 if __name__ == "__main__":
     unittest.main()
-
 
 

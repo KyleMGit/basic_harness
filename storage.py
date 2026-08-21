@@ -12,6 +12,8 @@ import sqlite3
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from compaction import ContextManager
+
 
 class TrajectoryLogger:
     """Logs conversation trajectories into SQLite and JSONL, and manages session resumption."""
@@ -20,6 +22,10 @@ class TrajectoryLogger:
         self.db_path = db_path or os.path.join(os.getcwd(), ".agent_history.db")
         self.write_enabled = write_enabled
         self._initialized = False
+
+    @staticmethod
+    def _safe(value: Any) -> Any:
+        return ContextManager.redact_sensitive_value(value)
 
     def set_write_enabled(self, enabled: bool):
         """Enable or disable trajectory mutations for this logger instance."""
@@ -83,7 +89,7 @@ class TrajectoryLogger:
             conn.execute("PRAGMA foreign_keys = ON")
             conn.cursor().execute(
                 "INSERT OR REPLACE INTO sessions (session_id, start_time, task, status, system_prompt) VALUES (?, ?, ?, ?, ?)",
-                (session_id, time.time(), task, "IN_PROGRESS", system_prompt)
+                (session_id, time.time(), self._safe(task), "IN_PROGRESS", self._safe(system_prompt))
             )
             conn.commit()
 
@@ -107,8 +113,8 @@ class TrajectoryLogger:
                     session_id,
                     step_index,
                     role,
-                    content or "",
-                    json.dumps(tool_calls) if tool_calls else None,
+                    self._safe(content or ""),
+                    json.dumps(self._safe(tool_calls)) if tool_calls else None,
                     tool_call_id,
                     time.time()
                 )
@@ -126,7 +132,7 @@ class TrajectoryLogger:
             conn.execute("PRAGMA foreign_keys = ON")
             conn.execute(
                 "UPDATE steps SET tool_calls = ? WHERE session_id = ? AND step_index = ? AND role = 'assistant'",
-                (json.dumps(tool_calls), session_id, step_index),
+                (json.dumps(self._safe(tool_calls)), session_id, step_index),
             )
             conn.commit()
 
@@ -168,9 +174,9 @@ class TrajectoryLogger:
                 """,
                 (
                     session_id,
-                    json.dumps(messages),
+                    json.dumps(self._safe(messages)),
                     step_counter,
-                    json.dumps(context_state),
+                    json.dumps(self._safe(context_state)),
                     time.time(),
                 ),
             )
@@ -336,5 +342,5 @@ class TrajectoryLogger:
                     "tool_call_id": row["tool_call_id"] if "tool_call_id" in row.keys() else None,
                     "timestamp": row["timestamp"]
                 }
-                f.write(json.dumps(step_dict) + "\n")
+                f.write(json.dumps(self._safe(step_dict)) + "\n")
         return True

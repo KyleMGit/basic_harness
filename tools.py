@@ -106,6 +106,15 @@ def _resolve_workspace_path(path: str) -> tuple[Optional[str], Optional[str]]:
     return candidate, None
 
 
+def _is_within_workspace(path: str) -> bool:
+    root = os.path.realpath(getattr(terminal_session, "workspace_root", terminal_session.cwd))
+    candidate = os.path.realpath(path)
+    try:
+        return os.path.commonpath((root, candidate)) == root
+    except ValueError:
+        return False
+
+
 def _is_sensitive_path(path: str) -> bool:
     parts = [p.lower() for p in Path(path).parts]
     name = parts[-1] if parts else ""
@@ -369,6 +378,8 @@ def grep_search(
     
     def search_file(fpath: str):
         nonlocal sensitive_skipped
+        if not _is_within_workspace(fpath):
+            return False
         if _is_sensitive_path(fpath):
             sensitive_skipped = True
             return False
@@ -389,7 +400,7 @@ def grep_search(
         search_file(resolved_root)
     else:
         for root, dirs, files in os.walk(resolved_root):
-            dirs[:] = [d for d in dirs if d not in IGNORED_DIRS and (not d.startswith(".agent_") and (not d.startswith(".") or d in VISIBLE_HIDDEN_DIRS))]
+            dirs[:] = [d for d in dirs if d not in IGNORED_DIRS and (not d.startswith(".agent_") and (not d.startswith(".") or d in VISIBLE_HIDDEN_DIRS)) and _is_within_workspace(os.path.join(root, d))]
             for filename in files:
                 if file_pattern and not fnmatch.fnmatch(filename, file_pattern):
                     continue
@@ -435,9 +446,11 @@ def find_files_by_pattern(pattern: str, search_path: str = ".", max_results: int
     matched_files = []
 
     for root, dirs, files in os.walk(resolved_root):
-        dirs[:] = [d for d in dirs if d not in IGNORED_DIRS and (not d.startswith(".agent_") and (not d.startswith(".") or d in VISIBLE_HIDDEN_DIRS))]
+        dirs[:] = [d for d in dirs if d not in IGNORED_DIRS and (not d.startswith(".agent_") and (not d.startswith(".") or d in VISIBLE_HIDDEN_DIRS)) and _is_within_workspace(os.path.join(root, d))]
         for f in files:
             full_path = os.path.join(root, f)
+            if not _is_within_workspace(full_path):
+                continue
             relative_to_root = os.path.relpath(full_path, resolved_root).replace(os.sep, "/")
             normalized_pattern = pattern.replace("\\", "/")
             patterns = {normalized_pattern}

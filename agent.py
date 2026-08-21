@@ -223,6 +223,31 @@ Below is the catalog of learned project skills. When a task relates to any avail
         if not restored_msgs:
             return False
 
+        repaired = []
+        index = 0
+        while index < len(restored_msgs):
+            message = restored_msgs[index]
+            repaired.append(message)
+            index += 1
+            calls = (message.get("tool_calls") or []) if message.get("role") == "assistant" else []
+            if not calls:
+                continue
+            answered = set()
+            while index < len(restored_msgs) and restored_msgs[index].get("role") == "tool":
+                result = restored_msgs[index]
+                repaired.append(result)
+                answered.add(result.get("tool_call_id"))
+                index += 1
+            for call in calls:
+                call_id = call.get("id")
+                if call_id and call_id not in answered:
+                    repaired.append({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": "Interrupted tool call: no result was persisted before session recovery.",
+                    })
+        restored_msgs = repaired
+
         self.session_id = target_session_id
         self.step_counter = restored_step
 
@@ -276,6 +301,16 @@ Below is the catalog of learned project skills. When a task relates to any avail
 
     def manage_context(self, force: bool = False):
         """Perform context health check, pruning, or summarization compaction."""
+        if self.enable_memory and not self.stateless:
+            try:
+                memory_context = (
+                    f"Project Memory (MEMORY.md):\n{project_memory_manager.load_memory()}\n\n"
+                    f"User Profile (USER.md):\n{user_profile_manager.load_profile()}"
+                )
+            except Exception:
+                memory_context = "None."
+        else:
+            memory_context = "None."
         compacted_msgs, was_compacted, msg = self.context_manager.compact(
             client=self.client,
             model=self.model,
@@ -283,6 +318,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
             current_step=self.step_counter,
             force=force,
             tool_schemas=registry.schemas_for(self.enable_memory, self.enable_skills),
+            memory_context=memory_context,
         )
         if was_compacted:
             print(f"\n[Context] {msg}")
@@ -391,6 +427,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
                 tools=registry.schemas_for(self.enable_memory, self.enable_skills) or None,
                 tool_choice="auto" if registry.schemas_for(self.enable_memory, self.enable_skills) else None,
             )
+        self._last_finish_reason = getattr(response.choices[0], "finish_reason", None)
         return response.choices[0].message
 
     def run(self, user_task: str) -> str:
@@ -439,6 +476,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
         print(f"[Initial CWD]: {terminal_session.cwd}")
         print("=" * 65)
 
+        partial_answer = ""
         for iteration in range(1, self.max_iterations + 1):
             self.manage_context()
 
@@ -448,6 +486,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
             print(f"\n[Iteration {iteration}/{self.max_iterations}] Thinking ({self.model}) [Context: ~{curr_tokens:,}/{max_t:,} tokens ({pct:.1f}%)]...")
 
             try:
+                self._last_finish_reason = None
                 raw_message = self.step()
             except Exception as e:
                 if self._is_context_limit_error(e):
@@ -479,6 +518,19 @@ Below is the catalog of learned project skills. When a task relates to any avail
                 if not isinstance(assistant_message, dict):
                     assistant_message = {"role": "assistant", "content": raw_message.content or ""}
                 protocol_errors = {tc["id"]: tc for tc in tool_calls if tc["name"] == "__protocol_error__"}
+                if tool_calls and not assistant_message.get("tool_calls"):
+                    assistant_message["content"] = thought_content or ""
+                    assistant_message["tool_calls"] = [
+                        {
+                            "id": tc["id"],
+                            "type": "function",
+                            "function": {
+                                "name": tc["name"],
+                                "arguments": json.dumps(tc["arguments"]),
+                            },
+                        }
+                        for tc in tool_calls
+                    ]
                 for stored_call in assistant_message.get("tool_calls") or []:
                     repaired = protocol_errors.get(stored_call.get("id"))
                     if repaired:
@@ -584,7 +636,27 @@ Below is the catalog of learned project skills. When a task relates to any avail
 
             # Case 2: Final response
             else:
-                final_answer = thought_content or "[Task Finished]"
+                finish_reason = getattr(raw_message, "finish_reason", None) or self._last_finish_reason
+                is_truncated = finish_reason == "length"
+                is_empty = not (thought_content or "").strip()
+                if is_truncated or is_empty:
+                    if thought_content:
+                        partial_answer += thought_content
+                    repair_prompt = (
+                        "Continue the truncated response from exactly where it stopped. "
+                        "Return only the continuation and finish the answer."
+                        if is_truncated else
+                        "The previous assistant response was empty. Provide the complete answer now."
+                    )
+                    self.step_counter += 1
+                    self.messages.append({"role": "user", "content": repair_prompt})
+                    self.logger.log_step(
+                        self.session_id, self.step_counter, "user", content=repair_prompt
+                    )
+                    self._persist_session_state()
+                    continue
+
+                final_answer = partial_answer + (thought_content or "")
                 print(f"\n[Task Complete]:\n{final_answer}\n" + "=" * 65)
                 self._persist_session_state()
                 self.logger.end_session(self.session_id, status="COMPLETED")
@@ -598,7 +670,9 @@ Below is the catalog of learned project skills. When a task relates to any avail
         print(f"\n[!] Agent reached iteration limit ({self.max_iterations}).")
         self.logger.end_session(self.session_id, status="MAX_ITERATIONS")
         self._active_skill_injection = None
-        return "Task halted: Max iterations reached."
+        if partial_answer:
+            return f"Task incomplete: iteration limit reached after partial response: {partial_answer}"
+        return "Task incomplete: iteration limit reached without a complete response."
 
 
 # ==============================================================================

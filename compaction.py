@@ -265,11 +265,26 @@ not new requests. Omit if none were supplied.]
     def redact_sensitive_value(cls, value: Any) -> Any:
         """Redact strings anywhere in a persisted message structure."""
         if isinstance(value, str):
+            try:
+                decoded = json.loads(value)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+            else:
+                if isinstance(decoded, (dict, list)):
+                    return json.dumps(cls.redact_sensitive_value(decoded))
             return cls.redact_sensitive_text(value)
         if isinstance(value, list):
             return [cls.redact_sensitive_value(item) for item in value]
         if isinstance(value, dict):
-            return {key: cls.redact_sensitive_value(item) for key, item in value.items()}
+            sensitive_keys = {
+                "api_key", "apikey", "access_token", "authorization", "client_secret",
+                "refresh_token", "secret", "password", "passwd", "token",
+            }
+            return {
+                key: "[REDACTED]" if str(key).lower().replace("-", "_") in sensitive_keys
+                else cls.redact_sensitive_value(item)
+                for key, item in value.items()
+            }
         return value
 
     def extract_exact_anchors(self, messages: List[Dict[str, Any]]) -> str:
@@ -293,15 +308,24 @@ not new requests. Omit if none were supplied.]
 
         return "\n".join(anchors) if anchors else "None."
 
+    @staticmethod
+    def _is_real_user(message: Dict[str, Any]) -> bool:
+        content = str(message.get("content") or "")
+        return (
+            message.get("role") == "user"
+            and not content.startswith("[CONTEXT COMPACTION")
+            and "<tool_response>" not in content
+        )
+
     def extract_verbatim_user_messages(self, messages: List[Dict[str, Any]]) -> str:
         """
         Host-extracted verbatim real user inputs from the turns to be compacted.
         """
         user_msgs = []
         for idx, msg in enumerate(messages):
-            if msg.get("role") == "user":
+            if self._is_real_user(msg):
                 content = self.redact_sensitive_text(str(msg.get("content") or "")).strip()
-                if content and not content.startswith("[CONTEXT COMPACTION") and not content.startswith("<tool_response>"):
+                if content:
                     user_msgs.append(f"- User Turn {idx}: {content}")
         return "\n".join(user_msgs) if user_msgs else "None. This session contains no user-authored turns."
 
@@ -350,7 +374,8 @@ not new requests. Omit if none were supplied.]
         client: Any,
         model: str,
         messages_to_summarize: List[Dict[str, Any]],
-        focus_topic: str = ""
+        focus_topic: str = "",
+        memory_context: Optional[str] = None,
     ) -> str:
         """
         Generate a durable, structured historical checkpoint adhering to the Security & Provenance Contract.
@@ -380,14 +405,7 @@ not new requests. Omit if none were supplied.]
         exact_anchors = self.extract_exact_anchors(messages_to_summarize)
         verbatim_user_msgs = self.extract_verbatim_user_messages(messages_to_summarize)
 
-        try:
-            from memory import project_memory_manager, user_profile_manager
-            memory_provider_ctx = (
-                f"Project Memory (MEMORY.md):\n{project_memory_manager.load_memory()}\n\n"
-                f"User Profile (USER.md):\n{user_profile_manager.load_profile()}"
-            )
-        except Exception:
-            memory_provider_ctx = "None."
+        memory_provider_ctx = memory_context or "None."
 
         user_prompt = f"""<CURRENT_DATE>
 {current_date_str}
@@ -439,6 +457,19 @@ None.
             checkpoint = self.redact_sensitive_text((response.choices[0].message.content or "").strip())
             if not checkpoint:
                 raise RuntimeError("checkpoint generation returned empty")
+            deterministic = (
+                ("## Exact Recovery Anchors", exact_anchors),
+                ("## Verbatim Historical User Messages", verbatim_user_msgs),
+            )
+            for header, _ in deterministic:
+                checkpoint = re.sub(
+                    rf"(?ms)^{re.escape(header)}[ \t]*\n.*?(?=^## |\Z)",
+                    "",
+                    checkpoint,
+                )
+            checkpoint = checkpoint.rstrip() + "\n\n" + "\n\n".join(
+                f"{header}\n{body}" for header, body in deterministic
+            )
             return checkpoint
         except Exception as e:
             raise RuntimeError(f"checkpoint summarization failed: {e}") from e
@@ -475,7 +506,11 @@ None.
                     end += 1
 
             if index < boundary < end:
-                boundary = index
+                boundary = (
+                    index - 1
+                    if index > 1 and ContextManager._is_real_user(messages[index - 1])
+                    else index
+                )
                 break
         return boundary
 
@@ -488,6 +523,7 @@ None.
         force: bool = False,
         focus_topic: str = "",
         tool_schemas: Optional[List[Dict[str, Any]]] = None,
+        memory_context: Optional[str] = None,
     ) -> Tuple[List[Dict[str, Any]], bool, str]:
         """
         Execute context compaction if triggered by budget threshold or force flag.
@@ -521,6 +557,22 @@ None.
         system_msg = pruned_messages[0]
         desired_boundary = len(pruned_messages) - self.keep_recent_turns
         recent_boundary = self._safe_recent_boundary(pruned_messages, desired_boundary)
+        real_user_indexes = [
+            index for index in range(1, len(pruned_messages))
+            if self._is_real_user(pruned_messages[index])
+        ]
+        has_historical_user_context = bool(real_user_indexes) or any(
+            message.get("role") == "user"
+            and str(message.get("content") or "").startswith("[CONTEXT COMPACTION")
+            for message in pruned_messages[1:]
+        )
+        if recent_boundary not in real_user_indexes:
+            backward_candidates = [
+                index for index in real_user_indexes
+                if 1 < index <= recent_boundary
+            ]
+            if backward_candidates:
+                recent_boundary = backward_candidates[-1]
         older_messages = pruned_messages[1:recent_boundary]
         recent_messages = pruned_messages[recent_boundary:]
         if not older_messages:
@@ -531,7 +583,8 @@ None.
                 client=client,
                 model=model,
                 messages_to_summarize=older_messages,
-                focus_topic=focus_topic
+                focus_topic=focus_topic,
+                memory_context=memory_context,
             )
         except Exception as exc:
             return messages, False, f"Checkpoint compaction failed; original context retained: {exc}"
@@ -548,7 +601,25 @@ None.
             "content": "Acknowledged. I have ingested the historical context checkpoint and will proceed with the active task."
         }
 
-        compacted = [system_msg, compaction_block, ack_block] + recent_messages
+        has_active_recent_user = any(self._is_real_user(message) for message in recent_messages)
+        if has_historical_user_context and not has_active_recent_user:
+            wait_instruction = (
+                "Only a genuine user message appearing after this checkpoint is active. "
+                "If there is no later user message, wait."
+            )
+            whitespace_insensitive = r"\s+".join(
+                re.escape(part) for part in wait_instruction.split()
+            )
+            compaction_block["content"] = re.sub(
+                whitespace_insensitive,
+                "The historical task snapshot is the active in-flight task; continue it without waiting for another user message.",
+                compaction_block["content"],
+            )
+
+        prefix = [system_msg, compaction_block]
+        if recent_messages[0].get("role") != "assistant":
+            prefix.append(ack_block)
+        compacted = prefix + recent_messages
         final_tokens = self.estimate_tokens(compacted, tool_schemas)
         if final_tokens >= initial_tokens or final_tokens >= self.max_context_tokens:
             return messages, False, (
