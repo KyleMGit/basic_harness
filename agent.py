@@ -88,9 +88,10 @@ Below is the catalog of learned project skills. When a task relates to any avail
         confirm_all_terminal_commands: bool = True,
         enable_skills: bool = True,
         enable_memory: bool = True,
-        auto_learn_skills: bool = True,
-        auto_learn_memory: bool = True,
+        auto_learn_skills: bool = False,
+        auto_learn_memory: bool = False,
         read_only: bool = False,
+        stateless: bool = False,
         use_hermes_xml_protocol: bool = False,
     ):
         self.model = model or "Qwen-32b"
@@ -99,9 +100,13 @@ Below is the catalog of learned project skills. When a task relates to any avail
         self.enable_skills = enable_skills
         self.enable_memory = enable_memory
         self.read_only = read_only
-        self.auto_learn_skills = auto_learn_skills and not read_only
-        self.auto_learn_memory = auto_learn_memory and not read_only
+        self.stateless = stateless
+        configured_auto_skills = auto_learn_skills and enable_skills
+        configured_auto_memory = auto_learn_memory and enable_memory
+        self.auto_learn_skills = configured_auto_skills and not read_only
+        self.auto_learn_memory = configured_auto_memory and not read_only
         self.use_hermes_xml_protocol = use_hermes_xml_protocol
+        self._startup_config = (enable_skills, enable_memory, configured_auto_skills, configured_auto_memory)
         
         # Local models running on Ollama/vLLM/LMStudio do not require a real API key,
         # but the OpenAI SDK requires a non-empty string.
@@ -127,7 +132,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
         # Construct system prompt with live skill catalog & memory snapshots
         system_content = self._build_system_prompt()
         if self.use_hermes_xml_protocol:
-            system_content = ToolProtocol.format_hermes_system_prompt(system_content, registry.schemas)
+            system_content = ToolProtocol.format_hermes_system_prompt(system_content, registry.schemas_for(self.enable_memory, self.enable_skills))
 
         self.messages: List[Dict[str, Any]] = [
             {"role": "system", "content": system_content}
@@ -145,12 +150,8 @@ Below is the catalog of learned project skills. When a task relates to any avail
         )
 
     def refresh_system_prompt(self):
-        """Update system prompt with newly learned skills or updated memories."""
-        new_prompt = self._build_system_prompt()
-        if self.use_hermes_xml_protocol:
-            new_prompt = ToolProtocol.format_hermes_system_prompt(new_prompt, registry.schemas)
-        if self.messages and self.messages[0].get("role") == "system":
-            self.messages[0]["content"] = new_prompt
+        """System prompts are frozen for a session; updates apply next session."""
+        return
 
     def _persist_session_state(self):
         """Persist the active transcript without the rebuildable system prompt."""
@@ -166,17 +167,17 @@ Below is the catalog of learned project skills. When a task relates to any avail
         """Configure agent testing/learning modes dynamically."""
         mode_clean = mode.lower().strip()
         if mode_clean == "normal":
-            self.enable_skills = True
-            self.enable_memory = True
+            self.enable_skills, self.enable_memory, configured_skills, configured_memory = self._startup_config
             self.read_only = False
-            self.auto_learn_skills = True
-            self.auto_learn_memory = True
+            self.stateless = False
+            self.auto_learn_skills = configured_skills
+            self.auto_learn_memory = configured_memory
             self.logger.set_write_enabled(True)
-            print("[Mode Updated] Normal mode: Full Skills, Memory, and Auto-Learning active.")
+            print(f"[Mode Updated] Normal mode restored (skills={self.enable_skills}, memory={self.enable_memory}, auto-skills={self.auto_learn_skills}, auto-memory={self.auto_learn_memory}).")
         elif mode_clean in ("read-only", "readonly", "freeze"):
-            self.enable_skills = True
-            self.enable_memory = True
+            self.enable_skills, self.enable_memory = self._startup_config[:2]
             self.read_only = True
+            self.stateless = False
             self.auto_learn_skills = False
             self.auto_learn_memory = False
             self.logger.set_write_enabled(False)
@@ -185,6 +186,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
             self.enable_skills = False
             self.enable_memory = False
             self.read_only = True
+            self.stateless = True
             self.auto_learn_skills = False
             self.auto_learn_memory = False
             self.logger.set_write_enabled(False)
@@ -193,10 +195,21 @@ Below is the catalog of learned project skills. When a task relates to any avail
             print(f"Unknown mode '{mode}'. Options: normal | read-only | stateless")
             return
         
-        self.refresh_system_prompt()
+        # Privacy boundary: no transcript from the prior mode crosses modes.
+        self.session_id = str(uuid.uuid4())[:8]
+        self.step_counter = 0
+        self.context_manager.restore_state()
+        system_content = self._build_system_prompt()
+        schemas = registry.schemas_for(self.enable_memory, self.enable_skills)
+        if self.use_hermes_xml_protocol:
+            system_content = ToolProtocol.format_hermes_system_prompt(system_content, schemas)
+        self.messages = [{"role": "system", "content": system_content}]
 
     def resume_session(self, target_session_id: str) -> bool:
         """Resume a past conversation session from .agent_history.db."""
+        if self.stateless:
+            print("[Testing Mode] Stateless mode: persisted sessions are unavailable.")
+            return False
         task, legacy_messages = self.logger.load_session_messages(target_session_id)
         saved_state = self.logger.load_session_state(target_session_id)
         if saved_state:
@@ -213,9 +226,14 @@ Below is the catalog of learned project skills. When a task relates to any avail
         self.session_id = target_session_id
         self.step_counter = restored_step
 
-        system_content = self._build_system_prompt()
-        if self.use_hermes_xml_protocol:
-            system_content = ToolProtocol.format_hermes_system_prompt(system_content, registry.schemas)
+        if self.enable_memory and self.enable_skills:
+            system_content = self.logger.load_session_system_prompt(target_session_id) or self._build_system_prompt()
+        else:
+            # A frozen prompt may contain capabilities or persisted material that
+            # the current process explicitly disabled at startup.
+            system_content = self._build_system_prompt()
+        if self.use_hermes_xml_protocol and "<tools>" not in system_content:
+            system_content = ToolProtocol.format_hermes_system_prompt(system_content, registry.schemas_for(self.enable_memory, self.enable_skills))
 
         self.messages = [{"role": "system", "content": system_content}] + restored_msgs
         print(f"\n[Session Resumed] Successfully reloaded session '{target_session_id}' ({len(restored_msgs)} turns restored).")
@@ -263,7 +281,8 @@ Below is the catalog of learned project skills. When a task relates to any avail
             model=self.model,
             messages=self.messages,
             current_step=self.step_counter,
-            force=force
+            force=force,
+            tool_schemas=registry.schemas_for(self.enable_memory, self.enable_skills),
         )
         if was_compacted:
             print(f"\n[Context] {msg}")
@@ -278,10 +297,20 @@ Below is the catalog of learned project skills. When a task relates to any avail
         elif force:
             print(f"\n[Info] {msg}")
 
+    @staticmethod
+    def _is_context_limit_error(exc: Exception) -> bool:
+        status = getattr(exc, "status_code", None)
+        code = str(getattr(exc, "code", "") or "").lower()
+        message = str(exc).lower()
+        markers = ("context length", "context_length", "maximum context", "too many tokens", "token limit", "context window")
+        return any(marker in message or marker in code for marker in markers) or (status == 400 and "token" in message)
+
     def run_auto_memory_reflection(self, task_summary: str):
         """Analyze trajectory to automatically extract and record user preferences and project facts."""
         if not self.auto_learn_memory or self.read_only:
             return
+
+        print("\n[Memory Reflection] Reviewing this task (one opt-in provider call)...")
 
         result = self.memory_extractor.extract_and_update(
             client=self.client,
@@ -299,11 +328,15 @@ Below is the catalog of learned project skills. When a task relates to any avail
 
         if refreshed:
             self.refresh_system_prompt()
+        else:
+            print("[Memory Reflection] No safe durable updates applied.")
 
     def run_auto_skill_synthesis(self, task_summary: str):
         """Analyze trajectory against catalog to automatically extract or refine skills."""
         if not self.auto_learn_skills or self.read_only:
             return
+
+        print("\n[Skill Reflection] Reviewing this task (one opt-in provider call)...")
 
         result = self.skill_extractor.extract_and_save(
             client=self.client,
@@ -315,6 +348,12 @@ Below is the catalog of learned project skills. When a task relates to any avail
             action = result.get("action", "SAVED")
             name = result["name"]
             desc = result.get("description", "")
+            if action == "ERROR":
+                print(f"\n[Skill Reflection] Skill '{name}' was not saved: {desc}")
+                return
+            if action in ("SKIP", "PROPOSE"):
+                print(f"\n[Skill Reflection] Existing skill '{name}' retained; review required for replacement.")
+                return
             action_label = "Refined existing skill" if action == "UPDATE" else "Synthesized new skill"
             
             print(f"\n[Self-Improvement] {action_label}: '{name}'")
@@ -328,31 +367,41 @@ Below is the catalog of learned project skills. When a task relates to any avail
                 "skill_synthesis",
                 content=f"{action_label}: {name}"
             )
+        else:
+            print("[Skill Reflection] No safe skill proposal applied.")
 
     def step(self) -> Any:
         """Invoke the LLM for one turn."""
+        request_messages = self.messages
+        if getattr(self, "_active_skill_injection", None):
+            request_messages = [dict(message) for message in self.messages]
+            for message in reversed(request_messages):
+                if message.get("role") == "user":
+                    message["content"] = f"{self._active_skill_injection}\n\n[ACTIVE USER TASK]:\n{message.get('content', '')}"
+                    break
         if self.use_hermes_xml_protocol:
             response = self.client.chat.completions.create(
                 model=self.model,
-                messages=self.messages,
+                messages=request_messages,
             )
         else:
             response = self.client.chat.completions.create(
                 model=self.model,
-                messages=self.messages,
-                tools=registry.schemas if registry.schemas else None,
-                tool_choice="auto" if registry.schemas else None,
+                messages=request_messages,
+                tools=registry.schemas_for(self.enable_memory, self.enable_skills) or None,
+                tool_choice="auto" if registry.schemas_for(self.enable_memory, self.enable_skills) else None,
             )
         return response.choices[0].message
 
     def run(self, user_task: str) -> str:
         """Execute the autonomous agent loop for a given task."""
         user_message_content = user_task
+        self._active_skill_injection = None
         if not self.messages or len(self.messages) <= 1:
             self.session_id = str(uuid.uuid4())[:8]
             self.step_counter = 0
             self.context_manager.restore_state()
-            self.logger.start_session(self.session_id, user_task)
+            self.logger.start_session(self.session_id, user_task, self.messages[0].get("content", ""))
 
         # 1. Pre-Turn Skill Matching (if enabled)
         if self.enable_skills:
@@ -373,9 +422,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
                     + "\n\n".join(skill_blocks)
                 )
                 print(f"\n[Skill Retrieval] Found {len(relevant_skills)} matching skill(s): {', '.join(s['name'] for s in relevant_skills)}")
-                user_message_content = (
-                    f"{skill_injection}\n\n[ACTIVE USER TASK]:\n{user_task}"
-                )
+                self._active_skill_injection = skill_injection
 
         # 2. Append user task
         self.messages.append({"role": "user", "content": user_message_content})
@@ -388,14 +435,14 @@ Below is the catalog of learned project skills. When a task relates to any avail
         print("\n" + "=" * 65)
         print(f"[Agent Session {self.session_id}] Task: {user_task}")
         print(f"[Model]: {self.model}")
-        print(f"[Mode]:  {'Read-Only (Saving Disabled)' if self.read_only else ('Stateless Benchmark' if not self.enable_skills and not self.enable_memory else 'Full Persistence')}")
+        print(f"[Mode]:  {'Stateless Benchmark' if not self.enable_skills and not self.enable_memory else ('Read-Only (Saving Disabled)' if self.read_only else 'Full Persistence')}")
         print(f"[Initial CWD]: {terminal_session.cwd}")
         print("=" * 65)
 
         for iteration in range(1, self.max_iterations + 1):
             self.manage_context()
 
-            curr_tokens = self.context_manager.estimate_tokens(self.messages)
+            curr_tokens = self.context_manager.estimate_tokens(self.messages, registry.schemas_for(self.enable_memory, self.enable_skills))
             max_t = self.context_manager.max_context_tokens
             pct = (curr_tokens / max_t) * 100
             print(f"\n[Iteration {iteration}/{self.max_iterations}] Thinking ({self.model}) [Context: ~{curr_tokens:,}/{max_t:,} tokens ({pct:.1f}%)]...")
@@ -403,10 +450,22 @@ Below is the catalog of learned project skills. When a task relates to any avail
             try:
                 raw_message = self.step()
             except Exception as e:
-                err_msg = f"LLM API Error: {str(e)}"
-                print(f"[!] {err_msg}")
-                self.logger.end_session(self.session_id, status="FAILED")
-                return err_msg
+                if self._is_context_limit_error(e):
+                    self.manage_context(force=True)
+                    try:
+                        raw_message = self.step()
+                    except Exception as retry_error:
+                        e = retry_error
+                    else:
+                        e = None
+                if e is None:
+                    pass
+                else:
+                    err_msg = f"LLM API Error: {str(e)}"
+                    print(f"[!] {err_msg}")
+                    self.logger.end_session(self.session_id, status="FAILED")
+                    self._active_skill_injection = None
+                    return err_msg
 
             thought_content, tool_calls = ToolProtocol.extract_tool_calls(raw_message)
 
@@ -419,6 +478,14 @@ Below is the catalog of learned project skills. When a task relates to any avail
                 assistant_message = raw_message.model_dump(exclude_none=True)
                 if not isinstance(assistant_message, dict):
                     assistant_message = {"role": "assistant", "content": raw_message.content or ""}
+                protocol_errors = {tc["id"]: tc for tc in tool_calls if tc["name"] == "__protocol_error__"}
+                for stored_call in assistant_message.get("tool_calls") or []:
+                    repaired = protocol_errors.get(stored_call.get("id"))
+                    if repaired:
+                        stored_call["function"] = {
+                            "name": "__protocol_error__",
+                            "arguments": json.dumps(repaired["arguments"]),
+                        }
                 self.messages.append(assistant_message)
                 self.logger.log_step(
                     self.session_id,
@@ -441,7 +508,10 @@ Below is the catalog of learned project skills. When a task relates to any avail
                     fn_args = tc["arguments"]
                     call_id = tc["id"]
 
-                    if fn_name == "run_terminal_command" and self.confirm_all_terminal_commands:
+                    if fn_name == "__protocol_error__":
+                        tool_result = "Protocol repair required: " + str(fn_args.get("error", "malformed tool call"))
+                        print(f"\n[Protocol Error]: {tool_result}")
+                    elif fn_name == "run_terminal_command" and self.confirm_all_terminal_commands:
                         orig_cmd = fn_args.get("command", "")
                         should_run, final_cmd, feedback = self.prompt_user_for_command(orig_cmd, fn_args)
                         
@@ -457,7 +527,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
                                     assistant_step_index,
                                     message_calls,
                                 )
-                            tool_result = registry.execute(fn_name, fn_args, read_only=self.read_only)
+                            tool_result = registry.execute(fn_name, fn_args, read_only=self.read_only, memory_disabled=not self.enable_memory, skills_disabled=not self.enable_skills)
                             if final_cmd != orig_cmd:
                                 if self.read_only and registry.is_write_tool(fn_name):
                                     provenance = (
@@ -476,7 +546,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
                     else:
                         print(f"\n[Tool Request]: {fn_name}")
                         print(f"    Arguments: {json.dumps(fn_args, indent=2)}")
-                        tool_result = registry.execute(fn_name, fn_args, read_only=self.read_only)
+                        tool_result = registry.execute(fn_name, fn_args, read_only=self.read_only, memory_disabled=not self.enable_memory, skills_disabled=not self.enable_skills)
 
                     preview = tool_result if len(tool_result) < 350 else tool_result[:350] + "\n... [TRUNCATED]"
                     print(f"[Tool Result]:\n{preview}\n" + "-" * 50)
@@ -522,11 +592,12 @@ Below is the catalog of learned project skills. When a task relates to any avail
                 # Run post-task reflection (if not disabled/read-only)
                 self.run_auto_memory_reflection(user_task)
                 self.run_auto_skill_synthesis(user_task)
-
+                self._active_skill_injection = None
                 return final_answer
 
         print(f"\n[!] Agent reached iteration limit ({self.max_iterations}).")
         self.logger.end_session(self.session_id, status="MAX_ITERATIONS")
+        self._active_skill_injection = None
         return "Task halted: Max iterations reached."
 
 
@@ -603,6 +674,16 @@ def parse_args():
         help="Disable USER.md and MEMORY.md injection."
     )
     parser.add_argument(
+        "--auto-skills",
+        action="store_true",
+        help="Opt in to one visible post-task provider call for skill proposals (costs time/tokens)."
+    )
+    parser.add_argument(
+        "--auto-memory",
+        action="store_true",
+        help="Opt in to one visible post-task provider call for memory reflection (costs time/tokens)."
+    )
+    parser.add_argument(
         "--no-auto-skills",
         action="store_true",
         help="Disable automatic post-task skill synthesis."
@@ -615,6 +696,43 @@ def parse_args():
     return parser.parse_args()
 
 
+def handle_cli_command(agent: HermesCodingAgent, prompt: str) -> bool:
+    """Handle small persistence-inspection commands at the agent policy boundary."""
+    command = prompt.lower().strip()
+    if command in ("/user", "/profile", "user", "profile"):
+        print("\n=== USER.md Profile ===")
+        print(user_profile_manager.load_profile() if agent.enable_memory else "Capability disabled: memory is unavailable for this agent.")
+        return True
+    if command in ("/memory", "memory"):
+        print("\n=== MEMORY.md Project Facts ===")
+        print(project_memory_manager.load_memory() if agent.enable_memory else "Capability disabled: memory is unavailable for this agent.")
+        return True
+    if command in ("/skills", "skills"):
+        print("\n" + (skill_store.list_skills() if agent.enable_skills else "Capability disabled: skills are unavailable for this agent."))
+        return True
+    if command in ("/sessions", "sessions"):
+        if agent.stateless:
+            print("Capability disabled: persisted sessions are unavailable in stateless mode.")
+            return True
+        past_sessions = agent.logger.list_sessions(limit=10)
+        if not past_sessions:
+            print("No past sessions found in database.")
+        else:
+            print("\nPast Recorded Sessions:")
+            for ps in past_sessions:
+                print(f"  [{ps['session_id']}] {ps['date']} | Status: {ps['status']:<10} | Steps: {ps['step_count']:<3} | Task: {ps['task'][:45]}")
+        return True
+    if command.startswith("/resume") or command.startswith("resume"):
+        parts = prompt.split()
+        if len(parts) > 1:
+            if not agent.resume_session(parts[1]):
+                print(f"[!] Session '{parts[1]}' not found or unavailable.")
+        else:
+            print("Usage: /resume <session_id>")
+        return True
+    return False
+
+
 def main():
     args = parse_args()
 
@@ -623,8 +741,8 @@ def main():
     is_read_only = args.read_only or is_stateless
     enable_skills = not (args.no_skills or is_stateless)
     enable_memory = not (args.no_memory or is_stateless)
-    auto_learn_skills = not (args.no_auto_skills or is_read_only)
-    auto_learn_memory = not (args.no_auto_memory or is_read_only)
+    auto_learn_skills = args.auto_skills and not (args.no_auto_skills or is_read_only)
+    auto_learn_memory = args.auto_memory and not (args.no_auto_memory or is_read_only)
 
     print("=" * 65)
     print(" Hermes-Refined Coding Agent Harness")
@@ -648,6 +766,7 @@ def main():
         auto_learn_skills=auto_learn_skills,
         auto_learn_memory=auto_learn_memory,
         read_only=is_read_only,
+        stateless=is_stateless,
         use_hermes_xml_protocol=args.xml
     )
 
@@ -664,6 +783,8 @@ def main():
             if prompt.lower() in ("exit", "quit"):
                 print("Exiting agent harness. Trajectories saved.")
                 break
+            if handle_cli_command(agent, prompt):
+                continue
             if prompt.lower().startswith("/mode"):
                 parts = prompt.split()
                 if len(parts) > 1:

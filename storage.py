@@ -33,13 +33,15 @@ class TrajectoryLogger:
 
     def _init_db(self):
         with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute("PRAGMA foreign_keys = ON")
             cursor = conn.cursor()
             cursor.execute("""
                 CREATE TABLE IF NOT EXISTS sessions (
                     session_id TEXT PRIMARY KEY,
                     start_time REAL,
                     task TEXT,
-                    status TEXT
+                    status TEXT,
+                    system_prompt TEXT
                 )
             """)
             cursor.execute("""
@@ -68,16 +70,20 @@ class TrajectoryLogger:
             columns = {row[1] for row in cursor.execute("PRAGMA table_info(steps)")}
             if "tool_call_id" not in columns:
                 cursor.execute("ALTER TABLE steps ADD COLUMN tool_call_id TEXT")
+            session_columns = {row[1] for row in cursor.execute("PRAGMA table_info(sessions)")}
+            if "system_prompt" not in session_columns:
+                cursor.execute("ALTER TABLE sessions ADD COLUMN system_prompt TEXT")
             conn.commit()
 
-    def start_session(self, session_id: str, task: str):
+    def start_session(self, session_id: str, task: str, system_prompt: Optional[str] = None):
         if not self.write_enabled:
             return
         self._ensure_db()
         with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute("PRAGMA foreign_keys = ON")
             conn.cursor().execute(
-                "INSERT OR REPLACE INTO sessions (session_id, start_time, task, status) VALUES (?, ?, ?, ?)",
-                (session_id, time.time(), task, "IN_PROGRESS")
+                "INSERT OR REPLACE INTO sessions (session_id, start_time, task, status, system_prompt) VALUES (?, ?, ?, ?, ?)",
+                (session_id, time.time(), task, "IN_PROGRESS", system_prompt)
             )
             conn.commit()
 
@@ -94,6 +100,7 @@ class TrajectoryLogger:
             return
         self._ensure_db()
         with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute("PRAGMA foreign_keys = ON")
             conn.cursor().execute(
                 "INSERT INTO steps (session_id, step_index, role, content, tool_calls, tool_call_id, timestamp) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
@@ -116,6 +123,7 @@ class TrajectoryLogger:
             return
         self._ensure_db()
         with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute("PRAGMA foreign_keys = ON")
             conn.execute(
                 "UPDATE steps SET tool_calls = ? WHERE session_id = ? AND step_index = ? AND role = 'assistant'",
                 (json.dumps(tool_calls), session_id, step_index),
@@ -127,6 +135,7 @@ class TrajectoryLogger:
             return
         self._ensure_db()
         with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute("PRAGMA foreign_keys = ON")
             conn.cursor().execute(
                 "UPDATE sessions SET status = ? WHERE session_id = ?",
                 (status, session_id)
@@ -145,6 +154,7 @@ class TrajectoryLogger:
             return
         self._ensure_db()
         with closing(sqlite3.connect(self.db_path)) as conn:
+            conn.execute("PRAGMA foreign_keys = ON")
             conn.execute(
                 """
                 INSERT INTO session_state (
@@ -178,14 +188,31 @@ class TrajectoryLogger:
                     "FROM session_state WHERE session_id = ?",
                     (session_id,),
                 ).fetchone()
+                newer = conn.execute(
+                    "SELECT role, content, tool_calls, tool_call_id, step_index FROM steps "
+                    "WHERE session_id = ? AND step_index > COALESCE((SELECT step_counter FROM session_state WHERE session_id = ?), -1) "
+                    "ORDER BY step_index, id", (session_id, session_id)
+                ).fetchall()
         except sqlite3.OperationalError:
             return None
         if not row:
             return None
         try:
+            messages = json.loads(row["messages_json"])
+            step_counter = int(row["step_counter"])
+            for event in newer:
+                if event["role"] in ("system_compaction", "skill_synthesis"):
+                    continue
+                msg = {"role": event["role"], "content": event["content"]}
+                if event["tool_calls"]:
+                    msg["tool_calls"] = json.loads(event["tool_calls"])
+                if event["tool_call_id"]:
+                    msg["tool_call_id"] = event["tool_call_id"]
+                messages.append(msg)
+                step_counter = max(step_counter, int(event["step_index"]))
             return {
-                "messages": json.loads(row["messages_json"]),
-                "step_counter": int(row["step_counter"]),
+                "messages": messages,
+                "step_counter": step_counter,
                 "context_state": json.loads(row["context_state_json"]),
             }
         except (TypeError, ValueError, json.JSONDecodeError):
@@ -275,6 +302,16 @@ class TrajectoryLogger:
             reconstructed_messages.append(msg)
 
         return task, reconstructed_messages
+
+    def load_session_system_prompt(self, session_id: str) -> Optional[str]:
+        if not os.path.exists(self.db_path):
+            return None
+        try:
+            with closing(sqlite3.connect(self.db_path)) as conn:
+                row = conn.execute("SELECT system_prompt FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
+            return row[0] if row and row[0] else None
+        except sqlite3.OperationalError:
+            return None
 
     def export_jsonl(self, session_id: str, output_file: str):
         """Export session trajectory to JSONL format."""

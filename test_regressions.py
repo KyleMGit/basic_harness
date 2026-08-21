@@ -370,8 +370,10 @@ class TestMessageSequencingAndCommandProvenance(unittest.TestCase):
         roles = [message["role"] for message in agent.messages]
         self.assertNotIn(("user", "user"), list(zip(roles, roles[1:])))
         user_message = next(message for message in agent.messages if message["role"] == "user")
-        self.assertIn("RELEVANT LEARNED SKILLS", user_message["content"])
-        self.assertIn("active task", user_message["content"])
+        self.assertEqual(user_message["content"], "active task")
+        provider_messages = agent.client.chat.completions.create.call_args.kwargs["messages"]
+        self.assertIn("RELEVANT LEARNED SKILLS", provider_messages[1]["content"])
+        self.assertIn("active task", provider_messages[1]["content"])
 
     def test_parallel_xml_results_are_one_correlated_user_turn(self):
         from agent import HermesCodingAgent

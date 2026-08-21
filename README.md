@@ -18,7 +18,7 @@ An open-source, terminal-native Python agent harness optimized for local models 
    - View past session logs, dates, and step counts with `/sessions`.
 4. **Hermes Skill System & Intelligent Deduplication ([`skills.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/skills.py))**:
    - Injects `<available_skills>` catalog and pre-turn keyword auto-injection.
-   - Catalog-aware deduplication: updates existing skills (`UPDATE`) instead of creating duplicates.
+   - Catalog-aware deduplication; autonomous reflection proposes/skips changes to existing procedures instead of overwriting them.
 5. **Two-Phase Context Compaction & Summarization ([`compaction.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/compaction.py))**:
    - Implements the **Security & Provenance Context-Checkpoint Summarizer** contract.
    - Host-side deterministic extraction for `<EXACT_ANCHORS>` and `<VERBATIM_USER_MESSAGES>` at the 40K token limit.
@@ -101,8 +101,10 @@ Whenever the agent proposes a system or terminal command, execution pauses for r
 | **`--stateless`** | `--benchmark` | `False` | **Benchmark Baseline**: Disables skills, memory, and disk saving (pure zero-shot). |
 | **`--no-skills`** | | `False` | Completely disables skill catalog and skill retrieval. |
 | **`--no-memory`** | | `False` | Completely disables USER.md and MEMORY.md injection. |
-| **`--no-auto-skills`**| | `False` | Disables post-task automatic skill synthesis. |
-| **`--no-auto-memory`**| | `False` | Disables post-task automatic memory reflection. |
+| **`--auto-skills`** | | `False` | Opts in to a visible post-task skill reflection provider call (extra latency/tokens). Existing procedures are not autonomously overwritten. |
+| **`--auto-memory`** | | `False` | Opts in to a visible post-task memory reflection provider call (extra latency/tokens). |
+| **`--no-auto-skills`**| | `False` | Compatibility alias that disables `--auto-skills`. |
+| **`--no-auto-memory`**| | `False` | Compatibility alias that disables `--auto-memory`. |
 | **`--xml`** | | `False` | Switches from OpenAI JSON tool calling to Hermes XML `<tool_call>` syntax. |
 
 ---
@@ -111,11 +113,11 @@ Whenever the agent proposes a system or terminal command, execution pauses for r
 
 | Tool Name | Parameters | Description |
 | :--- | :--- | :--- |
-| **`grep_search`** | `query`, `search_path`, `is_regex`, `file_pattern`, `max_results` | Fast ripgrep-style regex/literal code search returning file paths, line numbers, and snippets. |
-| **`find_files_by_pattern`** | `pattern`, `search_path`, `max_results` | Glob file search (`*.py`, `src/**/*.ts`, `*router*`) across workspace folders. |
+| **`grep_search`** | `query`, `search_path`, `is_regex`, `file_pattern`, `max_results` | Bounded regex/literal search confined to the canonical workspace; includes relevant hidden config folders and excludes VCS/runtime/cache folders and credential files. |
+| **`find_files_by_pattern`** | `pattern`, `search_path`, `max_results` | Confined glob search (`*.py`, `src/**/*.ts`, `*router*`) across workspace folders. |
 | **`run_terminal_command`** | `command`, `timeout` | Executes terminal commands with persistent `cwd` across turns. |
-| **`read_file`** | `file_path`, `start_line`, `end_line` | Reads file contents with optional line range slicing (1-indexed). |
-| **`write_file`** | `file_path`, `content` | Writes/creates files (automatically creating missing parent directories). |
+| **`read_file`** | `file_path`, `start_line`, `end_line` | Bounded file reads inside the configured workspace. Traversal, symlink escape, and sensitive credential targets are denied. |
+| **`write_file`** | `file_path`, `content` | Writes/creates normal source files inside the canonical workspace; outside and sensitive targets are denied. |
 | **`patch_file`** | `file_path`, `search_content`, `replace_content` | Performs targeted search-and-replace on existing files. |
 | **`list_directory`** | `directory_path` | Inspects directory contents and file sizes. |
 | **`load_skill` / `<skill_name>()`** | `name` | Reads instructions and workflow details for any learned project skill. |

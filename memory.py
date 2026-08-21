@@ -10,6 +10,7 @@ import json
 import os
 import re
 from typing import Any, Dict, List, Optional, Tuple
+from safety import screen_prompt_content
 
 
 class UserProfileManager:
@@ -70,13 +71,37 @@ class UserProfileManager:
         try:
             with open(self.file_path, "r", encoding="utf-8") as f:
                 content = f.read().strip()
+            safe, status = screen_prompt_content(content)
+            if not safe:
+                return status
             return content if content else self.DEFAULT_TEMPLATE.strip()
         except Exception as e:
             return f"Error loading USER.md: {str(e)}"
 
+    def _load_profile_for_update(self) -> Tuple[Optional[str], Optional[str]]:
+        """Read existing profile content without substituting display/status text."""
+        if not os.path.exists(self.file_path):
+            root_user_md = os.path.join(os.getcwd(), "USER.md")
+            if os.path.isfile(root_user_md):
+                self.file_path = root_user_md
+            else:
+                return self.DEFAULT_TEMPLATE.strip(), None
+        try:
+            with open(self.file_path, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+        except Exception as e:
+            return None, f"Error loading USER.md; existing content was not modified: {str(e)}"
+        safe, status = screen_prompt_content(content)
+        if not safe:
+            return None, status
+        return content if content else self.DEFAULT_TEMPLATE.strip(), None
+
     def save_profile(self, content: str) -> str:
         """Save updated content to USER.md with character budget enforcement."""
         content = content.strip()
+        safe, status = screen_prompt_content(content)
+        if not safe:
+            return status
 
         if len(content) > self.MAX_CHAR_BUDGET:
             return (
@@ -94,7 +119,12 @@ class UserProfileManager:
 
     def update_preference(self, category: str, note: str) -> str:
         """Append or update a specific preference under a category section in USER.md."""
-        current = self.load_profile()
+        safe, status = screen_prompt_content(f"{category}\n{note}")
+        if not safe:
+            return status
+        current, load_error = self._load_profile_for_update()
+        if load_error:
+            return load_error
         category_header = f"## {category}"
 
         clean_note = note.strip()
@@ -179,13 +209,37 @@ class ProjectMemoryManager:
         try:
             with open(self.file_path, "r", encoding="utf-8") as f:
                 content = f.read().strip()
+            safe, status = screen_prompt_content(content)
+            if not safe:
+                return status
             return content if content else self.DEFAULT_TEMPLATE.strip()
         except Exception as e:
             return f"Error loading MEMORY.md: {str(e)}"
 
+    def _load_memory_for_update(self) -> Tuple[Optional[str], Optional[str]]:
+        """Read existing memory content without substituting display/status text."""
+        if not os.path.exists(self.file_path):
+            root_mem_md = os.path.join(os.getcwd(), "MEMORY.md")
+            if os.path.isfile(root_mem_md):
+                self.file_path = root_mem_md
+            else:
+                return self.DEFAULT_TEMPLATE.strip(), None
+        try:
+            with open(self.file_path, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+        except Exception as e:
+            return None, f"Error loading MEMORY.md; existing content was not modified: {str(e)}"
+        safe, status = screen_prompt_content(content)
+        if not safe:
+            return None, status
+        return content if content else self.DEFAULT_TEMPLATE.strip(), None
+
     def save_memory(self, content: str) -> str:
         """Save updated content to MEMORY.md with character budget enforcement."""
         content = content.strip()
+        safe, status = screen_prompt_content(content)
+        if not safe:
+            return status
 
         if len(content) > self.MAX_CHAR_BUDGET:
             return (
@@ -203,7 +257,12 @@ class ProjectMemoryManager:
 
     def update_fact(self, category: str, fact: str) -> str:
         """Append or update a specific fact under a category section in MEMORY.md."""
-        current = self.load_memory()
+        safe, status = screen_prompt_content(f"{category}\n{fact}")
+        if not safe:
+            return status
+        current, load_error = self._load_memory_for_update()
+        if load_error:
+            return load_error
         category_header = f"## {category}"
 
         clean_fact = fact.strip()

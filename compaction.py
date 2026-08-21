@@ -208,11 +208,13 @@ not new requests. Omit if none were supplied.]
         trigger_threshold: float = 0.70,  # Triggers compaction at ~28,672 tokens (leaving ~12,288 tokens headroom)
         keep_recent_turns: int = 6,       # Preserves last 6 turns verbatim
         cooldown_steps: int = 3,
+        completion_reserve_tokens: Optional[int] = None,
     ):
         self.max_context_tokens = max_context_tokens
         self.trigger_threshold = trigger_threshold
         self.keep_recent_turns = keep_recent_turns
         self.cooldown_steps = cooldown_steps
+        self.completion_reserve_tokens = max(0, completion_reserve_tokens if completion_reserve_tokens is not None else min(1024, max_context_tokens // 10))
         self.last_compaction_step = -100
         self.compaction_count = 0
         self.previous_checkpoint: Optional[str] = None
@@ -220,7 +222,7 @@ not new requests. Omit if none were supplied.]
     def snapshot_state(self) -> Dict[str, Any]:
         """Return only the session-scoped compaction state needed for resumption."""
         return {
-            "previous_checkpoint": self.previous_checkpoint,
+            "previous_checkpoint": self.redact_sensitive_text(self.previous_checkpoint) if self.previous_checkpoint else None,
             "last_compaction_step": self.last_compaction_step,
             "compaction_count": self.compaction_count,
         }
@@ -228,12 +230,12 @@ not new requests. Omit if none were supplied.]
     def restore_state(self, state: Optional[Dict[str, Any]] = None):
         """Reset state, then restore a checkpoint owned by the resumed session."""
         state = state or {}
-        self.previous_checkpoint = state.get("previous_checkpoint")
+        checkpoint = state.get("previous_checkpoint")
+        self.previous_checkpoint = self.redact_sensitive_text(str(checkpoint)) if checkpoint else None
         self.last_compaction_step = int(state.get("last_compaction_step", -100))
         self.compaction_count = int(state.get("compaction_count", 0))
 
-    @staticmethod
-    def estimate_tokens(messages: List[Dict[str, Any]]) -> int:
+    def estimate_tokens(self, messages: List[Dict[str, Any]], tool_schemas: Optional[List[Dict[str, Any]]] = None) -> int:
         """
         Fast token estimation based on character count and structured payloads.
         (~4 chars per token rule of thumb).
@@ -247,16 +249,38 @@ not new requests. Omit if none were supplied.]
             if tool_calls:
                 char_count += len(json.dumps(tool_calls))
                 
-        return max(1, char_count // 4)
+        if tool_schemas:
+            char_count += len(json.dumps(tool_schemas))
+        return max(1, char_count // 4) + self.completion_reserve_tokens
+
+    @staticmethod
+    def redact_sensitive_text(text: str) -> str:
+        text = re.sub(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", "[REDACTED PRIVATE KEY]", text, flags=re.DOTALL)
+        text = re.sub(r"(?i)\b(authorization\s*:\s*bearer|bearer)\s+[A-Za-z0-9._~+/=-]+", r"\1 [REDACTED]", text)
+        text = re.sub(r"(?i)[\"']?\b(api[_-]?key|access[_-]?token|secret|password|passwd|token)\b[\"']?\s*[:=]\s*[^\s&,}]+", r"\1=[REDACTED]", text)
+        text = re.sub(r"(?i)([?&](?:api[_-]?key|access[_-]?token|secret|password|token)=)[^&#\s]+", r"\1[REDACTED]", text)
+        return text
+
+    @classmethod
+    def redact_sensitive_value(cls, value: Any) -> Any:
+        """Redact strings anywhere in a persisted message structure."""
+        if isinstance(value, str):
+            return cls.redact_sensitive_text(value)
+        if isinstance(value, list):
+            return [cls.redact_sensitive_value(item) for item in value]
+        if isinstance(value, dict):
+            return {key: cls.redact_sensitive_value(item) for key, item in value.items()}
+        return value
 
     def extract_exact_anchors(self, messages: List[Dict[str, Any]]) -> str:
         """
         Host-extracted deterministic anchors (file paths, URLs, error text, and git SHAs).
         """
-        text_corpus = " ".join(str(m.get("content") or "") for m in messages)
+        text_corpus = self.redact_sensitive_text(" ".join(str(m.get("content") or "") for m in messages))
         
-        paths = set(re.findall(r'(?:[A-Za-z]:[\\/]|[\./\\])[\w\-\./\\]+\.[a-zA-Z0-9]+', text_corpus))
         urls = set(re.findall(r'https?://[^\s<>"]+', text_corpus))
+        path_corpus = re.sub(r'https?://[^\s<>"]+', ' ', text_corpus)
+        paths = set(re.findall(r'(?<![:\w])(?:[A-Za-z]:[\\/]|[\./\\])[\w\-\./\\]+\.[a-zA-Z0-9]+', path_corpus))
         shas = set(re.findall(r'\b[0-9a-f]{40}\b|\b[0-9a-f]{7,8}\b', text_corpus))
 
         anchors = []
@@ -276,7 +300,7 @@ not new requests. Omit if none were supplied.]
         user_msgs = []
         for idx, msg in enumerate(messages):
             if msg.get("role") == "user":
-                content = str(msg.get("content") or "").strip()
+                content = self.redact_sensitive_text(str(msg.get("content") or "")).strip()
                 if content and not content.startswith("[CONTEXT COMPACTION") and not content.startswith("<tool_response>"):
                     user_msgs.append(f"- User Turn {idx}: {content}")
         return "\n".join(user_msgs) if user_msgs else "None. This session contains no user-authored turns."
@@ -297,26 +321,27 @@ not new requests. Omit if none were supplied.]
                 pruned_messages.append(msg)
                 continue
 
+            safe_msg = self.redact_sensitive_value(msg)
             role = msg.get("role")
-            content = str(msg.get("content") or "")
+            content = str(safe_msg.get("content") or "")
 
             # If it's a tool output message or hermes tool response with large output
             if role == "tool" and len(content) > 300:
                 head = content[:120].strip()
                 tail = content[-80:].strip()
                 summary_content = f"{head}\n\n... [PRUNED TOOL OUTPUT ({len(content)} chars) - Exit details retained] ...\n\n{tail}"
-                new_msg = dict(msg)
+                new_msg = dict(safe_msg)
                 new_msg["content"] = summary_content
                 pruned_messages.append(new_msg)
             elif "<tool_response>" in content and len(content) > 350:
                 head = content[:150].strip()
                 tail = content[-100:].strip()
                 summary_content = f"{head}\n\n... [PRUNED TOOL OUTPUT] ...\n\n{tail}"
-                new_msg = dict(msg)
+                new_msg = dict(safe_msg)
                 new_msg["content"] = summary_content
                 pruned_messages.append(new_msg)
             else:
-                pruned_messages.append(msg)
+                pruned_messages.append(safe_msg)
 
         return pruned_messages
 
@@ -331,11 +356,22 @@ not new requests. Omit if none were supplied.]
         Generate a durable, structured historical checkpoint adhering to the Security & Provenance Contract.
         """
         transcript_lines = []
+        def redact_serialized(value: Any) -> Any:
+            if isinstance(value, str):
+                return self.redact_sensitive_text(value)
+            if isinstance(value, list):
+                return [redact_serialized(item) for item in value]
+            if isinstance(value, dict):
+                return {key: redact_serialized(item) for key, item in value.items()}
+            return value
+
         for msg in messages_to_summarize:
             role = msg.get("role", "unknown").upper()
-            content = msg.get("content") or ""
+            content = self.redact_sensitive_text(str(msg.get("content") or ""))
             if msg.get("tool_calls"):
-                content += f"\n[Tool Calls: {json.dumps(msg.get('tool_calls'))}]"
+                content += self.redact_sensitive_text(
+                    f"\n[Tool Calls: {json.dumps(redact_serialized(msg.get('tool_calls')))}]"
+                )
             transcript_lines.append(f"### {role}:\n{content}")
 
         history_transcript = "\n\n".join(transcript_lines)
@@ -389,6 +425,7 @@ None.
 None.
 </RECOVERY_POINTER>
 """
+        user_prompt = self.redact_sensitive_text(user_prompt)
 
         try:
             response = client.chat.completions.create(
@@ -399,7 +436,7 @@ None.
                 ],
                 temperature=0.1,
             )
-            checkpoint = (response.choices[0].message.content or "").strip()
+            checkpoint = self.redact_sensitive_text((response.choices[0].message.content or "").strip())
             if not checkpoint:
                 raise RuntimeError("checkpoint generation returned empty")
             return checkpoint
@@ -449,14 +486,15 @@ None.
         messages: List[Dict[str, Any]],
         current_step: int,
         force: bool = False,
-        focus_topic: str = ""
+        focus_topic: str = "",
+        tool_schemas: Optional[List[Dict[str, Any]]] = None,
     ) -> Tuple[List[Dict[str, Any]], bool, str]:
         """
         Execute context compaction if triggered by budget threshold or force flag.
         Returns: (compacted_messages, was_compacted, status_message)
         """
-        initial_tokens = self.estimate_tokens(messages)
-        trigger_limit = int(self.max_context_tokens * self.trigger_threshold)
+        initial_tokens = self.estimate_tokens(messages, tool_schemas)
+        trigger_limit = max(1, int(self.max_context_tokens * self.trigger_threshold))
 
         # Check if compaction is needed
         if not force and initial_tokens < trigger_limit:
@@ -468,7 +506,7 @@ None.
 
         # Phase 1: Tool Output Pruning
         pruned_messages = self.prune_tool_outputs(messages)
-        pruned_tokens = self.estimate_tokens(pruned_messages)
+        pruned_tokens = self.estimate_tokens(pruned_messages, tool_schemas)
 
         # If Phase 1 pruned enough below threshold, return without full LLM summarization
         if not force and pruned_tokens < trigger_limit:
@@ -511,7 +549,7 @@ None.
         }
 
         compacted = [system_msg, compaction_block, ack_block] + recent_messages
-        final_tokens = self.estimate_tokens(compacted)
+        final_tokens = self.estimate_tokens(compacted, tool_schemas)
         if final_tokens >= initial_tokens or final_tokens >= self.max_context_tokens:
             return messages, False, (
                 "Checkpoint was ineffective or oversized; original context retained "

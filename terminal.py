@@ -36,9 +36,20 @@ class TerminalSession:
     ]
 
     def __init__(self, cwd: Optional[str] = None, max_output_chars: int = 8000):
-        self.cwd = os.path.abspath(cwd or os.getcwd())
+        self._cwd = os.path.abspath(cwd or os.getcwd())
+        self.workspace_root = os.path.realpath(self._cwd)
         self.env = os.environ.copy()
         self.max_output_chars = max_output_chars
+
+    @property
+    def cwd(self) -> str:
+        return self._cwd
+
+    @cwd.setter
+    def cwd(self, value: str) -> None:
+        """Explicit assignment configures a new workspace (used by embedders/tests)."""
+        self._cwd = os.path.abspath(value)
+        self.workspace_root = os.path.realpath(self._cwd)
 
     def is_destructive(self, command: str) -> bool:
         """Check if a command matches potentially destructive patterns."""
@@ -50,13 +61,17 @@ class TerminalSession:
     def is_safe(self, command: str) -> bool:
         """Check if a command starts with a known safe read-only prefix."""
         cmd_strip = command.strip().lower()
-        return any(cmd_strip.startswith(prefix) for prefix in self.SAFE_COMMAND_PREFIXES)
+        if re.search(r"(?:&&|\|\||[|;&])", cmd_strip):
+            return False
+        return any(cmd_strip == prefix or cmd_strip.startswith(prefix + " ") for prefix in self.SAFE_COMMAND_PREFIXES)
 
     def _handle_cd(self, command: str) -> Optional[str]:
         """
         Handle 'cd' command separately to persist working directory across steps.
         Returns a status string if it was purely a cd command, or None to run via shell.
         """
+        if re.search(r"(?:&&|\|\||[|;&])", command):
+            return None
         cmd_parts = command.strip().split()
         if len(cmd_parts) >= 1 and cmd_parts[0].lower() == "cd":
             if len(cmd_parts) == 1:
@@ -67,7 +82,7 @@ class TerminalSession:
 
             new_path = os.path.abspath(os.path.join(self.cwd, target_dir))
             if os.path.isdir(new_path):
-                self.cwd = new_path
+                self._cwd = new_path
                 return f"[Directory changed to]: {self.cwd}"
             else:
                 return f"Error: Directory '{new_path}' does not exist."
@@ -98,6 +113,16 @@ class TerminalSession:
             stdout = process.stdout or ""
             stderr = process.stderr or ""
             exit_code = process.returncode
+
+            # A successful leading cd in a compound shell command updates the
+            # session cwd without attempting to interpret the whole chain as a path.
+            if exit_code == 0:
+                leading_cd = re.match(r'^\s*cd\s+(?:/d\s+)?("[^"]+"|\'[^\']+\'|[^&|;]+?)\s*(?:&&|;)', command, re.IGNORECASE)
+                if leading_cd:
+                    target = os.path.expanduser(leading_cd.group(1).strip().strip("\"'"))
+                    changed = os.path.abspath(os.path.join(self.cwd, target))
+                    if os.path.isdir(changed):
+                        self._cwd = changed
 
             # 3. Format and clip output to prevent context blowout
             formatted_output = self._format_output(stdout, stderr, exit_code)

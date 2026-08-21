@@ -14,7 +14,7 @@ class ToolProtocol:
     """Parses tool calls from raw model text or structured API objects."""
 
     HERMES_TOOL_CALL_REGEX = re.compile(
-        r"<tool_call>\s*({.*?})\s*</tool_call>",
+        r"<tool_call>\s*(.*?)\s*</tool_call>",
         re.DOTALL
     )
 
@@ -50,8 +50,12 @@ class ToolProtocol:
                 raw_args = tc.function.arguments
                 try:
                     args = json.loads(raw_args)
-                except Exception:
-                    args = {}
+                    if not isinstance(args, dict):
+                        raise ValueError("arguments must decode to an object")
+                except Exception as exc:
+                    tool_calls.append({"id": tc.id or f"call_{idx}", "name": "__protocol_error__",
+                                       "arguments": {"error": f"Malformed arguments for {fn_name}: {exc}"}})
+                    continue
                 tool_calls.append({
                     "id": tc.id or f"call_{idx}",
                     "name": fn_name,
@@ -78,8 +82,9 @@ class ToolProtocol:
                                 "name": fn_name,
                                 "arguments": args
                             })
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        tool_calls.append({"id": f"hermes_call_{idx}", "name": "__protocol_error__",
+                                           "arguments": {"error": f"Malformed Hermes tool call: {exc}"}})
                 
                 clean_text = cls.HERMES_TOOL_CALL_REGEX.sub("", content).strip()
                 return clean_text, tool_calls

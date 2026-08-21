@@ -7,7 +7,10 @@ Supports native Markdown (SKILL.md, .md with YAML frontmatter) and JSON format.
 import json
 import os
 import re
+import tempfile
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
+from safety import screen_prompt_content
 
 
 class SkillStore:
@@ -95,9 +98,31 @@ tags: {tags_str}
             os.path.join(self.storage_dir, f"{safe}.json"),
         ]
 
+        root_real = os.path.realpath(self.storage_dir)
+        for walk_root, dirs, files in os.walk(self.storage_dir, followlinks=False):
+            dirs[:] = [d for d in dirs if os.path.commonpath((root_real, os.path.realpath(os.path.join(walk_root, d)))) == root_real]
+            if "SKILL.md" in files:
+                candidate = os.path.join(walk_root, "SKILL.md")
+                try:
+                    with open(candidate, "r", encoding="utf-8") as handle:
+                        content = handle.read()
+                    parsed = self.parse_markdown_skill(content, default_name=os.path.basename(walk_root))
+                    if self._safe_name(parsed.get("name", "")) == safe or self._safe_name(os.path.basename(walk_root)) == safe:
+                        candidates.append(candidate)
+                except OSError:
+                    continue
+        found = []
         for cand in candidates:
-            if cand and os.path.isfile(cand):
-                return cand
+            if cand and os.path.isfile(cand) and os.path.commonpath((root_real, os.path.realpath(cand))) == root_real:
+                if os.path.realpath(cand) not in found:
+                    found.append(os.path.realpath(cand))
+        if len(found) > 1:
+            # Markdown/JSON siblings are one logical root skill; nested duplicates are ambiguous.
+            nested = [p for p in found if os.path.basename(p).lower() == "skill.md"]
+            if len(nested) > 1 or (nested and any(os.path.dirname(p) != self.storage_dir for p in found if p not in nested)):
+                raise ValueError(f"Ambiguous skill name '{name}': {len(found)} confined candidates found.")
+        if found:
+            return next((p for p in found if p.lower().endswith(".md")), found[0])
         return None
 
     def save_skill(self, name: str, description: str, instructions: str, tags: Optional[List[str]] = None) -> str:
@@ -112,16 +137,12 @@ tags: {tags_str}
         clean_name = name.strip()
         clean_desc = description.strip()
         clean_instr = instructions.strip()
+        safe_content, status = screen_prompt_content(f"{clean_name}\n{clean_desc}\n{clean_instr}")
+        if not safe_content:
+            return status
 
         # 1. Write Markdown format (.md)
         md_content = self.format_markdown_skill(clean_name, clean_desc, clean_instr, tags)
-        try:
-            with open(md_path, "w", encoding="utf-8") as f:
-                f.write(md_content)
-        except Exception as e:
-            return f"Error saving markdown skill '{name}': {str(e)}"
-
-        # 2. Write JSON format (.json) for tool/JSON interoperability
         skill_dict = {
             "name": clean_name,
             "description": clean_desc,
@@ -130,17 +151,41 @@ tags: {tags_str}
             "format": "markdown",
             "file": f"{safe}.md"
         }
+        tmp_md = tmp_json = None
+        old_md = Path(md_path).read_bytes() if os.path.exists(md_path) else None
+        old_json = Path(json_path).read_bytes() if os.path.exists(json_path) else None
         try:
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(skill_dict, f, indent=2)
-        except Exception:
-            pass
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=self.storage_dir, delete=False) as f:
+                tmp_md = f.name; f.write(md_content)
+            with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=self.storage_dir, delete=False) as f:
+                tmp_json = f.name; json.dump(skill_dict, f, indent=2)
+            os.replace(tmp_md, md_path); tmp_md = None
+            os.replace(tmp_json, json_path); tmp_json = None
+        except Exception as e:
+            for pending in (tmp_md, tmp_json):
+                if pending and os.path.exists(pending):
+                    os.unlink(pending)
+            try:
+                if old_md is None:
+                    if os.path.exists(md_path): os.unlink(md_path)
+                else:
+                    with open(md_path, "wb") as f: f.write(old_md)
+                if old_json is None:
+                    if os.path.exists(json_path): os.unlink(json_path)
+                else:
+                    with open(json_path, "wb") as f: f.write(old_json)
+            except OSError:
+                pass
+            return f"Error saving coherent skill '{name}': {e}"
 
         return f"Skill '{clean_name}' successfully saved as '{md_path}' and '{json_path}'."
 
     def load_skill(self, name: str) -> str:
         """Load and read instructions for a specific skill from .md or .json file."""
-        file_path = self.resolve_skill_file(name)
+        try:
+            file_path = self.resolve_skill_file(name)
+        except ValueError as exc:
+            return f"Error: {exc}"
         if not file_path:
             return f"Skill '{name}' not found in '{self.storage_dir}' (checked .md, .json, and SKILL.md)."
 
@@ -159,6 +204,10 @@ tags: {tags_str}
                 desc = data.get("description")
                 instr = data.get("instructions")
 
+            safe_content, status = screen_prompt_content(f"{desc}\n{instr}")
+            if not safe_content:
+                return status
+
             return f"=== SKILL: {skill_name} ===\nFile: {file_path}\nDescription: {desc}\n\nInstructions:\n{instr}"
         except Exception as e:
             return f"Error loading skill from '{file_path}': {str(e)}"
@@ -173,6 +222,11 @@ tags: {tags_str}
         for root, _, files in os.walk(self.storage_dir):
             for filename in sorted(files):
                 full_path = os.path.join(root, filename)
+                try:
+                    if os.path.commonpath((os.path.realpath(self.storage_dir), os.path.realpath(full_path))) != os.path.realpath(self.storage_dir):
+                        continue
+                except ValueError:
+                    continue
                 
                 # Check markdown files (.md, SKILL.md)
                 if filename.endswith(".md"):
@@ -180,6 +234,8 @@ tags: {tags_str}
                         with open(full_path, "r", encoding="utf-8") as f:
                             content = f.read()
                         parsed = self.parse_markdown_skill(content, default_name=self._safe_name(filename))
+                        if not screen_prompt_content(f"{parsed.get('description', '')}\n{parsed.get('instructions', '')}")[0]:
+                            continue
                         norm_name = self._safe_name(parsed["name"])
                         parsed["file_path"] = full_path
                         skills_map[norm_name] = parsed
@@ -194,12 +250,23 @@ tags: {tags_str}
                             with open(full_path, "r", encoding="utf-8") as f:
                                 data = json.load(f)
                             if "name" in data and "instructions" in data:
+                                if not screen_prompt_content(
+                                    f"{data.get('description', '')}\n{data.get('instructions', '')}"
+                                )[0]:
+                                    continue
                                 data["file_path"] = full_path
                                 skills_map[norm_name] = data
                         except Exception:
                             continue
 
-        return list(skills_map.values())
+        unambiguous = []
+        for norm_name in sorted(skills_map):
+            try:
+                self.resolve_skill_file(norm_name)
+            except ValueError:
+                continue
+            unambiguous.append(skills_map[norm_name])
+        return unambiguous
 
     def get_skills_index(self) -> List[Dict[str, str]]:
         """Retrieve a lightweight catalog index of all available skills."""
@@ -406,7 +473,15 @@ Respond ONLY with a JSON object in this format:
                             action = "UPDATE"
                             break
 
-                self.skill_store.save_skill(name, desc, instr)
+                if action == "UPDATE" and self.skill_store.resolve_skill_file(name):
+                    return {"action": "SKIP", "name": name, "description": "Existing skill retained; autonomous replacement requires review."}
+                save_status = self.skill_store.save_skill(name, desc, instr)
+                if "successfully saved" not in str(save_status).lower():
+                    return {
+                        "action": "ERROR",
+                        "name": name,
+                        "description": f"Skill was not saved: {save_status}",
+                    }
                 return {
                     "action": action,
                     "name": name,

@@ -156,13 +156,13 @@ class TestHermesAgentComponents(unittest.TestCase):
         )
 
         self.assertIsNotNone(result)
-        self.assertEqual(result["action"], "UPDATE")
+        self.assertEqual(result["action"], "SKIP")
         self.assertEqual(result["name"], "setup_pytest_env")
         
         # Verify only 1 skill file exists (no duplicates)
         all_skills = store.get_all_skills()
         self.assertEqual(len(all_skills), 1)
-        self.assertIn("pytest-cov", all_skills[0]["instructions"])
+        self.assertNotIn("pytest-cov", all_skills[0]["instructions"])
 
         # Case B: LLM action NONE (trivial / duplicate)
         mock_resp.choices = [MagicMock(message=MagicMock(content=json.dumps({"action": "NONE"})))]
@@ -286,11 +286,11 @@ Fix NoneType bug in main.py.
 
         agent.run("Create a new FastAPI router endpoint")
 
-        # Verify that the skill was retrieved and pre-injected into messages
-        injected_turns = [m for m in agent.messages if "[RELEVANT LEARNED SKILLS AUTO-INJECTED]" in str(m.get("content"))]
-        self.assertEqual(len(injected_turns), 1)
-        self.assertIn("fastapi_endpoint_pattern", injected_turns[0]["content"])
-        self.assertIn("from fastapi import APIRouter", injected_turns[0]["content"])
+        # Skill instructions are an ephemeral provider projection, not durable user authorship.
+        self.assertEqual(agent.messages[1]["content"], "Create a new FastAPI router endpoint")
+        injected = agent.client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
+        self.assertIn("fastapi_endpoint_pattern", injected)
+        self.assertIn("from fastapi import APIRouter", injected)
 
     def test_direct_skill_name_as_tool_call(self):
         from tools import registry as reg, skill_store as global_store
@@ -506,7 +506,6 @@ Fix NoneType bug in main.py.
         self.assertIn("Default testing profile", sys_prompt)
 if __name__ == "__main__":
     unittest.main()
-
 
 
 
