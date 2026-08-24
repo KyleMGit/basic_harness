@@ -7,8 +7,18 @@
     "logmech": "YOUR_LOGON_MECHANISM"
   },
   "impala": {
-    "connection_string": "DSN=YOUR_IMPALA_DSN;UID=YOUR_USERNAME;PWD=YOUR_PASSWORD",
+    "host": "YOUR_IMPALA_HOSTNAME",
+    "port": 21050,
     "database": "default",
-    "timeout": 30
+    "timeout": 30,
+    "auth_mechanism": "NOSASL",
+    "user": "YOUR_IMPALA_USERNAME",
+    "password": "YOUR_IMPALA_PASSWORD",
+    "use_ssl": false,
+    "ca_cert": "OPTIONAL_CA_CERT_PATH",
+    "kerberos_service_name": "impala",
+    "use_http_transport": false,
+    "http_path": "",
+    "verify_cert": false
   }
 }

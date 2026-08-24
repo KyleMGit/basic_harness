@@ -118,6 +118,8 @@ Whenever the agent proposes a system or terminal command, execution pauses for r
 | **`run_terminal_command`** | `command`, `timeout` | Executes terminal commands with persistent `cwd` across turns. |
 | **`query_teradata`** | `sql`, `max_rows` | Runs one bounded, read-only Teradata query using environment configuration. |
 | **`query_impala`** | `sql`, `max_rows` | Runs one bounded, read-only Hadoop Impala query using environment configuration. |
+| **`export_teradata_csv`** | `sql`, `file_path`, `batch_size`, `overwrite` | Streams a read-only Teradata query to an atomic workspace CSV file. |
+| **`export_impala_csv`** | `sql`, `file_path`, `batch_size`, `overwrite` | Streams a read-only Impala query to an atomic workspace CSV file. |
 | **`read_file`** | `file_path`, `start_line`, `end_line` | Bounded file reads inside the configured workspace. Traversal, symlink escape, and sensitive credential targets are denied. |
 | **`write_file`** | `file_path`, `content` | Writes/creates normal source files inside the canonical workspace; outside and sensitive targets are denied. |
 | **`patch_file`** | `file_path`, `search_content`, `replace_content` | Performs targeted search-and-replace on existing files. |
@@ -134,15 +136,19 @@ Whenever the agent proposes a system or terminal command, execution pauses for r
 Install the drivers only when their tools are needed:
 
 ```bash
-pip install teradatasql pyodbc
+pip install teradataml impyla
 ```
 
 Configure credentials outside model-visible tool arguments. Teradata supports
 `TERADATA_HOST`, `TERADATA_USER`, `TERADATA_PASSWORD`, and the optional
-`TERADATA_DATABASE` and `TERADATA_LOGMECH`. Impala uses the opaque ODBC string in
-`IMPALA_CONNECTION_STRING`, plus optional `IMPALA_DATABASE` (default `default`)
-and positive-integer `IMPALA_ODBC_TIMEOUT` (default `30` seconds). ODBC keywords
-are driver-specific, so the harness does not parse the connection string.
+`TERADATA_DATABASE` and `TERADATA_LOGMECH`. The `impyla` distribution exposes the
+`impala.dbapi` module used by this harness. Impala requires `IMPALA_HOST`; optional
+settings are `IMPALA_PORT` (default `21050`), `IMPALA_DATABASE` (default
+`default`), `IMPALA_TIMEOUT` (default `30`), `IMPALA_AUTH_MECHANISM` (default
+`NOSASL`), `IMPALA_USER`, `IMPALA_PASSWORD`, `IMPALA_USE_SSL`, `IMPALA_CA_CERT`,
+`IMPALA_KERBEROS_SERVICE_NAME` (default `impala`), `IMPALA_USE_HTTP_TRANSPORT`,
+`IMPALA_HTTP_PATH` (default empty), and `IMPALA_VERIFY_CERT`. Boolean environment
+values accept `true/false`, `1/0`, `yes/no`, or `on/off`.
 
 Alternatively, set `AGENT_DB_CONFIG` to the exact path of a UTF-8 JSON file:
 
@@ -156,9 +162,19 @@ Alternatively, set `AGENT_DB_CONFIG` to the exact path of a UTF-8 JSON file:
     "logmech": "OPTIONAL_LOGON_MECHANISM"
   },
   "impala": {
-    "connection_string": "DSN=YOUR_IMPALA_DSN;UID=YOUR_USERNAME;PWD=YOUR_PASSWORD",
+    "host": "IMPALA_HOSTNAME",
+    "port": 21050,
     "database": "default",
-    "timeout": 30
+    "timeout": 30,
+    "auth_mechanism": "NOSASL",
+    "user": "OPTIONAL_USERNAME",
+    "password": "OPTIONAL_PASSWORD",
+    "use_ssl": false,
+    "ca_cert": "OPTIONAL_CA_CERT_PATH",
+    "kerberos_service_name": "impala",
+    "use_http_transport": false,
+    "http_path": "",
+    "verify_cert": false
   }
 }
 ```
@@ -187,9 +203,19 @@ $env:AGENT_DB_CONFIG = 'C:\Users\you\.config\hermes\database.json'
 python agent.py --model Qwen-32b
 ```
 
-Database tools accept only `sql` and optional `max_rows` (1 through 1000). To
+Query tools accept only `sql` and optional `max_rows` (1 through 1000). To
 request more than the default 100 rows, for example, call `query_impala` with
 `{"sql":"SELECT * FROM events","max_rows":500}`. Every result is also capped
 at 16,000 characters, so large cells or wide results can return fewer requested
-rows with `truncated` set to `true`. Never place credentials in prompts or SQL
-tool calls.
+rows with `truncated` set to `true`.
+
+CSV exports are the unbounded streaming alternative to those previews. For
+example, call `export_impala_csv` with
+`{"sql":"SELECT * FROM events","file_path":"exports/events.csv","batch_size":2000}`.
+The destination must end in `.csv`, remain inside the canonical workspace, and
+must not be a sensitive path. `batch_size` defaults to 1000 and accepts 1 through
+10000; `overwrite` defaults to `false`. Export tools execute the query once and
+write each fetched batch directly to a same-directory temporary file, publishing
+the destination only after success. Their compact result is a manifest, not query
+rows. Unlike query previews, exports are write tools and are blocked in read-only
+agent mode. Never place credentials in prompts or SQL tool calls.

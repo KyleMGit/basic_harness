@@ -1,11 +1,14 @@
 """Read-only database query helpers used by the native agent tools."""
 
 import base64
+import csv
+import hashlib
 import importlib
 import json
 import math
 import os
 import re
+import tempfile
 from datetime import date, datetime
 from decimal import Decimal
 from typing import Any, Callable, Dict
@@ -161,11 +164,51 @@ def _required_settings(values: Dict[str, Any]) -> None:
         raise RuntimeError("Missing required environment configuration: " + ", ".join(missing))
 
 
+def _positive_integer(value: Any, name: str, maximum: int | None = None) -> int:
+    try:
+        if isinstance(value, bool):
+            raise ValueError
+        parsed = int(value)
+        if parsed <= 0 or (maximum is not None and parsed > maximum):
+            raise ValueError
+    except (TypeError, ValueError):
+        requirement = "an integer from 1 through 65535" if maximum else "a positive integer"
+        raise RuntimeError(f"{name} must be {requirement}.") from None
+    return parsed
+
+
+def _boolean_setting(section: Dict[str, Any], env_name: str, key: str,
+                     default: bool = False) -> bool:
+    value = _setting(section, env_name, key, default)
+    if env_name in os.environ and isinstance(value, str):
+        normalized = value.lower()
+        if normalized in {"true", "1", "yes", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "off"}:
+            return False
+    elif isinstance(value, bool):
+        return value
+    raise RuntimeError(
+        f"{env_name} must be a boolean (true/false/1/0/yes/no/on/off).")
+
+
 def _max_rows(value: int) -> int:
     try:
         return max(1, min(1000, int(value)))
     except (TypeError, ValueError):
         raise ValueError("max_rows must be an integer.")
+
+
+def _batch_size(value: int) -> int:
+    if isinstance(value, bool):
+        raise ValueError("batch_size must be an integer from 1 through 10000.")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        raise ValueError("batch_size must be an integer from 1 through 10000.") from None
+    if parsed < 1 or parsed > 10000:
+        raise ValueError("batch_size must be an integer from 1 through 10000.")
+    return parsed
 
 
 def _json_value(value: Any) -> Any:
@@ -180,6 +223,72 @@ def _json_value(value: Any) -> Any:
     if isinstance(value, bytes):
         return base64.b64encode(value).decode("ascii")
     return str(value)
+
+
+def _csv_value(value: Any) -> Any:
+    value = _json_value(value)
+    return "" if value is None else value
+
+
+def _manifest_columns(description: Any) -> list[str]:
+    columns = []
+    json_chars = 2
+    for column in description or ():
+        if len(columns) >= 256:
+            break
+        name, _ = _bounded_text(column[0], _MAX_COLUMN_CHARS)
+        fragment = json.dumps(name, separators=(",", ":"), allow_nan=False)
+        if json_chars + (1 if columns else 0) + len(fragment) > 4096:
+            break
+        columns.append(name)
+        json_chars += (1 if len(columns) > 1 else 0) + len(fragment)
+    return columns
+
+
+def _stream_csv(cursor: Any, file_path: str, batch_size: int, database: str,
+                backend: str, sql: str, workspace_root: str, overwrite: bool) -> str:
+    temporary_path = None
+    row_count = 0
+    try:
+        with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", newline="", dir=os.path.dirname(file_path),
+                prefix=".csv-export-", suffix=".tmp", delete=False) as handle:
+            temporary_path = handle.name
+            writer = csv.writer(handle)
+            writer.writerow([str(column[0]) for column in (cursor.description or ())])
+            while True:
+                batch = cursor.fetchmany(batch_size)
+                if not batch:
+                    break
+                for row in batch:
+                    writer.writerow([_csv_value(value) for value in row])
+                    row_count += 1
+        if overwrite:
+            os.replace(temporary_path, file_path)
+        else:
+            os.link(temporary_path, file_path)
+            os.unlink(temporary_path)
+        temporary_path = None
+        database_name, _ = _bounded_text(database, _MAX_COLUMN_CHARS)
+        relative_path = os.path.relpath(file_path, workspace_root).replace(os.sep, "/")
+        manifest = {
+            "backend": backend,
+            "batch_size": batch_size,
+            "byte_size": os.path.getsize(file_path),
+            "columns": _manifest_columns(cursor.description),
+            "completed": True,
+            "database": database_name,
+            "file_path": relative_path,
+            "row_count": row_count,
+            "sql_sha256": hashlib.sha256(sql.encode("utf-8")).hexdigest(),
+        }
+        return json.dumps(manifest, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    finally:
+        if temporary_path is not None:
+            try:
+                os.unlink(temporary_path)
+            except OSError:
+                pass
 
 
 def _bounded_text(value: Any, limit: int) -> tuple[str, bool]:
@@ -291,11 +400,11 @@ def query_teradata(sql: str, max_rows: int = 100) -> str:
         ("TERADATA_HOST", "host"), ("TERADATA_USER", "user"), ("TERADATA_PASSWORD", "password"))}
     _required_settings(values)
     try:
-        driver = importlib.import_module("teradatasql")
+        teradataml = importlib.import_module("teradataml")
     except ImportError:
-        raise RuntimeError("Teradata driver is unavailable; install it with: pip install teradatasql") from None
+        raise RuntimeError("Teradata driver is unavailable; install it with: pip install teradataml") from None
     options: Dict[str, Any] = {
-        "host": values["TERADATA_HOST"], "user": values["TERADATA_USER"],
+        "host": values["TERADATA_HOST"], "username": values["TERADATA_USER"],
         "password": values["TERADATA_PASSWORD"],
     }
     database = _setting(section, "TERADATA_DATABASE", "database", "")
@@ -304,25 +413,254 @@ def query_teradata(sql: str, max_rows: int = 100) -> str:
         options["database"] = database
     if logmech:
         options["logmech"] = logmech
-    return _execute(lambda: driver.connect(**options), sql, limit, database, "Teradata")
+    try:
+        existing_context = teradataml.get_context()
+    except Exception:
+        raise RuntimeError(
+            "Unable to verify Teradata context state; close any active context and retry.") from None
+    if existing_context is not None:
+        raise RuntimeError(
+            "An active Teradata context already exists; close it before running this query.")
+    context_created = False
+    cursor = None
+    try:
+        try:
+            teradataml.create_context(**options)
+        except Exception:
+            try:
+                context_created = teradataml.get_context() is not None
+            except Exception:
+                pass
+            raise
+        context_created = True
+        cursor = teradataml.execute_sql(statement=sql)
+        fetched = list(cursor.fetchmany(limit + 1))
+        return _serialize_result(database, cursor.description, fetched[:limit], len(fetched) > limit)
+    except Exception:
+        raise RuntimeError("Teradata query failed during connection, execution, or fetch.") from None
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if context_created:
+            try:
+                teradataml.remove_context()
+            except Exception:
+                # teradataml 20.00.00.11 exposes an engine before connect succeeds,
+                # while remove_context closes the still-None connection before resetting globals.
+                try:
+                    context_module = importlib.import_module("teradataml.context.context")
+                    connection = getattr(context_module, "td_connection", None)
+                    if connection is not None:
+                        try:
+                            connection.close()
+                        except Exception:
+                            pass
+                    engine_wrapper = getattr(context_module, "td_sqlalchemy_engine", None)
+                    if engine_wrapper is not None:
+                        try:
+                            getattr(engine_wrapper, "engine", engine_wrapper).dispose()
+                        except Exception:
+                            pass
+                    try:
+                        context_module.td_connection = None
+                    except Exception:
+                        pass
+                    try:
+                        context_module.td_sqlalchemy_engine = None
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            try:
+                _ = teradataml.get_context() is None
+            except Exception:
+                pass
 
 
 def query_impala(sql: str, max_rows: int = 100) -> str:
     validate_read_only_sql(sql, "impala")
     limit = _max_rows(max_rows)
     section = _load_config().get("impala", {})
-    connection_string = _setting(section, "IMPALA_CONNECTION_STRING", "connection_string")
-    _required_settings({"IMPALA_CONNECTION_STRING": connection_string})
-    try:
-        pyodbc = importlib.import_module("pyodbc")
-    except ImportError:
-        raise RuntimeError("Impala driver is unavailable; install it with: pip install pyodbc") from None
-    try:
-        timeout = int(_setting(section, "IMPALA_ODBC_TIMEOUT", "timeout", 30))
-        if timeout <= 0:
-            raise ValueError
-    except (TypeError, ValueError):
-        raise RuntimeError("IMPALA_ODBC_TIMEOUT must be a positive integer.") from None
+    host = _setting(section, "IMPALA_HOST", "host")
+    _required_settings({"IMPALA_HOST": host})
+    port = _positive_integer(_setting(section, "IMPALA_PORT", "port", 21050),
+                             "IMPALA_PORT", 65535)
+    timeout = _positive_integer(_setting(section, "IMPALA_TIMEOUT", "timeout", 30),
+                                "IMPALA_TIMEOUT")
     database = _setting(section, "IMPALA_DATABASE", "database", "default")
-    return _execute(lambda: pyodbc.connect(connection_string, autocommit=True, timeout=timeout),
+    options: Dict[str, Any] = {
+        "host": host,
+        "port": port,
+        "database": database,
+        "timeout": timeout,
+        "auth_mechanism": _setting(
+            section, "IMPALA_AUTH_MECHANISM", "auth_mechanism", "NOSASL"),
+        "use_ssl": _boolean_setting(section, "IMPALA_USE_SSL", "use_ssl"),
+        "kerberos_service_name": _setting(
+            section, "IMPALA_KERBEROS_SERVICE_NAME", "kerberos_service_name", "impala"),
+        "use_http_transport": _boolean_setting(
+            section, "IMPALA_USE_HTTP_TRANSPORT", "use_http_transport"),
+        "http_path": _setting(section, "IMPALA_HTTP_PATH", "http_path", ""),
+        "verify_cert": _boolean_setting(section, "IMPALA_VERIFY_CERT", "verify_cert"),
+    }
+    for option, env_name, key in (
+            ("user", "IMPALA_USER", "user"),
+            ("password", "IMPALA_PASSWORD", "password"),
+            ("ca_cert", "IMPALA_CA_CERT", "ca_cert")):
+        value = _setting(section, env_name, key)
+        if value:
+            options[option] = value
+    try:
+        dbapi = importlib.import_module("impala.dbapi")
+    except ImportError:
+        raise RuntimeError("Impala driver is unavailable; install it with: pip install impyla") from None
+    return _execute(lambda: dbapi.connect(**options),
                     sql, limit, database, "Impala")
+
+
+def _check_export_request(sql: str, file_path: str, batch_size: int,
+                          dialect: str, overwrite: bool) -> int:
+    validate_read_only_sql(sql, dialect)
+    batch = _batch_size(batch_size)
+    if not isinstance(file_path, str) or not file_path.lower().endswith(".csv"):
+        raise ValueError("CSV export destination must end in .csv.")
+    if os.path.exists(file_path) and not overwrite:
+        raise FileExistsError("CSV export destination already exists; set overwrite=true to replace it.")
+    return batch
+
+
+def export_impala_csv(sql: str, file_path: str, batch_size: int = 1000,
+                      workspace_root: str | None = None, overwrite: bool = False) -> str:
+    batch = _check_export_request(sql, file_path, batch_size, "impala", overwrite)
+    section = _load_config().get("impala", {})
+    host = _setting(section, "IMPALA_HOST", "host")
+    _required_settings({"IMPALA_HOST": host})
+    port = _positive_integer(_setting(section, "IMPALA_PORT", "port", 21050),
+                             "IMPALA_PORT", 65535)
+    timeout = _positive_integer(_setting(section, "IMPALA_TIMEOUT", "timeout", 30),
+                                "IMPALA_TIMEOUT")
+    database = _setting(section, "IMPALA_DATABASE", "database", "default")
+    options: Dict[str, Any] = {
+        "host": host, "port": port, "database": database, "timeout": timeout,
+        "auth_mechanism": _setting(section, "IMPALA_AUTH_MECHANISM", "auth_mechanism", "NOSASL"),
+        "use_ssl": _boolean_setting(section, "IMPALA_USE_SSL", "use_ssl"),
+        "kerberos_service_name": _setting(
+            section, "IMPALA_KERBEROS_SERVICE_NAME", "kerberos_service_name", "impala"),
+        "use_http_transport": _boolean_setting(
+            section, "IMPALA_USE_HTTP_TRANSPORT", "use_http_transport"),
+        "http_path": _setting(section, "IMPALA_HTTP_PATH", "http_path", ""),
+        "verify_cert": _boolean_setting(section, "IMPALA_VERIFY_CERT", "verify_cert"),
+    }
+    for option, env_name, key in (("user", "IMPALA_USER", "user"),
+                                  ("password", "IMPALA_PASSWORD", "password"),
+                                  ("ca_cert", "IMPALA_CA_CERT", "ca_cert")):
+        value = _setting(section, env_name, key)
+        if value:
+            options[option] = value
+    try:
+        dbapi = importlib.import_module("impala.dbapi")
+    except ImportError:
+        raise RuntimeError("Impala driver is unavailable; install it with: pip install impyla") from None
+    connection = None
+    cursor = None
+    try:
+        connection = dbapi.connect(**options)
+        cursor = connection.cursor()
+        cursor.execute(sql)
+        return _stream_csv(cursor, file_path, batch, database, "Impala", sql,
+                           workspace_root or os.getcwd(), overwrite)
+    except Exception:
+        raise RuntimeError("Impala CSV export failed during connection, execution, fetch, or write.") from None
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                pass
+
+
+def export_teradata_csv(sql: str, file_path: str, batch_size: int = 1000,
+                        workspace_root: str | None = None, overwrite: bool = False) -> str:
+    batch = _check_export_request(sql, file_path, batch_size, "teradata", overwrite)
+    section = _load_config().get("teradata", {})
+    values = {name: _setting(section, name, key) for name, key in (
+        ("TERADATA_HOST", "host"), ("TERADATA_USER", "user"),
+        ("TERADATA_PASSWORD", "password"))}
+    _required_settings(values)
+    database = _setting(section, "TERADATA_DATABASE", "database", "")
+    options: Dict[str, Any] = {
+        "host": values["TERADATA_HOST"], "username": values["TERADATA_USER"],
+        "password": values["TERADATA_PASSWORD"],
+    }
+    logmech = _setting(section, "TERADATA_LOGMECH", "logmech")
+    if database:
+        options["database"] = database
+    if logmech:
+        options["logmech"] = logmech
+    try:
+        teradataml = importlib.import_module("teradataml")
+    except ImportError:
+        raise RuntimeError("Teradata driver is unavailable; install it with: pip install teradataml") from None
+    try:
+        existing_context = teradataml.get_context()
+    except Exception:
+        raise RuntimeError("Unable to verify Teradata context state; close any active context and retry.") from None
+    if existing_context is not None:
+        raise RuntimeError("An active Teradata context already exists; close it before running this export.")
+    context_created = False
+    cursor = None
+    try:
+        try:
+            teradataml.create_context(**options)
+        except Exception:
+            try:
+                context_created = teradataml.get_context() is not None
+            except Exception:
+                pass
+            raise
+        context_created = True
+        cursor = teradataml.execute_sql(statement=sql)
+        return _stream_csv(cursor, file_path, batch, database, "Teradata", sql,
+                           workspace_root or os.getcwd(), overwrite)
+    except Exception:
+        raise RuntimeError("Teradata CSV export failed during connection, execution, fetch, or write.") from None
+    finally:
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if context_created:
+            try:
+                teradataml.remove_context()
+            except Exception:
+                try:
+                    context_module = importlib.import_module("teradataml.context.context")
+                    connection = getattr(context_module, "td_connection", None)
+                    if connection is not None:
+                        try:
+                            connection.close()
+                        except Exception:
+                            pass
+                    engine_wrapper = getattr(context_module, "td_sqlalchemy_engine", None)
+                    if engine_wrapper is not None:
+                        try:
+                            getattr(engine_wrapper, "engine", engine_wrapper).dispose()
+                        except Exception:
+                            pass
+                    context_module.td_connection = None
+                    context_module.td_sqlalchemy_engine = None
+                except Exception:
+                    pass
+            try:
+                _ = teradataml.get_context() is None
+            except Exception:
+                pass

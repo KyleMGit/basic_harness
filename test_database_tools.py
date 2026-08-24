@@ -1,13 +1,18 @@
 import json
+import csv
+import io
 import math
 import os
+import sys
 import tempfile
+import types
 import unittest
 from datetime import date, datetime
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
 import db_tools
+import tools
 from tools import registry
 
 
@@ -19,6 +24,8 @@ class FakeCursor:
         self.fetch_error = fetch_error
         self.closed = False
         self.executed = None
+        self.offset = 0
+        self.fetch_sizes = []
 
     def execute(self, sql):
         self.executed = sql
@@ -26,9 +33,12 @@ class FakeCursor:
             raise self.execute_error
 
     def fetchmany(self, size):
+        self.fetch_sizes.append(size)
         if self.fetch_error:
             raise self.fetch_error
-        return self.rows[:size]
+        result = self.rows[self.offset:self.offset + size]
+        self.offset += len(result)
+        return result
 
     def close(self):
         self.closed = True
@@ -47,6 +57,172 @@ class FakeConnection:
 
 
 class DatabaseToolTests(unittest.TestCase):
+    def test_export_registry_schema_write_classification_and_dispatch(self):
+        schemas = {item["function"]["name"]: item["function"] for item in registry.schemas}
+        for name in ("export_teradata_csv", "export_impala_csv"):
+            schema = schemas[name]["parameters"]
+            self.assertEqual(schema["required"], ["sql", "file_path"])
+            self.assertFalse(schema["additionalProperties"])
+            self.assertEqual(set(schema["properties"]),
+                             {"sql", "file_path", "batch_size", "overwrite"})
+            self.assertEqual(schema["properties"]["batch_size"], {
+                "type": "integer", "description": "Rows fetched and written per batch (1..10000).",
+                "minimum": 1, "maximum": 10000, "default": 1000})
+            self.assertEqual(schema["properties"]["overwrite"]["default"], False)
+            self.assertTrue(registry.is_write_tool(name))
+        self.assertFalse(registry.is_write_tool("query_teradata"))
+        self.assertFalse(registry.is_write_tool("query_impala"))
+        blocked = registry.execute("export_impala_csv", {
+            "sql": "SELECT 1", "file_path": "x.csv"}, read_only=True)
+        self.assertIn("not executed", blocked)
+
+        with tempfile.TemporaryDirectory(dir=os.getcwd()) as root, patch.object(
+                tools.terminal_session, "workspace_root", root), patch.object(
+                tools.terminal_session, "_cwd", root), patch(
+                "tools.db_tools.export_impala_csv", return_value='{"completed":true}') as export:
+            result = registry.execute("export_impala_csv", {
+                "sql": "SELECT 1", "file_path": "nested/out.csv",
+                "batch_size": 7, "overwrite": False})
+        self.assertEqual(result, '{"completed":true}')
+        export.assert_called_once_with(
+            "SELECT 1", os.path.join(root, "nested", "out.csv"), 7, root, False)
+
+    def test_export_destination_guards_run_before_backend_and_create_parents(self):
+        with tempfile.TemporaryDirectory(dir=os.getcwd()) as root, patch.object(
+                tools.terminal_session, "workspace_root", root), patch.object(
+                tools.terminal_session, "_cwd", root), patch(
+                "tools.db_tools.export_impala_csv") as export:
+            for path in ("bad.txt", "../escape.csv", ".ssh/secret.csv"):
+                with self.subTest(path=path):
+                    result = registry.execute("export_impala_csv", {"sql": "SELECT 1", "file_path": path})
+                    self.assertTrue(result.startswith("Error"))
+            existing = os.path.join(root, "existing.csv")
+            with open(existing, "w", encoding="utf-8") as handle:
+                handle.write("keep")
+            result = registry.execute("export_impala_csv", {
+                "sql": "SELECT 1", "file_path": "existing.csv"})
+            self.assertIn("already exists", result)
+            export.assert_not_called()
+            registry.execute("export_impala_csv", {
+                "sql": "SELECT 1", "file_path": "new/ok.csv", "overwrite": True})
+            self.assertTrue(os.path.isdir(os.path.join(root, "new")))
+
+    def test_impala_export_streams_multiple_batches_and_csv_types_atomically(self):
+        rows = [
+            ('comma,value', 'line1\nline2', None, Decimal("1.20"),
+             date(2026, 1, 2), datetime(2026, 1, 2, 3, 4, 5), b"hi", math.nan),
+            ('quote"value', "plain", "", Decimal("2"), None, None, b"", math.inf),
+            ("third", "row", None, Decimal("3"), None, None, b"x", -math.inf),
+        ]
+        cursor = FakeCursor(rows=rows, description=[(name,) for name in
+            ("text", "lines", "null", "amount", "day", "stamp", "bytes", "float")])
+        connection = FakeConnection(cursor)
+        driver = MagicMock()
+        driver.connect.return_value = connection
+        with tempfile.TemporaryDirectory(dir=os.getcwd()) as root:
+            output = os.path.join(root, "nested", "data.csv")
+            os.makedirs(os.path.dirname(output))
+            with patch.dict(os.environ, {"IMPALA_HOST": "impala.example",
+                                         "IMPALA_DATABASE": "analytics"}, clear=True), patch.object(
+                    db_tools.importlib, "import_module", return_value=driver):
+                manifest = json.loads(db_tools.export_impala_csv(
+                    "SELECT * FROM t", output, 2, root))
+            with open(output, newline="", encoding="utf-8") as handle:
+                parsed = list(csv.reader(handle))
+            self.assertEqual(parsed[0], [item[0] for item in cursor.description])
+            self.assertEqual(parsed[1], ["comma,value", "line1\nline2", "", "1.20",
+                                         "2026-01-02", "2026-01-02T03:04:05", "aGk=", "NaN"])
+            self.assertEqual(parsed[2][-1], "+Infinity")
+            self.assertEqual(parsed[3][-1], "-Infinity")
+            self.assertEqual(cursor.fetch_sizes, [2, 2, 2])
+            self.assertEqual(cursor.executed, "SELECT * FROM t")
+            self.assertTrue(cursor.closed)
+            self.assertTrue(connection.closed)
+            self.assertEqual(manifest["row_count"], 3)
+            self.assertEqual(manifest["file_path"], "nested/data.csv")
+            self.assertEqual(manifest["byte_size"], os.path.getsize(output))
+            self.assertEqual(manifest["batch_size"], 2)
+            self.assertTrue(manifest["completed"])
+            self.assertEqual(len(manifest["sql_sha256"]), 64)
+            self.assertNotIn("rows", manifest)
+            self.assertNotIn("SELECT", json.dumps(manifest))
+
+    def test_export_empty_result_writes_header_and_bounded_manifest(self):
+        long_name = "c" * 1000
+        cursor = FakeCursor(description=[(long_name,)] * 400)
+        driver = MagicMock()
+        driver.connect.return_value = FakeConnection(cursor)
+        with tempfile.TemporaryDirectory(dir=os.getcwd()) as root:
+            output = os.path.join(root, "empty.csv")
+            with patch.dict(os.environ, {"IMPALA_HOST": "host"}, clear=True), patch.object(
+                    db_tools.importlib, "import_module", return_value=driver):
+                raw = db_tools.export_impala_csv("SELECT 1", output, 1000, root)
+            manifest = json.loads(raw)
+            self.assertEqual(manifest["row_count"], 0)
+            self.assertLessEqual(len(manifest["columns"]), 256)
+            self.assertLessEqual(len(raw), 16000)
+            self.assertEqual(cursor.fetch_sizes, [1000])
+            with open(output, newline="", encoding="utf-8") as handle:
+                self.assertEqual(len(next(csv.reader(handle))), 400)
+
+    def test_export_rejects_sql_and_batch_before_driver_import(self):
+        with tempfile.TemporaryDirectory(dir=os.getcwd()) as root, patch.object(
+                db_tools.importlib, "import_module") as importer:
+            for sql, batch in (("DELETE FROM t", 10), ("SELECT 1", 0), ("SELECT 1", 10001)):
+                with self.subTest(sql=sql, batch=batch), self.assertRaises((ValueError, RuntimeError)):
+                    db_tools.export_impala_csv(sql, os.path.join(root, "x.csv"), batch, root)
+            importer.assert_not_called()
+
+    def test_export_failure_removes_temp_and_preserves_destination(self):
+        cursor = FakeCursor(rows=[("one",), ("two",)], description=[("value",)])
+        cursor.fetchmany = MagicMock(side_effect=[[('one',)], RuntimeError("row secret")])
+        connection = FakeConnection(cursor)
+        driver = MagicMock()
+        driver.connect.return_value = connection
+        with tempfile.TemporaryDirectory(dir=os.getcwd()) as root:
+            output = os.path.join(root, "keep.csv")
+            with open(output, "w", encoding="utf-8") as handle:
+                handle.write("original")
+            with patch.dict(os.environ, {"IMPALA_HOST": "secret-host"}, clear=True), patch.object(
+                    db_tools.importlib, "import_module", return_value=driver):
+                with self.assertRaisesRegex(RuntimeError, "Impala CSV export failed") as caught:
+                    db_tools.export_impala_csv("SELECT secret_column FROM t", output, 1, root, True)
+            self.assertNotIn("secret", str(caught.exception).lower())
+            with open(output, encoding="utf-8") as handle:
+                self.assertEqual(handle.read(), "original")
+            self.assertEqual(os.listdir(root), ["keep.csv"])
+            self.assertTrue(cursor.closed)
+            self.assertTrue(connection.closed)
+
+    def test_teradata_export_context_lifecycle_and_partial_cleanup(self):
+        cursor = FakeCursor(rows=[(1,), (2,)], description=[("n",)])
+        teradataml = MagicMock()
+        teradataml.get_context.return_value = None
+        teradataml.execute_sql.return_value = cursor
+        env = {"TERADATA_HOST": "host", "TERADATA_USER": "user",
+               "TERADATA_PASSWORD": "password", "TERADATA_DATABASE": "warehouse"}
+        with tempfile.TemporaryDirectory(dir=os.getcwd()) as root, patch.dict(
+                os.environ, env, clear=True), patch.object(
+                db_tools.importlib, "import_module", return_value=teradataml):
+            result = json.loads(db_tools.export_teradata_csv(
+                "SELECT n FROM t", os.path.join(root, "td.csv"), 1, root))
+        self.assertEqual(cursor.fetch_sizes, [1, 1, 1])
+        teradataml.create_context.assert_called_once()
+        teradataml.execute_sql.assert_called_once_with(statement="SELECT n FROM t")
+        teradataml.remove_context.assert_called_once_with()
+        self.assertEqual(result["backend"], "Teradata")
+
+        partial = MagicMock()
+        partial.get_context.side_effect = [None, object()]
+        partial.create_context.side_effect = RuntimeError("credential secret")
+        with tempfile.TemporaryDirectory(dir=os.getcwd()) as root, patch.dict(
+                os.environ, env, clear=True), patch.object(
+                db_tools.importlib, "import_module", return_value=partial):
+            with self.assertRaisesRegex(RuntimeError, "Teradata CSV export failed"):
+                db_tools.export_teradata_csv("SELECT 1", os.path.join(root, "x.csv"), 1, root)
+            self.assertEqual(os.listdir(root), [])
+        partial.remove_context.assert_called_once_with()
+
     def test_registry_schemas_and_read_only_dispatch(self):
         schemas = {item["function"]["name"]: item["function"] for item in registry.schemas}
         for name in ("query_teradata", "query_impala"):
@@ -71,49 +247,197 @@ class DatabaseToolTests(unittest.TestCase):
                   (Decimal("2"), None, None, b"extra")],
             description=[("amount",), ("day",), ("timestamp",), ("payload",)],
         )
-        connection = FakeConnection(cursor)
-        driver = MagicMock()
-        driver.connect.return_value = connection
+        teradataml = MagicMock()
+        teradataml.get_context.return_value = None
+        teradataml.execute_sql.return_value = cursor
         env = {
             "TERADATA_HOST": "td.example", "TERADATA_USER": "analyst",
             "TERADATA_PASSWORD": "hidden", "TERADATA_DATABASE": "warehouse",
             "TERADATA_LOGMECH": "LDAP",
         }
         with patch.dict(os.environ, env, clear=True), patch.object(
-                db_tools.importlib, "import_module", return_value=driver):
+                db_tools.importlib, "import_module", return_value=teradataml) as importer:
             result = json.loads(db_tools.query_teradata("/* lead */ SELECT ';' AS x;", max_rows=1))
 
-        driver.connect.assert_called_once_with(host="td.example", user="analyst", password="hidden",
-                                               database="warehouse", logmech="LDAP")
+        importer.assert_called_once_with("teradataml")
+        teradataml.create_context.assert_called_once_with(
+            host="td.example", username="analyst", password="hidden",
+            database="warehouse", logmech="LDAP")
+        teradataml.execute_sql.assert_called_once_with(statement="/* lead */ SELECT ';' AS x;")
         self.assertEqual(result, {
             "database": "warehouse", "columns": ["amount", "day", "timestamp", "payload"],
             "rows": [["1.25", "2026-01-02", "2026-01-02T03:04:05", "aGk="]],
             "row_count": 1, "truncated": True,
         })
         self.assertTrue(cursor.closed)
-        self.assertTrue(connection.closed)
+        teradataml.remove_context.assert_called_once_with()
 
-    def test_impala_lazily_imports_pyodbc_and_maps_opaque_connection(self):
+    def test_teradata_omits_absent_optional_context_kwargs(self):
+        teradataml = MagicMock()
+        teradataml.get_context.return_value = None
+        teradataml.execute_sql.return_value = FakeCursor(description=[])
+        env = {"TERADATA_HOST": "host", "TERADATA_USER": "user", "TERADATA_PASSWORD": "password"}
+        with patch.dict(os.environ, env, clear=True), patch.object(
+                db_tools.importlib, "import_module", return_value=teradataml):
+            db_tools.query_teradata("SELECT 1")
+
+        teradataml.create_context.assert_called_once_with(
+            host="host", username="user", password="password")
+
+    def test_teradata_cleanup_on_execute_and_fetch_failures(self):
+        for failure_kind in ("execute", "fetch"):
+            teradataml = MagicMock()
+            teradataml.get_context.return_value = None
+            cursor = FakeCursor(fetch_error=RuntimeError("fetch secret"))
+            if failure_kind == "execute":
+                teradataml.execute_sql.side_effect = RuntimeError("execute secret")
+            else:
+                teradataml.execute_sql.return_value = cursor
+            env = {"TERADATA_HOST": "host-secret", "TERADATA_USER": "user-secret",
+                   "TERADATA_PASSWORD": "password-secret"}
+            with self.subTest(failure_kind=failure_kind), patch.dict(
+                    os.environ, env, clear=True), patch.object(
+                    db_tools.importlib, "import_module", return_value=teradataml):
+                with self.assertRaisesRegex(RuntimeError, "Teradata query failed") as caught:
+                    db_tools.query_teradata("SELECT 1")
+            self.assertNotIn("secret", str(caught.exception))
+            if failure_kind == "fetch":
+                self.assertTrue(cursor.closed)
+            teradataml.remove_context.assert_called_once_with()
+
+    def test_teradata_does_not_remove_context_when_creation_fails(self):
+        teradataml = MagicMock()
+        teradataml.get_context.return_value = None
+        teradataml.create_context.side_effect = RuntimeError("host-secret")
+        env = {"TERADATA_HOST": "host-secret", "TERADATA_USER": "user-secret",
+               "TERADATA_PASSWORD": "password-secret"}
+        with patch.dict(os.environ, env, clear=True), patch.object(
+                db_tools.importlib, "import_module", return_value=teradataml):
+            with self.assertRaisesRegex(RuntimeError, "Teradata query failed") as caught:
+                db_tools.query_teradata("SELECT 1")
+        self.assertNotIn("secret", str(caught.exception))
+        teradataml.remove_context.assert_not_called()
+
+    def test_teradata_removes_partially_created_context_when_creation_fails(self):
+        teradataml = MagicMock()
+        contexts = iter((None, object()))
+        teradataml.get_context.side_effect = lambda: next(contexts)
+        teradataml.create_context.side_effect = RuntimeError("host-secret")
+        env = {"TERADATA_HOST": "host-secret", "TERADATA_USER": "user-secret",
+               "TERADATA_PASSWORD": "password-secret"}
+        with patch.dict(os.environ, env, clear=True), patch.object(
+                db_tools.importlib, "import_module", return_value=teradataml):
+            with self.assertRaisesRegex(RuntimeError, "Teradata query failed") as caught:
+                db_tools.query_teradata("SELECT 1")
+        self.assertNotIn("secret", str(caught.exception))
+        teradataml.remove_context.assert_called_once_with()
+
+    def test_teradata_recovers_from_partial_context_when_public_cleanup_raises(self):
+        teradataml = types.ModuleType("teradataml")
+        context_package = types.ModuleType("teradataml.context")
+        context_module = types.ModuleType("teradataml.context.context")
+        disposed = []
+        create_attempts = []
+
+        class UnderlyingEngine:
+            def dispose(self):
+                disposed.append(True)
+
+        class EngineWrapper:
+            def __init__(self):
+                self.engine = UnderlyingEngine()
+
+        context_module.td_connection = None
+        context_module.td_sqlalchemy_engine = None
+
+        def get_context():
+            return context_module.td_sqlalchemy_engine
+
+        def create_context(**_options):
+            create_attempts.append(True)
+            context_module.td_sqlalchemy_engine = EngineWrapper()
+            raise RuntimeError("host-secret")
+
+        def remove_context():
+            context_module.td_connection.close()
+
+        teradataml.get_context = get_context
+        teradataml.create_context = create_context
+        teradataml.remove_context = remove_context
+        context_package.context = context_module
+        teradataml.context = context_package
+        fake_modules = {
+            "teradataml": teradataml,
+            "teradataml.context": context_package,
+            "teradataml.context.context": context_module,
+        }
+        env = {"TERADATA_HOST": "host-secret", "TERADATA_USER": "user-secret",
+               "TERADATA_PASSWORD": "password-secret"}
+
+        with patch.dict(os.environ, env, clear=True), patch.dict(sys.modules, fake_modules):
+            for _ in range(2):
+                with self.assertRaisesRegex(RuntimeError, "Teradata query failed") as caught:
+                    db_tools.query_teradata("SELECT 1")
+                self.assertNotIn("secret", str(caught.exception))
+                self.assertIsNone(context_module.td_connection)
+                self.assertIsNone(context_module.td_sqlalchemy_engine)
+
+        self.assertEqual(create_attempts, [True, True])
+        self.assertEqual(disposed, [True, True])
+
+    def test_teradata_rejects_preexisting_context_without_modifying_it(self):
+        teradataml = MagicMock()
+        teradataml.get_context.return_value = object()
+        env = {"TERADATA_HOST": "host", "TERADATA_USER": "user", "TERADATA_PASSWORD": "password"}
+        with patch.dict(os.environ, env, clear=True), patch.object(
+                db_tools.importlib, "import_module", return_value=teradataml):
+            with self.assertRaisesRegex(RuntimeError, "active Teradata context"):
+                db_tools.query_teradata("SELECT 1")
+        teradataml.create_context.assert_not_called()
+        teradataml.remove_context.assert_not_called()
+
+    def test_impala_lazily_imports_dbapi_and_maps_full_connection(self):
         cursor = FakeCursor(rows=[(index,) for index in range(150)], description=[("one",)])
         connection = FakeConnection(cursor)
-        pyodbc = MagicMock()
-        pyodbc.connect.return_value = connection
+        dbapi = MagicMock()
+        dbapi.connect.return_value = connection
         env = {
-            "IMPALA_CONNECTION_STRING": "DSN=opaque-secret", "IMPALA_DATABASE": "analytics",
-            "IMPALA_ODBC_TIMEOUT": "45",
+            "IMPALA_HOST": "impala.example", "IMPALA_PORT": "21051",
+            "IMPALA_DATABASE": "analytics", "IMPALA_TIMEOUT": "45",
+            "IMPALA_AUTH_MECHANISM": "PLAIN", "IMPALA_USER": "analyst",
+            "IMPALA_PASSWORD": "hidden", "IMPALA_USE_SSL": "yes",
+            "IMPALA_CA_CERT": "/certs/ca.pem", "IMPALA_KERBEROS_SERVICE_NAME": "hive",
+            "IMPALA_USE_HTTP_TRANSPORT": "1", "IMPALA_HTTP_PATH": "cliservice",
+            "IMPALA_VERIFY_CERT": "on",
         }
         with patch.dict(os.environ, env, clear=True), patch.object(
-                db_tools.importlib, "import_module", return_value=pyodbc) as importer:
+                db_tools.importlib, "import_module", return_value=dbapi) as importer:
             result = json.loads(db_tools.query_impala("WITH x AS (SELECT 1) SELECT * FROM x", max_rows=125))
 
-        importer.assert_called_once_with("pyodbc")
-        pyodbc.connect.assert_called_once_with("DSN=opaque-secret", autocommit=True, timeout=45)
+        importer.assert_called_once_with("impala.dbapi")
+        dbapi.connect.assert_called_once_with(
+            host="impala.example", port=21051, database="analytics", timeout=45,
+            auth_mechanism="PLAIN", user="analyst", password="hidden", use_ssl=True,
+            ca_cert="/certs/ca.pem", kerberos_service_name="hive",
+            use_http_transport=True, http_path="cliservice", verify_cert=True)
         self.assertEqual(result["database"], "analytics")
         self.assertEqual(result["row_count"], 125)
         self.assertTrue(result["truncated"])
         self.assertEqual(cursor.executed, "WITH x AS (SELECT 1) SELECT * FROM x")
         self.assertTrue(cursor.closed)
         self.assertTrue(connection.closed)
+
+    def test_impala_connection_defaults_and_optional_fields_are_omitted(self):
+        dbapi = MagicMock()
+        dbapi.connect.return_value = FakeConnection(FakeCursor(description=[]))
+        with patch.dict(os.environ, {"IMPALA_HOST": "impala.example"}, clear=True), patch.object(
+                db_tools.importlib, "import_module", return_value=dbapi):
+            db_tools.query_impala("SELECT 1")
+
+        dbapi.connect.assert_called_once_with(
+            host="impala.example", port=21050, database="default", timeout=30,
+            auth_mechanism="NOSASL", use_ssl=False, kerberos_service_name="impala",
+            use_http_transport=False, http_path="", verify_cert=False)
 
     def test_write_stacked_and_blank_sql_are_rejected_before_import(self):
         invalid = ["", " -- only a comment\n", "DELETE FROM t", "SELECT 1; DROP TABLE t",
@@ -152,7 +476,7 @@ class DatabaseToolTests(unittest.TestCase):
         with patch.dict(os.environ, {}, clear=True):
             with self.assertRaisesRegex(RuntimeError, "TERADATA_HOST.*TERADATA_USER.*TERADATA_PASSWORD"):
                 db_tools.query_teradata("SELECT 1")
-            with self.assertRaisesRegex(RuntimeError, "IMPALA_CONNECTION_STRING"):
+            with self.assertRaisesRegex(RuntimeError, "IMPALA_HOST"):
                 db_tools.query_impala("SELECT 1")
 
         with patch.dict(os.environ, {"TERADATA_HOST": "h", "TERADATA_USER": "u",
@@ -160,44 +484,75 @@ class DatabaseToolTests(unittest.TestCase):
                 db_tools.importlib, "import_module", side_effect=ImportError("no module")):
             with self.assertRaises(RuntimeError) as caught:
                 db_tools.query_teradata("SELECT 1")
-        self.assertIn("pip install teradatasql", str(caught.exception))
+        self.assertIn("pip install teradataml", str(caught.exception))
         self.assertNotIn("super-secret", str(caught.exception))
 
-        with patch.dict(os.environ, {"IMPALA_CONNECTION_STRING": "DSN=super-secret"}, clear=True), patch.object(
+        with patch.dict(os.environ, {"IMPALA_HOST": "super-secret"}, clear=True), patch.object(
                 db_tools.importlib, "import_module", side_effect=ImportError("super-secret")):
             with self.assertRaises(RuntimeError) as caught:
                 db_tools.query_impala("SELECT 1")
-        self.assertIn("pip install pyodbc", str(caught.exception))
+        self.assertIn("pip install impyla", str(caught.exception))
         self.assertNotIn("super-secret", str(caught.exception))
 
     def test_json_config_loading_and_environment_precedence(self):
         config = {
             "teradata": {"host": "json-host", "user": "json-user", "password": "json-pass",
                          "database": "json-db", "logmech": "LDAP"},
-            "impala": {"connection_string": "DSN=json-secret", "database": "json-default", "timeout": 12},
+            "impala": {"host": "json-host", "port": 21052, "database": "json-default",
+                       "timeout": 12, "auth_mechanism": "LDAP", "user": "json-user",
+                       "password": "json-pass", "use_ssl": False, "ca_cert": "json-ca.pem",
+                       "kerberos_service_name": "json-service", "use_http_transport": False,
+                       "http_path": "json-path", "verify_cert": False},
         }
         with tempfile.TemporaryDirectory() as directory:
             path = os.path.join(directory, "database.json")
             with open(path, "w", encoding="utf-8") as handle:
                 json.dump(config, handle)
-            cursor = FakeCursor(description=[])
-            driver = MagicMock()
-            driver.connect.return_value = FakeConnection(cursor)
+            teradataml = MagicMock()
+            teradataml.get_context.return_value = None
+            teradataml.execute_sql.return_value = FakeCursor(description=[])
             env = {"AGENT_DB_CONFIG": path, "TERADATA_HOST": "env-host",
-                   "IMPALA_CONNECTION_STRING": "DSN=env-secret", "IMPALA_ODBC_TIMEOUT": "31"}
+                   "IMPALA_HOST": "env-impala", "IMPALA_PORT": "21053",
+                   "IMPALA_TIMEOUT": "31", "IMPALA_USE_SSL": "true",
+                   "IMPALA_USE_HTTP_TRANSPORT": "yes", "IMPALA_VERIFY_CERT": "1"}
             with patch.dict(os.environ, env, clear=True), patch.object(
-                    db_tools.importlib, "import_module", return_value=driver):
+                    db_tools.importlib, "import_module", return_value=teradataml):
                 td_result = json.loads(db_tools.query_teradata("SELECT 1"))
-                td_call = driver.connect.call_args
-                driver.reset_mock()
-                driver.connect.return_value = FakeConnection(FakeCursor(description=[]))
+                td_call = teradataml.create_context.call_args
+                dbapi = MagicMock()
+                dbapi.connect.return_value = FakeConnection(FakeCursor(description=[]))
+                db_tools.importlib.import_module.return_value = dbapi
                 impala_result = json.loads(db_tools.query_impala("SELECT 1"))
 
-        self.assertEqual(td_call.kwargs, {"host": "env-host", "user": "json-user", "password": "json-pass",
+        self.assertEqual(td_call.kwargs, {"host": "env-host", "username": "json-user", "password": "json-pass",
                                           "database": "json-db", "logmech": "LDAP"})
-        driver.connect.assert_called_once_with("DSN=env-secret", autocommit=True, timeout=31)
+        dbapi.connect.assert_called_once_with(
+            host="env-impala", port=21053, database="json-default", timeout=31,
+            auth_mechanism="LDAP", user="json-user", password="json-pass", use_ssl=True,
+            ca_cert="json-ca.pem", kerberos_service_name="json-service",
+            use_http_transport=True, http_path="json-path", verify_cert=True)
         self.assertEqual(td_result["database"], "json-db")
         self.assertEqual(impala_result["database"], "json-default")
+
+    def test_impala_rejects_invalid_native_settings_before_import_or_connection(self):
+        cases = [
+            ({"IMPALA_PORT": "0"}, "IMPALA_PORT.*1.*65535"),
+            ({"IMPALA_PORT": "65536"}, "IMPALA_PORT.*1.*65535"),
+            ({"IMPALA_PORT": "not-an-int"}, "IMPALA_PORT.*1.*65535"),
+            ({"IMPALA_TIMEOUT": "0"}, "IMPALA_TIMEOUT.*positive integer"),
+            ({"IMPALA_TIMEOUT": "1.5"}, "IMPALA_TIMEOUT.*positive integer"),
+            ({"IMPALA_USE_SSL": "maybe"}, "IMPALA_USE_SSL.*boolean"),
+            ({"IMPALA_USE_HTTP_TRANSPORT": "2"}, "IMPALA_USE_HTTP_TRANSPORT.*boolean"),
+            ({"IMPALA_VERIFY_CERT": ""}, "IMPALA_VERIFY_CERT.*boolean"),
+        ]
+        for extra, expected in cases:
+            env = {"IMPALA_HOST": "impala.example"}
+            env.update(extra)
+            with self.subTest(extra=extra), patch.dict(os.environ, env, clear=True), patch.object(
+                    db_tools.importlib, "import_module") as importer:
+                with self.assertRaisesRegex(RuntimeError, expected):
+                    db_tools.query_impala("SELECT 1")
+                importer.assert_not_called()
 
     def test_json_config_errors_are_actionable_and_secret_safe(self):
         cases = [(b'{"impala":', "valid JSON"), (b'[]', "root.*object"),
@@ -229,7 +584,7 @@ class DatabaseToolTests(unittest.TestCase):
             driver = MagicMock()
             driver.connect.return_value = FakeConnection(cursor)
             with self.subTest(width=len(description)), patch.dict(
-                    os.environ, {"IMPALA_CONNECTION_STRING": "DSN=secret"}, clear=True), patch.object(
+                    os.environ, {"IMPALA_HOST": "impala.example"}, clear=True), patch.object(
                     db_tools.importlib, "import_module", return_value=driver):
                 payload = db_tools.query_impala("SELECT 1")
             self.assertLessEqual(len(payload), 16000)
@@ -285,7 +640,7 @@ class DatabaseToolTests(unittest.TestCase):
             driver = MagicMock()
             driver.connect.return_value = connection
             with self.subTest(failure_kind=failure_kind), patch.dict(
-                    os.environ, {"IMPALA_CONNECTION_STRING": "DSN=host"}, clear=True), patch.object(
+                    os.environ, {"IMPALA_HOST": "impala.example"}, clear=True), patch.object(
                     db_tools.importlib, "import_module", return_value=driver):
                 with self.assertRaisesRegex(RuntimeError, "failed"):
                     db_tools.query_impala("SELECT 1")

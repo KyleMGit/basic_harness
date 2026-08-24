@@ -28,6 +28,8 @@ class ToolRegistry:
             "save_skill",
             "update_user_profile",
             "update_project_memory",
+            "export_teradata_csv",
+            "export_impala_csv",
         }
 
     def register(self, name: str, description: str, parameters: Dict[str, Any]):
@@ -124,6 +126,62 @@ def query_teradata(sql: str, max_rows: int = 100) -> str:
 )
 def query_impala(sql: str, max_rows: int = 100) -> str:
     return db_tools.query_impala(sql, max_rows)
+
+
+def _database_export_parameters() -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "sql": {"type": "string", "description": "One read-only SQL query or introspection statement."},
+            "file_path": {"type": "string", "description": "Workspace-relative destination ending in .csv."},
+            "batch_size": {"type": "integer", "description": "Rows fetched and written per batch (1..10000).",
+                           "minimum": 1, "maximum": 10000, "default": 1000},
+            "overwrite": {"type": "boolean", "description": "Replace an existing destination file.",
+                          "default": False},
+        },
+        "required": ["sql", "file_path"],
+        "additionalProperties": False,
+    }
+
+
+def _prepare_csv_destination(file_path: str, overwrite: bool) -> tuple[str, str]:
+    if not isinstance(file_path, str) or not file_path.lower().endswith(".csv"):
+        raise ValueError("CSV export destination must end in .csv.")
+    resolved, denied = _resolve_workspace_path(file_path)
+    if denied:
+        raise ValueError(denied)
+    assert resolved is not None
+    if _is_sensitive_path(resolved):
+        raise ValueError("Denied: CSV export destination is a sensitive path.")
+    if os.path.isdir(resolved):
+        raise ValueError("CSV export destination must be a file path.")
+    if os.path.exists(resolved) and not overwrite:
+        raise FileExistsError("CSV export destination already exists; set overwrite=true to replace it.")
+    root = os.path.realpath(getattr(terminal_session, "workspace_root", terminal_session.cwd))
+    os.makedirs(os.path.dirname(resolved), exist_ok=True)
+    return resolved, root
+
+
+@registry.register(
+    name="export_teradata_csv",
+    description="Stream one read-only Teradata query directly to an atomic workspace CSV file.",
+    parameters=_database_export_parameters(),
+)
+def export_teradata_csv(sql: str, file_path: str, batch_size: int = 1000,
+                        overwrite: bool = False) -> str:
+    resolved, root = _prepare_csv_destination(file_path, overwrite)
+    return db_tools.export_teradata_csv(sql, resolved, batch_size, root, overwrite)
+
+
+@registry.register(
+    name="export_impala_csv",
+    description="Stream one read-only Impala query directly to an atomic workspace CSV file.",
+    parameters=_database_export_parameters(),
+)
+def export_impala_csv(sql: str, file_path: str, batch_size: int = 1000,
+                      overwrite: bool = False) -> str:
+    resolved, root = _prepare_csv_destination(file_path, overwrite)
+    return db_tools.export_impala_csv(sql, resolved, batch_size, root, overwrite)
 
 
 def _resolve_workspace_path(path: str) -> tuple[Optional[str], Optional[str]]:
