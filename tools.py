@@ -12,6 +12,7 @@ from typing import Any, Callable, Dict, List, Optional
 from terminal import TerminalSession
 from skills import SkillStore
 from memory import user_profile_manager, project_memory_manager
+import db_tools
 
 
 class ToolRegistry:
@@ -92,6 +93,37 @@ MAX_TEXT_CHARS = 16000
 MAX_TEXT_LINES = 500
 VISIBLE_HIDDEN_DIRS = {".github", ".hermes", ".claude", ".vscode", ".devcontainer"}
 IGNORED_DIRS = {".git", "node_modules", "__pycache__", "venv", ".venv", ".pytest_cache", ".agent_memories", ".agent_skills"}
+
+
+def _database_query_parameters() -> Dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "sql": {"type": "string", "description": "One read-only SQL query or introspection statement."},
+            "max_rows": {"type": "integer", "description": "Maximum rows to return (1..1000).",
+                         "minimum": 1, "maximum": 1000, "default": 100},
+        },
+        "required": ["sql"],
+        "additionalProperties": False,
+    }
+
+
+@registry.register(
+    name="query_teradata",
+    description="Run one bounded, read-only query against Teradata using environment-configured credentials.",
+    parameters=_database_query_parameters(),
+)
+def query_teradata(sql: str, max_rows: int = 100) -> str:
+    return db_tools.query_teradata(sql, max_rows)
+
+
+@registry.register(
+    name="query_impala",
+    description="Run one bounded, read-only query against Hadoop Impala using environment configuration.",
+    parameters=_database_query_parameters(),
+)
+def query_impala(sql: str, max_rows: int = 100) -> str:
+    return db_tools.query_impala(sql, max_rows)
 
 
 def _resolve_workspace_path(path: str) -> tuple[Optional[str], Optional[str]]:

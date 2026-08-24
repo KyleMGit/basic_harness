@@ -116,6 +116,8 @@ Whenever the agent proposes a system or terminal command, execution pauses for r
 | **`grep_search`** | `query`, `search_path`, `is_regex`, `file_pattern`, `max_results` | Bounded regex/literal search confined to the canonical workspace; includes relevant hidden config folders and excludes VCS/runtime/cache folders and credential files. |
 | **`find_files_by_pattern`** | `pattern`, `search_path`, `max_results` | Confined glob search (`*.py`, `src/**/*.ts`, `*router*`) across workspace folders. |
 | **`run_terminal_command`** | `command`, `timeout` | Executes terminal commands with persistent `cwd` across turns. |
+| **`query_teradata`** | `sql`, `max_rows` | Runs one bounded, read-only Teradata query using environment configuration. |
+| **`query_impala`** | `sql`, `max_rows` | Runs one bounded, read-only Hadoop Impala query using environment configuration. |
 | **`read_file`** | `file_path`, `start_line`, `end_line` | Bounded file reads inside the configured workspace. Traversal, symlink escape, and sensitive credential targets are denied. |
 | **`write_file`** | `file_path`, `content` | Writes/creates normal source files inside the canonical workspace; outside and sensitive targets are denied. |
 | **`patch_file`** | `file_path`, `search_content`, `replace_content` | Performs targeted search-and-replace on existing files. |
@@ -126,3 +128,68 @@ Whenever the agent proposes a system or terminal command, execution pauses for r
 | **`update_user_profile`** | `category`, `preference` | Appends or updates preferences in `USER.md`. |
 | **`read_project_memory`** | *(none)* | Reads project architecture facts from `MEMORY.md`. |
 | **`update_project_memory`** | `category`, `fact` | Appends or updates technical facts in `MEMORY.md`. |
+
+### Optional database query drivers
+
+Install the drivers only when their tools are needed:
+
+```bash
+pip install teradatasql pyodbc
+```
+
+Configure credentials outside model-visible tool arguments. Teradata supports
+`TERADATA_HOST`, `TERADATA_USER`, `TERADATA_PASSWORD`, and the optional
+`TERADATA_DATABASE` and `TERADATA_LOGMECH`. Impala uses the opaque ODBC string in
+`IMPALA_CONNECTION_STRING`, plus optional `IMPALA_DATABASE` (default `default`)
+and positive-integer `IMPALA_ODBC_TIMEOUT` (default `30` seconds). ODBC keywords
+are driver-specific, so the harness does not parse the connection string.
+
+Alternatively, set `AGENT_DB_CONFIG` to the exact path of a UTF-8 JSON file:
+
+```json
+{
+  "teradata": {
+    "host": "TERADATA_HOSTNAME",
+    "user": "TERADATA_USERNAME",
+    "password": "TERADATA_PASSWORD",
+    "database": "OPTIONAL_DATABASE",
+    "logmech": "OPTIONAL_LOGON_MECHANISM"
+  },
+  "impala": {
+    "connection_string": "DSN=YOUR_IMPALA_DSN;UID=YOUR_USERNAME;PWD=YOUR_PASSWORD",
+    "database": "default",
+    "timeout": 30
+  }
+}
+```
+
+Keep this file outside the repository and restrict its permissions to the
+account running the harness. The named file is loaded only when a database query
+runs; the harness does not search for configuration files. Environment values
+override corresponding JSON values. Start with it in Git Bash:
+
+```bash
+export AGENT_DB_CONFIG=/c/Users/you/.config/hermes/database.json
+python agent.py --model Qwen-32b
+```
+
+In Windows Command Prompt:
+
+```bat
+set "AGENT_DB_CONFIG=C:\Users\you\.config\hermes\database.json"
+python agent.py --model Qwen-32b
+```
+
+Or in PowerShell:
+
+```powershell
+$env:AGENT_DB_CONFIG = 'C:\Users\you\.config\hermes\database.json'
+python agent.py --model Qwen-32b
+```
+
+Database tools accept only `sql` and optional `max_rows` (1 through 1000). To
+request more than the default 100 rows, for example, call `query_impala` with
+`{"sql":"SELECT * FROM events","max_rows":500}`. Every result is also capped
+at 16,000 characters, so large cells or wide results can return fewer requested
+rows with `truncated` set to `true`. Never place credentials in prompts or SQL
+tool calls.

@@ -1,0 +1,14 @@
+{
+  "teradata": {
+    "host": "YOUR_TERADATA_HOSTNAME",
+    "user": "YOUR_TERADATA_USERNAME",
+    "password": "YOUR_TERADATA_PASSWORD",
+    "database": "YOUR_DEFAULT_DATABASE",
+    "logmech": "YOUR_LOGON_MECHANISM"
+  },
+  "impala": {
+    "connection_string": "DSN=YOUR_IMPALA_DSN;UID=YOUR_USERNAME;PWD=YOUR_PASSWORD",
+    "database": "default",
+    "timeout": 30
+  }
+}
