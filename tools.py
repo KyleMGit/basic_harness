@@ -15,6 +15,13 @@ from memory import user_profile_manager, project_memory_manager
 import db_tools
 
 
+READ_THIS_PATH = (Path(__file__).resolve().parent / "READ_THIS.md").resolve()
+
+
+def _is_protected_operator_prompt(path: str) -> bool:
+    return Path(path).resolve() == READ_THIS_PATH
+
+
 class ToolRegistry:
     """Tool registry and dispatcher with schema support."""
 
@@ -340,6 +347,8 @@ def write_file(file_path: str, content: str) -> str:
         resolved_path, denied = _resolve_workspace_path(file_path)
         if denied:
             return denied
+        if _is_protected_operator_prompt(resolved_path):
+            return f"Denied: Operator-managed READ_THIS.md cannot be written by agent file tools: '{file_path}'."
         if _is_sensitive_path(resolved_path):
             return f"Denied: Sensitive credential target '{file_path}' cannot be written."
         os.makedirs(os.path.dirname(resolved_path), exist_ok=True)
@@ -368,6 +377,8 @@ def patch_file(file_path: str, search_content: str, replace_content: str) -> str
         resolved_path, denied = _resolve_workspace_path(file_path)
         if denied:
             return denied
+        if _is_protected_operator_prompt(resolved_path):
+            return f"Denied: Operator-managed READ_THIS.md cannot be patched by agent file tools: '{file_path}'."
         if _is_sensitive_path(resolved_path):
             return f"Denied: Sensitive credential target '{file_path}' cannot be patched."
         if not os.path.exists(resolved_path):

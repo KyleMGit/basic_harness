@@ -1,5 +1,15 @@
 # Hermes-Refined Coding Agent Harness
 
+## Required global prompt layer
+
+Repository-root `READ_THIS.md` is the operator-managed global instruction layer. It is resolved relative to `agent.py`, never the process working directory, validated as UTF-8, screened by the existing prompt-content scanner, and limited to **20,000 characters**. Missing, unreadable, invalid-UTF-8, empty, oversized, scanner-rejected, or reserved-marker-containing content stops startup or a mode rebuild instead of being omitted.
+
+Prompt construction order is: the replaceable base template with `USER.md`, `MEMORY.md`, and the skill catalog filled in; then a separately marked `READ_THIS.md` block; then Hermes tool XML when `--xml` is enabled. Because injection happens outside template formatting, a replacement base/persona template does not need a `READ_THIS.md` placeholder. The block is mandatory in normal, no-memory, no-skills, read-only, stateless, mode-rebuilt, and XML prompts.
+
+The complete system prompt is frozen and saved per session. Resume preserves an existing marked `READ_THIS.md` snapshot exactly; a legacy saved prompt without the marker receives the current validated block once. When disabled startup capabilities require the base prompt to be rebuilt, any saved marked `READ_THIS.md` snapshot is still retained.
+
+Agent-facing `write_file` and `patch_file` deny only the canonical repository-root `READ_THIS.md`; `read_file` remains allowed, and unrelated nested files with that name are ordinary workspace files. This is an agent file-tool boundary, not an operating-system permission: an operator can still edit the root file through an explicitly user-approved terminal command.
+
 An open-source, terminal-native Python agent harness optimized for local models (**Qwen-32b**, etc.) and remote models, inspired by [**NousResearch/hermes-agent**](https://github.com/nousresearch/hermes-agent).
 
 ---

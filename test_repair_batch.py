@@ -177,7 +177,9 @@ class TestSliceBModesPrivacy(unittest.TestCase):
         enabled.logger.load_session_state = MagicMock(return_value=None)
         enabled.logger.load_session_system_prompt = MagicMock(return_value=sentinel)
         self.assertTrue(enabled.resume_session("saved"))
-        self.assertEqual(enabled.messages[0]["content"], sentinel)
+        resumed_prompt = enabled.messages[0]["content"]
+        self.assertTrue(resumed_prompt.startswith(sentinel))
+        self.assertEqual(resumed_prompt.count("<!-- READ_THIS.md:START -->"), 1)
     def test_stateless_capabilities_are_omitted_and_blocked(self):
         names = {s["function"]["name"] for s in tools.registry.schemas_for(enable_memory=False, enable_skills=False)}
         self.assertTrue(names.isdisjoint({"save_skill", "load_skill", "list_skills", "read_user_profile", "update_user_profile", "read_project_memory", "update_project_memory"}))

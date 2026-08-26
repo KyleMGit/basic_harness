@@ -23,6 +23,7 @@ import os
 import re
 import sys
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 try:
@@ -37,6 +38,64 @@ from protocol import ToolProtocol
 from storage import TrajectoryLogger
 from compaction import ContextManager
 from memory import user_profile_manager, project_memory_manager, auto_memory_extractor
+from safety import screen_prompt_content
+
+
+READ_THIS_PATH = Path(__file__).resolve().parent / "READ_THIS.md"
+READ_THIS_MAX_CHARS = 20_000
+READ_THIS_START_MARKER = "<!-- READ_THIS.md:START -->"
+READ_THIS_END_MARKER = "<!-- READ_THIS.md:END -->"
+
+
+def load_read_this_block() -> str:
+    """Load the required, source-relative operator prompt layer."""
+    try:
+        content = READ_THIS_PATH.read_text(encoding="utf-8")
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"Required READ_THIS.md is missing: {READ_THIS_PATH}") from exc
+    except UnicodeDecodeError as exc:
+        raise RuntimeError(f"Required READ_THIS.md is not valid UTF-8: {READ_THIS_PATH}") from exc
+    except (PermissionError, OSError) as exc:
+        raise RuntimeError(f"Required READ_THIS.md is unreadable: {READ_THIS_PATH}: {exc}") from exc
+    content = content.strip()
+    if not content:
+        raise RuntimeError(f"Required READ_THIS.md is empty: {READ_THIS_PATH}")
+    if READ_THIS_START_MARKER in content or READ_THIS_END_MARKER in content:
+        raise RuntimeError("Required READ_THIS.md contains a reserved READ_THIS.md marker.")
+    if len(content) > READ_THIS_MAX_CHARS:
+        raise RuntimeError(
+            f"Required READ_THIS.md exceeds the maximum of {READ_THIS_MAX_CHARS} characters: {READ_THIS_PATH}"
+        )
+    accepted, reason = screen_prompt_content(content)
+    if not accepted:
+        raise RuntimeError(f"Required READ_THIS.md failed prompt screening: {reason}")
+    return f"{READ_THIS_START_MARKER}\n{content}\n{READ_THIS_END_MARKER}"
+
+
+def _read_this_snapshot(prompt: str) -> Optional[str]:
+    if prompt.count(READ_THIS_START_MARKER) != prompt.count(READ_THIS_END_MARKER):
+        raise RuntimeError("Saved system prompt contains an incomplete READ_THIS.md marker block.")
+    if prompt.count(READ_THIS_START_MARKER) > 1:
+        raise RuntimeError("Saved system prompt contains more than one READ_THIS.md marker block.")
+    start = prompt.find(READ_THIS_START_MARKER)
+    if start < 0:
+        return None
+    end = prompt.find(READ_THIS_END_MARKER)
+    if end < start:
+        raise RuntimeError("Saved system prompt contains READ_THIS.md markers out of order.")
+    return prompt[start:end + len(READ_THIS_END_MARKER)]
+
+
+def _append_read_this(prompt: str, block: Optional[str] = None) -> str:
+    if READ_THIS_START_MARKER in prompt or READ_THIS_END_MARKER in prompt:
+        raise RuntimeError("Fresh system prompt contains a reserved READ_THIS.md marker.")
+    return f"{prompt.rstrip()}\n\n### Global Operator Instructions (READ_THIS.md)\n{block or load_read_this_block()}\n"
+
+
+def _inject_read_this(prompt: str, block: Optional[str] = None) -> str:
+    if _read_this_snapshot(prompt) is not None:
+        return prompt
+    return _append_read_this(prompt, block)
 
 
 class HermesCodingAgent:
@@ -143,11 +202,12 @@ Below is the catalog of learned project skills. When a task relates to any avail
         catalog_xml = skill_store.format_catalog_prompt() if self.enable_skills else "<available_skills>\nNone (Skills disabled for testing).\n</available_skills>"
         user_profile_xml = user_profile_manager.format_system_prompt_block() if self.enable_memory else "<user_profile>\nDefault testing profile.\n</user_profile>"
         project_mem_xml = project_memory_manager.format_system_prompt_block() if self.enable_memory else "<project_memory>\nDefault testing memory.\n</project_memory>"
-        return self.SYSTEM_PROMPT_TEMPLATE.format(
+        base_prompt = self.SYSTEM_PROMPT_TEMPLATE.format(
             skills_catalog=catalog_xml,
             user_profile=user_profile_xml,
             project_memory=project_mem_xml
         )
+        return _append_read_this(base_prompt)
 
     def refresh_system_prompt(self):
         """System prompts are frozen for a session; updates apply next session."""
@@ -251,12 +311,18 @@ Below is the catalog of learned project skills. When a task relates to any avail
         self.session_id = target_session_id
         self.step_counter = restored_step
 
+        saved_prompt = self.logger.load_session_system_prompt(target_session_id)
         if self.enable_memory and self.enable_skills:
-            system_content = self.logger.load_session_system_prompt(target_session_id) or self._build_system_prompt()
+            system_content = _inject_read_this(saved_prompt) if saved_prompt else self._build_system_prompt()
         else:
             # A frozen prompt may contain capabilities or persisted material that
             # the current process explicitly disabled at startup.
             system_content = self._build_system_prompt()
+            if saved_prompt:
+                saved_read_this = _read_this_snapshot(saved_prompt)
+                if saved_read_this:
+                    current_read_this = _read_this_snapshot(system_content)
+                    system_content = system_content.replace(current_read_this, saved_read_this, 1)
         if self.use_hermes_xml_protocol and "<tools>" not in system_content:
             system_content = ToolProtocol.format_hermes_system_prompt(system_content, registry.schemas_for(self.enable_memory, self.enable_skills))
 
