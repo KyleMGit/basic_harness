@@ -474,9 +474,12 @@ class DatabaseToolTests(unittest.TestCase):
 
     def test_missing_configuration_and_drivers_are_actionable_without_secrets(self):
         with patch.dict(os.environ, {}, clear=True):
-            with self.assertRaisesRegex(RuntimeError, "TERADATA_HOST.*TERADATA_USER.*TERADATA_PASSWORD"):
+            with self.assertRaisesRegex(
+                    RuntimeError,
+                    "Missing required database configuration: TERADATA_HOST.*TERADATA_USER.*TERADATA_PASSWORD"):
                 db_tools.query_teradata("SELECT 1")
-            with self.assertRaisesRegex(RuntimeError, "IMPALA_HOST"):
+            with self.assertRaisesRegex(
+                    RuntimeError, "Missing required database configuration: IMPALA_HOST"):
                 db_tools.query_impala("SELECT 1")
 
         with patch.dict(os.environ, {"TERADATA_HOST": "h", "TERADATA_USER": "u",
@@ -511,11 +514,13 @@ class DatabaseToolTests(unittest.TestCase):
             teradataml = MagicMock()
             teradataml.get_context.return_value = None
             teradataml.execute_sql.return_value = FakeCursor(description=[])
-            env = {"AGENT_DB_CONFIG": path, "TERADATA_HOST": "env-host",
+            env = {"AGENT_DB_CONFIG": os.path.join(directory, "ignored.json"),
+                   "TERADATA_HOST": "env-host",
                    "IMPALA_HOST": "env-impala", "IMPALA_PORT": "21053",
                    "IMPALA_TIMEOUT": "31", "IMPALA_USE_SSL": "true",
                    "IMPALA_USE_HTTP_TRANSPORT": "yes", "IMPALA_VERIFY_CERT": "1"}
             with patch.dict(os.environ, env, clear=True), patch.object(
+                    db_tools, "__file__", os.path.join(directory, "db_tools.py")), patch.object(
                     db_tools.importlib, "import_module", return_value=teradataml):
                 td_result = json.loads(db_tools.query_teradata("SELECT 1"))
                 td_call = teradataml.create_context.call_args
@@ -533,6 +538,31 @@ class DatabaseToolTests(unittest.TestCase):
             use_http_transport=True, http_path="json-path", verify_cert=True)
         self.assertEqual(td_result["database"], "json-db")
         self.assertEqual(impala_result["database"], "json-default")
+
+    def test_json_config_loads_from_db_tools_directory_without_agent_db_config(self):
+        config = {"impala": {"host": "adjacent-host"}}
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "database.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(config, handle)
+            with patch.dict(os.environ, {}, clear=True), patch.object(
+                    db_tools, "__file__", os.path.join(directory, "db_tools.py")):
+                self.assertEqual(db_tools._load_config(), config)
+
+    def test_json_config_loading_is_independent_of_current_working_directory(self):
+        config = {"teradata": {"host": "adjacent-host"}}
+        with tempfile.TemporaryDirectory() as module_directory, tempfile.TemporaryDirectory() as cwd:
+            path = os.path.join(module_directory, "database.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(config, handle)
+            previous_cwd = os.getcwd()
+            try:
+                os.chdir(cwd)
+                with patch.dict(os.environ, {}, clear=True), patch.object(
+                        db_tools, "__file__", os.path.join(module_directory, "db_tools.py")):
+                    self.assertEqual(db_tools._load_config(), config)
+            finally:
+                os.chdir(previous_cwd)
 
     def test_impala_rejects_invalid_native_settings_before_import_or_connection(self):
         cases = [
@@ -557,19 +587,22 @@ class DatabaseToolTests(unittest.TestCase):
     def test_json_config_errors_are_actionable_and_secret_safe(self):
         cases = [(b'{"impala":', "valid JSON"), (b'[]', "root.*object"),
                  (b'{"impala":"secret-value"}', "impala.*object"), (b'\xff', "UTF-8")]
-        with tempfile.TemporaryDirectory() as directory:
-            for index, (content, expected) in enumerate(cases):
-                path = os.path.join(directory, f"bad-{index}.json")
+        for content, expected in cases:
+            with self.subTest(expected=expected), tempfile.TemporaryDirectory() as directory:
+                path = os.path.join(directory, "database.json")
                 with open(path, "wb") as handle:
                     handle.write(content)
-                with self.subTest(path=path), patch.dict(os.environ, {"AGENT_DB_CONFIG": path}, clear=True):
+                with patch.dict(os.environ, {}, clear=True), patch.object(
+                        db_tools, "__file__", os.path.join(directory, "db_tools.py")):
                     with self.assertRaisesRegex(RuntimeError, expected) as caught:
                         db_tools.query_impala("SELECT 1")
                     self.assertNotIn("secret-value", str(caught.exception))
-            path = os.path.join(directory, "large.json")
+        with tempfile.TemporaryDirectory() as directory:
+            path = os.path.join(directory, "database.json")
             with open(path, "wb") as handle:
                 handle.write(b" " * (65536 + 1))
-            with patch.dict(os.environ, {"AGENT_DB_CONFIG": path}, clear=True):
+            with patch.dict(os.environ, {}, clear=True), patch.object(
+                    db_tools, "__file__", os.path.join(directory, "db_tools.py")):
                 with self.assertRaisesRegex(RuntimeError, "64 KiB"):
                     db_tools.query_impala("SELECT 1")
 

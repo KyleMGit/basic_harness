@@ -4,3 +4,4 @@ __pycache__/
 .agent_memories/
 .agent_skills/
 _test_tmp/
+database.json

@@ -160,7 +160,8 @@ settings are `IMPALA_PORT` (default `21050`), `IMPALA_DATABASE` (default
 `IMPALA_HTTP_PATH` (default empty), and `IMPALA_VERIFY_CERT`. Boolean environment
 values accept `true/false`, `1/0`, `yes/no`, or `on/off`.
 
-Alternatively, set `AGENT_DB_CONFIG` to the exact path of a UTF-8 JSON file:
+Alternatively, copy `database.example.json` to `database.json` in the same
+directory as `db_tools.py` and fill in the UTF-8 JSON file:
 
 ```json
 {
@@ -189,29 +190,12 @@ Alternatively, set `AGENT_DB_CONFIG` to the exact path of a UTF-8 JSON file:
 }
 ```
 
-Keep this file outside the repository and restrict its permissions to the
-account running the harness. The named file is loaded only when a database query
-runs; the harness does not search for configuration files. Environment values
-override corresponding JSON values. Start with it in Git Bash:
-
-```bash
-export AGENT_DB_CONFIG=/c/Users/you/.config/hermes/database.json
-python agent.py --model Qwen-32b
-```
-
-In Windows Command Prompt:
-
-```bat
-set "AGENT_DB_CONFIG=C:\Users\you\.config\hermes\database.json"
-python agent.py --model Qwen-32b
-```
-
-Or in PowerShell:
-
-```powershell
-$env:AGENT_DB_CONFIG = 'C:\Users\you\.config\hermes\database.json'
-python agent.py --model Qwen-32b
-```
+`database.json` is ignored by Git; keep its permissions restricted to the account
+running the harness. It is loaded from the fixed location beside `db_tools.py`
+only when a database query runs, regardless of the current working directory.
+If it is absent, configuration comes only from the environment. Individual
+`TERADATA_*` and `IMPALA_*` environment values override their corresponding JSON
+values. `database.example.json` remains the tracked template.
 
 Query tools accept only `sql` and optional `max_rows` (1 through 1000). To
 request more than the default 100 rows, for example, call `query_impala` with

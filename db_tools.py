@@ -126,31 +126,31 @@ def validate_read_only_sql(sql: str, dialect: str = "generic") -> None:
 
 
 def _load_config() -> Dict[str, Dict[str, Any]]:
-    path = os.environ.get("AGENT_DB_CONFIG")
-    if not path:
-        return {}
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "database.json")
     try:
         if os.path.getsize(path) > _MAX_CONFIG_BYTES:
-            raise RuntimeError(f"AGENT_DB_CONFIG file {path} exceeds 64 KiB.")
+            raise RuntimeError(f"Database config file {path} exceeds 64 KiB.")
         with open(path, "rb") as handle:
             raw = handle.read(_MAX_CONFIG_BYTES + 1)
+    except FileNotFoundError:
+        return {}
     except RuntimeError:
         raise
     except OSError:
-        raise RuntimeError(f"Could not read AGENT_DB_CONFIG file: {path}") from None
+        raise RuntimeError(f"Could not read database config file: {path}") from None
     if len(raw) > _MAX_CONFIG_BYTES:
-        raise RuntimeError(f"AGENT_DB_CONFIG file {path} exceeds 64 KiB.")
+        raise RuntimeError(f"Database config file {path} exceeds 64 KiB.")
     try:
         config = json.loads(raw.decode("utf-8"))
     except UnicodeDecodeError:
-        raise RuntimeError(f"AGENT_DB_CONFIG file {path} must be valid UTF-8.") from None
+        raise RuntimeError(f"Database config file {path} must be valid UTF-8.") from None
     except json.JSONDecodeError:
-        raise RuntimeError(f"AGENT_DB_CONFIG file {path} must contain valid JSON.") from None
+        raise RuntimeError(f"Database config file {path} must contain valid JSON.") from None
     if not isinstance(config, dict):
-        raise RuntimeError(f"AGENT_DB_CONFIG file {path} root must be an object.")
+        raise RuntimeError(f"Database config file {path} root must be an object.")
     for section in ("teradata", "impala"):
         if section in config and not isinstance(config[section], dict):
-            raise RuntimeError(f"AGENT_DB_CONFIG key '{section}' in {path} must be an object.")
+            raise RuntimeError(f"Database config key '{section}' in {path} must be an object.")
     return config
 
 
@@ -161,7 +161,7 @@ def _setting(section: Dict[str, Any], env_name: str, key: str, default: Any = No
 def _required_settings(values: Dict[str, Any]) -> None:
     missing = [name for name, value in values.items() if not value]
     if missing:
-        raise RuntimeError("Missing required environment configuration: " + ", ".join(missing))
+        raise RuntimeError("Missing required database configuration: " + ", ".join(missing))
 
 
 def _positive_integer(value: Any, name: str, maximum: int | None = None) -> int:
