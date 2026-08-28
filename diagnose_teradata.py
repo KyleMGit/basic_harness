@@ -38,6 +38,22 @@ def _redact(message: str, values: tuple[Any, ...]) -> str:
     )
 
 
+def _format_exception_chain(
+        exc: BaseException, redacted_values: tuple[Any, ...]) -> list[str]:
+    lines = []
+    current: BaseException | None = exc
+    seen = set()
+    first = True
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        prefix = "" if first else "Caused by "
+        message = _redact(str(current), redacted_values)
+        lines.append(f"{prefix}{type(current).__name__}: {message}")
+        current = current.__cause__ or current.__context__
+        first = False
+    return lines
+
+
 def main() -> int:
     config = db_tools._load_config()
     section = config.get("teradata", {})
@@ -113,12 +129,11 @@ def main() -> int:
         print("Rows returned:", len(rows))
         return 0
     except Exception as exc:
-        message = _redact(
-            str(exc), (password, user, host, database))
         print(f"{stage}: FAILED")
-        print("Exception type:", type(exc).__name__)
-        print("Redacted driver message:")
-        print(message[:2000])
+        print("Redacted exception chain:")
+        lines = _format_exception_chain(
+            exc, (password, user, host, database))
+        print("\n".join(lines)[:4000])
         return 1
     finally:
         if cursor is not None:
