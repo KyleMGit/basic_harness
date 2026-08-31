@@ -288,9 +288,9 @@ class DatabaseToolTests(unittest.TestCase):
         for failure_kind in ("execute", "fetch"):
             teradataml = MagicMock()
             teradataml.get_context.return_value = None
-            cursor = FakeCursor(fetch_error=RuntimeError("fetch secret"))
+            cursor = FakeCursor(fetch_error=RuntimeError("fetch failed for password=password-secret"))
             if failure_kind == "execute":
-                teradataml.execute_sql.side_effect = RuntimeError("execute secret")
+                teradataml.execute_sql.side_effect = RuntimeError("execute failed for host-secret")
             else:
                 teradataml.execute_sql.return_value = cursor
             env = {"TERADATA_HOST": "host-secret", "TERADATA_USER": "user-secret",
@@ -300,10 +300,44 @@ class DatabaseToolTests(unittest.TestCase):
                     db_tools.importlib, "import_module", return_value=teradataml):
                 with self.assertRaisesRegex(RuntimeError, "Teradata query failed") as caught:
                     db_tools.query_teradata("SELECT 1")
-            self.assertNotIn("secret", str(caught.exception))
+            for secret in env.values():
+                self.assertNotIn(secret, str(caught.exception))
             if failure_kind == "fetch":
                 self.assertTrue(cursor.closed)
             teradataml.remove_context.assert_called_once_with()
+
+    def test_teradata_query_error_reports_stage_and_redacted_exception_chain_to_agent(self):
+        class TeradataMlException(Exception):
+            pass
+
+        class OperationalError(Exception):
+            errorcode = 3706
+            sqlstate = "42000"
+
+        inner = OperationalError(
+            "[Error 3706] Syntax error near host-secret; password=password-secret")
+        outer = TeradataMlException("TDML_2000: Failed to execute SQL")
+        outer.__cause__ = inner
+        teradataml = MagicMock()
+        teradataml.get_context.return_value = None
+        teradataml.execute_sql.side_effect = outer
+        env = {"TERADATA_HOST": "host-secret", "TERADATA_USER": "user-secret",
+               "TERADATA_PASSWORD": "password-secret", "TERADATA_DATABASE": "db-secret"}
+
+        with patch.dict(os.environ, env, clear=True), patch.object(
+                db_tools.importlib, "import_module", return_value=teradataml):
+            result = registry.execute("query_teradata", {"sql": "SELECT broken FROM t"})
+
+        self.assertIn("stage=execute", result)
+        self.assertIn("TeradataMlException", result)
+        self.assertIn("OperationalError", result)
+        self.assertIn("TDML_2000", result)
+        self.assertIn("3706", result)
+        self.assertIn("sqlstate=42000", result)
+        self.assertIn("Syntax error", result)
+        for secret in env.values():
+            self.assertNotIn(secret, result)
+        teradataml.remove_context.assert_called_once_with()
 
     def test_teradata_does_not_remove_context_when_creation_fails(self):
         teradataml = MagicMock()
@@ -679,6 +713,60 @@ class DatabaseToolTests(unittest.TestCase):
                     db_tools.query_impala("SELECT 1")
             self.assertTrue(cursor.closed)
             self.assertTrue(connection.closed)
+
+    def test_query_error_redacts_configured_secret_embedded_in_driver_text(self):
+        rendered = str(db_tools._format_query_error(
+            "Teradata", "execute",
+            RuntimeError("driver payload=prefixsecret-passsuffix"),
+            ("secret-pass",),
+        ))
+
+        self.assertNotIn("secret-pass", rendered)
+        self.assertIn("prefix<redacted>suffix", rendered)
+
+    def test_query_error_diagnostics_are_bounded_and_cycle_safe(self):
+        outer = RuntimeError("outer " + "x" * 5000)
+        inner = RuntimeError("password=secret-pass")
+        outer.__cause__ = inner
+        inner.__context__ = outer
+
+        rendered = str(db_tools._format_query_error(
+            "Teradata", "execute", outer, ("secret-pass",)))
+
+        self.assertLessEqual(len(rendered), db_tools._MAX_ERROR_CHARS)
+        self.assertIn("truncated", rendered)
+        self.assertNotIn("additional exception chain", rendered)
+        self.assertNotIn("secret-pass", rendered)
+
+    def test_impala_query_error_reports_exact_stage_code_and_redacted_message(self):
+        class HiveServer2Error(Exception):
+            errno = 100
+
+        cases = {
+            "connect": (None, HiveServer2Error("connect failed to secret-host as secret-user")),
+            "execute": (FakeCursor(execute_error=HiveServer2Error(
+                "AnalysisException code 100: unknown column; pwd=secret-pass")), None),
+            "fetch": (FakeCursor(fetch_error=HiveServer2Error(
+                "fetch failed for dsn=secret-dsn")), None),
+        }
+        env = {"IMPALA_HOST": "secret-host", "IMPALA_USER": "secret-user",
+               "IMPALA_PASSWORD": "secret-pass", "IMPALA_DATABASE": "secret-dsn"}
+        for expected_stage, (cursor, connect_error) in cases.items():
+            driver = MagicMock()
+            if connect_error is not None:
+                driver.connect.side_effect = connect_error
+            else:
+                driver.connect.return_value = FakeConnection(cursor)
+            with self.subTest(stage=expected_stage), patch.dict(
+                    os.environ, env, clear=True), patch.object(
+                    db_tools.importlib, "import_module", return_value=driver):
+                result = registry.execute("query_impala", {"sql": "SELECT broken FROM t"})
+
+            self.assertIn(f"stage={expected_stage}", result)
+            self.assertIn("HiveServer2Error", result)
+            self.assertIn("errno=100", result)
+            for secret in env.values():
+                self.assertNotIn(secret, result)
 
 
 if __name__ == "__main__":

@@ -203,6 +203,13 @@ request more than the default 100 rows, for example, call `query_impala` with
 at 16,000 characters, so large cells or wide results can return fewer requested
 rows with `truncated` set to `true`.
 
+Failed queries identify the exact `connect`, `execute`, `fetch`, or `serialize`
+stage and include a bounded, sanitized exception chain. Exception classes,
+SQLSTATEs, and vendor error codes are preserved when available so the agent can
+correct SQL rather than seeing only a generic query failure. Configured hosts,
+users, passwords, databases/DSNs, connection values, and common credential
+assignments are redacted before the error reaches the agent.
+
 CSV exports are the unbounded streaming alternative to those previews. For
 example, call `export_impala_csv` with
 `{"sql":"SELECT * FROM events","file_path":"exports/events.csv","batch_size":2000}`.

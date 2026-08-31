@@ -19,6 +19,14 @@ _MAX_CONFIG_BYTES = 64 * 1024
 _MAX_RESULT_CHARS = 16000
 _MAX_CELL_CHARS = 4096
 _MAX_COLUMN_CHARS = 512
+_MAX_ERROR_CHARS = 3000
+_MAX_ERROR_MESSAGE_CHARS = 800
+_MAX_EXCEPTION_CHAIN = 8
+_ERROR_CODE_ATTRIBUTES = ("code", "errorcode", "errno", "sqlstate", "sql_state")
+_SECRET_ASSIGNMENT = re.compile(
+    r'''(?ix)\b(password|pwd|pass|username|user|host|hostname|dsn|database|db)\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^,;\s\]\)]+)'''
+)
+_URL_CREDENTIALS = re.compile(r"(?i)([a-z][a-z0-9+.-]*://)([^/@\s:]+):([^/@\s]+)@")
 _WRITE_KEYWORDS = re.compile(
     r"\b(?:INSERT|UPDATE|DELETE|MERGE|UPSERT|DROP|ALTER|CREATE|TRUNCATE|GRANT|REVOKE|CALL|EXECUTE)\b",
     re.IGNORECASE,
@@ -298,6 +306,73 @@ def _bounded_text(value: Any, limit: int) -> tuple[str, bool]:
     return text[:limit], True
 
 
+def _redact_error_text(message: str, redacted_values: tuple[Any, ...]) -> str:
+    """Bound and sanitize driver text while preserving actionable SQL diagnostics."""
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", message)
+    text = _URL_CREDENTIALS.sub(r"\1<redacted>:<redacted>@", text)
+    text = _SECRET_ASSIGNMENT.sub(lambda match: f"{match.group(1)}=<redacted>", text)
+    values = sorted(
+        {str(value) for value in redacted_values if value is not None and str(value)},
+        key=len,
+        reverse=True,
+    )
+    for value in values:
+        # Exact replacement also catches credentials embedded in opaque driver payloads.
+        text = text.replace(value, "<redacted>")
+        # The boundary pass additionally catches case-only variations without replacing
+        # every occurrence of a short configured value inside ordinary words.
+        text = re.sub(
+            rf"(?<![A-Za-z0-9]){re.escape(value)}(?![A-Za-z0-9])",
+            "<redacted>",
+            text,
+            flags=re.IGNORECASE,
+        )
+    text = re.sub(r"\s+", " ", text).strip()
+    if not text:
+        return "<no message>"
+    if len(text) > _MAX_ERROR_MESSAGE_CHARS:
+        return text[:_MAX_ERROR_MESSAGE_CHARS - 15] + "... [truncated]"
+    return text
+
+
+def _exception_codes(exc: BaseException, redacted_values: tuple[Any, ...]) -> str:
+    codes = []
+    for attribute in _ERROR_CODE_ATTRIBUTES:
+        try:
+            value = getattr(exc, attribute)
+        except Exception:
+            continue
+        if value is None or isinstance(value, (dict, list, tuple, set)):
+            continue
+        rendered = _redact_error_text(str(value), redacted_values)
+        if len(rendered) <= 80:
+            codes.append(f"{attribute}={rendered}")
+    return ", ".join(codes)
+
+
+def _format_query_error(database_kind: str, stage: str, exc: BaseException,
+                        redacted_values: tuple[Any, ...]) -> RuntimeError:
+    """Return an agent-useful, secret-safe summary of a database exception chain."""
+    parts = []
+    current: BaseException | None = exc
+    seen = set()
+    while current is not None and id(current) not in seen and len(parts) < _MAX_EXCEPTION_CHAIN:
+        seen.add(id(current))
+        codes = _exception_codes(current, redacted_values)
+        code_text = f" [{codes}]" if codes else ""
+        message = _redact_error_text(str(current), redacted_values)
+        prefix = "" if not parts else "Caused by "
+        parts.append(f"{prefix}{type(current).__name__}{code_text}: {message}")
+        current = current.__cause__ or current.__context__
+    if current is not None and id(current) not in seen:
+        parts.append("Caused by <additional exception chain truncated>")
+    detail = " | ".join(parts)
+    rendered = f"{database_kind} query failed (stage={stage}): {detail}"
+    if len(rendered) > _MAX_ERROR_CHARS:
+        rendered = rendered[:_MAX_ERROR_CHARS - 15] + "... [truncated]"
+    return RuntimeError(rendered)
+
+
 def _serialize_result(database: str, description: Any, rows: Any, row_truncated: bool) -> str:
     truncated = row_truncated
     database, shortened = _bounded_text(database, _MAX_COLUMN_CHARS)
@@ -367,18 +442,22 @@ def _serialize_result(database: str, description: Any, rows: Any, row_truncated:
 
 
 def _execute(connect: Callable[[], Any], sql: str, max_rows: int, database: str,
-             database_kind: str) -> str:
+             database_kind: str, redacted_values: tuple[Any, ...]) -> str:
     connection = None
     cursor = None
+    stage = "connect"
     try:
         connection = connect()
         cursor = connection.cursor()
+        stage = "execute"
         cursor.execute(sql)
+        stage = "fetch"
         fetched = list(cursor.fetchmany(max_rows + 1))
         rows = fetched[:max_rows]
+        stage = "serialize"
         return _serialize_result(database, cursor.description, rows, len(fetched) > max_rows)
-    except Exception:
-        raise RuntimeError(f"{database_kind} query failed during connection, execution, or fetch.") from None
+    except Exception as exc:
+        raise _format_query_error(database_kind, stage, exc, redacted_values) from None
     finally:
         if cursor is not None:
             try:
@@ -423,6 +502,11 @@ def query_teradata(sql: str, max_rows: int = 100) -> str:
             "An active Teradata context already exists; close it before running this query.")
     context_created = False
     cursor = None
+    stage = "connect"
+    redacted_values = (
+        values["TERADATA_HOST"], values["TERADATA_USER"],
+        values["TERADATA_PASSWORD"], database,
+    )
     try:
         try:
             teradataml.create_context(**options)
@@ -433,11 +517,14 @@ def query_teradata(sql: str, max_rows: int = 100) -> str:
                 pass
             raise
         context_created = True
+        stage = "execute"
         cursor = teradataml.execute_sql(statement=sql)
+        stage = "fetch"
         fetched = list(cursor.fetchmany(limit + 1))
+        stage = "serialize"
         return _serialize_result(database, cursor.description, fetched[:limit], len(fetched) > limit)
-    except Exception:
-        raise RuntimeError("Teradata query failed during connection, execution, or fetch.") from None
+    except Exception as exc:
+        raise _format_query_error("Teradata", stage, exc, redacted_values) from None
     finally:
         if cursor is not None:
             try:
@@ -517,8 +604,11 @@ def query_impala(sql: str, max_rows: int = 100) -> str:
         dbapi = importlib.import_module("impala.dbapi")
     except ImportError:
         raise RuntimeError("Impala driver is unavailable; install it with: pip install impyla") from None
-    return _execute(lambda: dbapi.connect(**options),
-                    sql, limit, database, "Impala")
+    return _execute(
+        lambda: dbapi.connect(**options), sql, limit, database, "Impala",
+        (host, options.get("user"), options.get("password"), database,
+         options.get("ca_cert"), options.get("http_path")),
+    )
 
 
 def _check_export_request(sql: str, file_path: str, batch_size: int,
