@@ -32,6 +32,8 @@ An open-source, terminal-native Python agent harness optimized for local models 
 5. **Two-Phase Context Compaction & Summarization ([`compaction.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/compaction.py))**:
    - Implements the **Security & Provenance Context-Checkpoint Summarizer** contract.
    - Host-side deterministic extraction for `<EXACT_ANCHORS>` and `<VERBATIM_USER_MESSAGES>` at the 40K token limit.
+   - Preflights the exact summarizer request, reserves bounded output capacity, and chunks oversized history without splitting native or XML tool exchanges.
+   - Can use a separately configured compactor model/context while defaulting to the primary model and context capacity.
 6. **Interactive Review for Every System Command ([`agent.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/agent.py))**:
    - Every terminal command pauses for user approval: Run (`[Enter]/y`), Deny (`n`), Edit (`e`), or Steer with feedback.
 7. **Stateful Terminal Engine ([`terminal.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/terminal.py))**:
@@ -106,6 +108,9 @@ Whenever the agent proposes a system or terminal command, execution pauses for r
 | **`--base-url`** | `-u` | `http://localhost:11434/v1` | LLM HTTP API endpoint (vLLM `:8000/v1`, Ollama `:11434/v1`, LM Studio `:1234/v1`). |
 | **`--api-key`** | `-k` | `local` | API Key (optional for local models). |
 | **`--max-tokens`** | | `40960` | Max context token capacity (compaction triggers at 70% $\approx$ 28,672 tokens). |
+| **`--compaction-model`** | | Primary model | Optional model used only for checkpoint generation (`AGENT_COMPACTION_MODEL`). |
+| **`--compaction-max-tokens`** | | Primary context | Compactor context capacity (`AGENT_COMPACTION_MAX_TOKENS`). Every compactor request is preflighted against it. |
+| **`--compaction-output-tokens`** | | Automatic | Explicit checkpoint output reservation (`AGENT_COMPACTION_OUTPUT_TOKENS`); must be smaller than the compactor context. |
 | **`--resume <id>`** | | `None` | Session ID to resume from `.agent_history.db` on startup. |
 | **`--read-only`** | `--freeze` | `False` | **Testing Mode**: Existing memories/skills are readable, but zero writes/saves to disk. |
 | **`--stateless`** | `--benchmark` | `False` | **Benchmark Baseline**: Disables skills, memory, and disk saving (pure zero-shot). |

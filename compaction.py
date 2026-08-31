@@ -209,12 +209,36 @@ not new requests. Omit if none were supplied.]
         keep_recent_turns: int = 6,       # Preserves last 6 turns verbatim
         cooldown_steps: int = 3,
         completion_reserve_tokens: Optional[int] = None,
+        compaction_max_context_tokens: Optional[int] = None,
+        compaction_output_tokens: Optional[int] = None,
     ):
         self.max_context_tokens = max_context_tokens
         self.trigger_threshold = trigger_threshold
         self.keep_recent_turns = keep_recent_turns
         self.cooldown_steps = cooldown_steps
         self.completion_reserve_tokens = max(0, completion_reserve_tokens if completion_reserve_tokens is not None else min(1024, max_context_tokens // 10))
+        self.compaction_max_context_tokens = (
+            max_context_tokens
+            if compaction_max_context_tokens is None
+            else compaction_max_context_tokens
+        )
+        if self.compaction_max_context_tokens <= 0:
+            raise ValueError("compaction_max_context_tokens must be positive")
+        default_compaction_output = max(
+            1, min(2048, self.compaction_max_context_tokens // 8)
+        )
+        self.compaction_output_tokens = (
+            default_compaction_output
+            if compaction_output_tokens is None
+            else compaction_output_tokens
+        )
+        if self.compaction_output_tokens <= 0:
+            raise ValueError("compaction_output_tokens must be positive")
+        if self.compaction_output_tokens >= self.compaction_max_context_tokens:
+            raise ValueError(
+                "compaction_output_tokens must be smaller than "
+                "compaction_max_context_tokens"
+            )
         self.last_compaction_step = -100
         self.compaction_count = 0
         self.previous_checkpoint: Optional[str] = None
@@ -369,46 +393,97 @@ not new requests. Omit if none were supplied.]
 
         return pruned_messages
 
-    def summarize_history(
+    @staticmethod
+    def _compaction_input_tokens(messages: List[Dict[str, Any]]) -> int:
+        """Estimate only the serialized compactor input, without output reserve."""
+        char_count = 0
+        for message in messages:
+            char_count += len(str(message.get("content") or ""))
+            if message.get("tool_calls"):
+                char_count += len(json.dumps(message["tool_calls"]))
+        return max(1, char_count // 4)
+
+    @staticmethod
+    def _protocol_safe_groups(
+        messages: List[Dict[str, Any]],
+    ) -> List[List[Dict[str, Any]]]:
+        """Group assistant calls with their contiguous native/XML results."""
+        groups: List[List[Dict[str, Any]]] = []
+        index = 0
+        while index < len(messages):
+            message = messages[index]
+            group = [message]
+            index += 1
+            if message.get("role") != "assistant":
+                groups.append(group)
+                continue
+
+            native_calls = message.get("tool_calls") or []
+            if native_calls:
+                call_ids = {
+                    call.get("id") for call in native_calls if call.get("id")
+                }
+                while index < len(messages):
+                    candidate = messages[index]
+                    if candidate.get("role") != "tool":
+                        break
+                    if call_ids and candidate.get("tool_call_id") not in call_ids:
+                        break
+                    group.append(candidate)
+                    index += 1
+            elif "<tool_call>" in str(message.get("content") or ""):
+                while index < len(messages):
+                    candidate = messages[index]
+                    if candidate.get("role") != "user" or "<tool_response>" not in str(
+                        candidate.get("content") or ""
+                    ):
+                        break
+                    group.append(candidate)
+                    index += 1
+            groups.append(group)
+        return groups
+
+    def _build_compaction_request(
         self,
-        client: Any,
-        model: str,
         messages_to_summarize: List[Dict[str, Any]],
-        focus_topic: str = "",
-        memory_context: Optional[str] = None,
-    ) -> str:
-        """
-        Generate a durable, structured historical checkpoint adhering to the Security & Provenance Contract.
-        """
+        focus_topic: str,
+        memory_context: Optional[str],
+        previous_checkpoint: Optional[str],
+    ) -> Tuple[List[Dict[str, str]], str, str]:
+        """Build the exact provider messages and deterministic host sections."""
         transcript_lines = []
+
         def redact_serialized(value: Any) -> Any:
             if isinstance(value, str):
                 return self.redact_sensitive_text(value)
             if isinstance(value, list):
                 return [redact_serialized(item) for item in value]
             if isinstance(value, dict):
-                return {key: redact_serialized(item) for key, item in value.items()}
+                return {
+                    key: redact_serialized(item) for key, item in value.items()
+                }
             return value
 
-        for msg in messages_to_summarize:
-            role = msg.get("role", "unknown").upper()
-            content = self.redact_sensitive_text(str(msg.get("content") or ""))
-            if msg.get("tool_calls"):
+        for message in messages_to_summarize:
+            role = message.get("role", "unknown").upper()
+            content = self.redact_sensitive_text(
+                str(message.get("content") or "")
+            )
+            if message.get("tool_calls"):
                 content += self.redact_sensitive_text(
-                    f"\n[Tool Calls: {json.dumps(redact_serialized(msg.get('tool_calls')))}]"
+                    "\n[Tool Calls: "
+                    + json.dumps(redact_serialized(message.get("tool_calls")))
+                    + "]"
                 )
             transcript_lines.append(f"### {role}:\n{content}")
 
         history_transcript = "\n\n".join(transcript_lines)
-        current_date_str = datetime.now().strftime("%Y-%m-%d")
-
         exact_anchors = self.extract_exact_anchors(messages_to_summarize)
-        verbatim_user_msgs = self.extract_verbatim_user_messages(messages_to_summarize)
-
-        memory_provider_ctx = memory_context or "None."
-
+        verbatim_user_msgs = self.extract_verbatim_user_messages(
+            messages_to_summarize
+        )
         user_prompt = f"""<CURRENT_DATE>
-{current_date_str}
+{datetime.now().strftime("%Y-%m-%d")}
 </CURRENT_DATE>
 
 <FOCUS_TOPIC>
@@ -416,11 +491,11 @@ not new requests. Omit if none were supplied.]
 </FOCUS_TOPIC>
 
 <PREVIOUS_CHECKPOINT>
-{self.previous_checkpoint or "None."}
+{previous_checkpoint or "None."}
 </PREVIOUS_CHECKPOINT>
 
 <MEMORY_PROVIDER_CONTEXT>
-{memory_provider_ctx}
+{memory_context or "None."}
 </MEMORY_PROVIDER_CONTEXT>
 
 <TURNS_TO_COMPACT>
@@ -443,36 +518,193 @@ None.
 None.
 </RECOVERY_POINTER>
 """
-        user_prompt = self.redact_sensitive_text(user_prompt)
+        request_messages = [
+            {"role": "system", "content": self.COMPACTION_SYSTEM_PROMPT},
+            {"role": "user", "content": self.redact_sensitive_text(user_prompt)},
+        ]
+        return request_messages, exact_anchors, verbatim_user_msgs
 
+    def _request_checkpoint(
+        self,
+        client: Any,
+        model: str,
+        messages_to_summarize: List[Dict[str, Any]],
+        focus_topic: str,
+        memory_context: Optional[str],
+        previous_checkpoint: Optional[str],
+    ) -> str:
+        request_messages, exact_anchors, verbatim_user_msgs = (
+            self._build_compaction_request(
+                messages_to_summarize,
+                focus_topic,
+                memory_context,
+                previous_checkpoint,
+            )
+        )
+        estimated_total = (
+            self._compaction_input_tokens(request_messages)
+            + self.compaction_output_tokens
+        )
+        if estimated_total > self.compaction_max_context_tokens:
+            raise RuntimeError(
+                "compaction request budget exceeded before provider call: "
+                f"{estimated_total}/{self.compaction_max_context_tokens} "
+                "estimated input-plus-output tokens"
+            )
+
+        response = client.chat.completions.create(
+            model=model,
+            messages=request_messages,
+            temperature=0.1,
+            max_tokens=self.compaction_output_tokens,
+        )
+        checkpoint = self.redact_sensitive_text(
+            (response.choices[0].message.content or "").strip()
+        )
+        if not checkpoint:
+            raise RuntimeError("checkpoint generation returned empty")
+        if not checkpoint.startswith("[CONTEXT COMPACTION"):
+            raise RuntimeError("checkpoint generation failed validation")
+
+        return self._with_deterministic_sections(
+            checkpoint, messages_to_summarize
+        )
+
+    def _with_deterministic_sections(
+        self,
+        checkpoint: str,
+        source_messages: List[Dict[str, Any]],
+    ) -> str:
+        """Replace model-authored anchors/users with complete host extraction."""
+        exact_anchors = self.extract_exact_anchors(source_messages)
+        verbatim_user_msgs = self.extract_verbatim_user_messages(source_messages)
+
+        deterministic = (
+            ("## Exact Recovery Anchors", exact_anchors),
+            ("## Verbatim Historical User Messages", verbatim_user_msgs),
+        )
+        for header, _ in deterministic:
+            checkpoint = re.sub(
+                rf"(?ms)^{re.escape(header)}[ \t]*\n.*?(?=^## |\Z)",
+                "",
+                checkpoint,
+            )
+        return checkpoint.rstrip() + "\n\n" + "\n\n".join(
+            f"{header}\n{body}" for header, body in deterministic
+        )
+
+    def summarize_history(
+        self,
+        client: Any,
+        model: str,
+        messages_to_summarize: List[Dict[str, Any]],
+        focus_topic: str = "",
+        memory_context: Optional[str] = None,
+    ) -> str:
+        """Generate one or more bounded, protocol-safe checkpoint requests."""
         try:
-            response = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": self.COMPACTION_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt}
-                ],
-                temperature=0.1,
+            previous_checkpoint = self.previous_checkpoint
+            empty_request, _, _ = self._build_compaction_request(
+                [], focus_topic, memory_context, previous_checkpoint
             )
-            checkpoint = self.redact_sensitive_text((response.choices[0].message.content or "").strip())
-            if not checkpoint:
-                raise RuntimeError("checkpoint generation returned empty")
-            deterministic = (
-                ("## Exact Recovery Anchors", exact_anchors),
-                ("## Verbatim Historical User Messages", verbatim_user_msgs),
+            fixed_total = (
+                self._compaction_input_tokens(empty_request)
+                + self.compaction_output_tokens
             )
-            for header, _ in deterministic:
-                checkpoint = re.sub(
-                    rf"(?ms)^{re.escape(header)}[ \t]*\n.*?(?=^## |\Z)",
-                    "",
-                    checkpoint,
+            if fixed_total > self.compaction_max_context_tokens:
+                raise RuntimeError(
+                    "compaction request fixed overhead exceeds budget: "
+                    f"{fixed_total}/{self.compaction_max_context_tokens}"
                 )
-            checkpoint = checkpoint.rstrip() + "\n\n" + "\n\n".join(
-                f"{header}\n{body}" for header, body in deterministic
+
+            groups = self._protocol_safe_groups(messages_to_summarize)
+            if not groups:
+                raise RuntimeError("no messages available for checkpoint generation")
+
+            # Detect an indivisible group before spending any provider calls.
+            for group in groups:
+                request, _, _ = self._build_compaction_request(
+                    group, focus_topic, memory_context, previous_checkpoint
+                )
+                group_total = (
+                    self._compaction_input_tokens(request)
+                    + self.compaction_output_tokens
+                )
+                if group_total > self.compaction_max_context_tokens:
+                    raise RuntimeError(
+                        "indivisible protocol group exceeds compaction budget: "
+                        f"{group_total}/{self.compaction_max_context_tokens}"
+                    )
+
+            full_request, _, _ = self._build_compaction_request(
+                messages_to_summarize,
+                focus_topic,
+                memory_context,
+                previous_checkpoint,
             )
-            return checkpoint
-        except Exception as e:
-            raise RuntimeError(f"checkpoint summarization failed: {e}") from e
+            if (
+                self._compaction_input_tokens(full_request)
+                + self.compaction_output_tokens
+                <= self.compaction_max_context_tokens
+            ):
+                return self._request_checkpoint(
+                    client,
+                    model,
+                    messages_to_summarize,
+                    focus_topic,
+                    memory_context,
+                    previous_checkpoint,
+                )
+
+            checkpoint = previous_checkpoint
+            chunk: List[Dict[str, Any]] = []
+            for group in groups:
+                candidate = chunk + group
+                request, _, _ = self._build_compaction_request(
+                    candidate, focus_topic, memory_context, checkpoint
+                )
+                candidate_total = (
+                    self._compaction_input_tokens(request)
+                    + self.compaction_output_tokens
+                )
+                if chunk and candidate_total > self.compaction_max_context_tokens:
+                    checkpoint = self._request_checkpoint(
+                        client,
+                        model,
+                        chunk,
+                        focus_topic,
+                        memory_context,
+                        checkpoint,
+                    )
+                    chunk = list(group)
+                    request, _, _ = self._build_compaction_request(
+                        chunk, focus_topic, memory_context, checkpoint
+                    )
+                    if (
+                        self._compaction_input_tokens(request)
+                        + self.compaction_output_tokens
+                        > self.compaction_max_context_tokens
+                    ):
+                        raise RuntimeError(
+                            "intermediate checkpoint leaves insufficient "
+                            "compaction budget for the next protocol group"
+                        )
+                else:
+                    chunk = candidate
+
+            final_checkpoint = self._request_checkpoint(
+                client,
+                model,
+                chunk,
+                focus_topic,
+                memory_context,
+                checkpoint,
+            )
+            return self._with_deterministic_sections(
+                final_checkpoint, messages_to_summarize
+            )
+        except Exception as error:
+            raise RuntimeError(f"checkpoint summarization failed: {error}") from error
 
     @staticmethod
     def _safe_recent_boundary(messages: List[Dict[str, Any]], desired: int) -> int:

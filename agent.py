@@ -118,6 +118,8 @@ You have access to tools that allow you to inspect the system, manage files, sea
 - **Codebase Exploration**: Use `grep_search` and `find_files_by_pattern` for fast multi-file navigation instead of reading entire files repeatedly.
 - **Verification & Testing**: Always verify changes by running tests, linters, or checking file content.
 - **Analyze Output**: Inspect command outputs (stdout, stderr, exit codes). If errors occur, diagnose and repair them iteratively.
+- **Database Results**: Database query tools return bounded previews. Use only the requested columns and deterministic ordering. A truncated preview is not the complete dataset, so use aggregate or otherwise answer-shaped SQL when the database can compute the requested answer. For a complete row-set request (for example, “all products”), answer inline only when the preview is complete; if it is truncated, run the matching database export tool and provide the complete CSV manifest instead of presenting the preview as complete.
+- **Complete CSV Exports**: Never reconstruct a complete CSV from query-preview rows or pass those rows to `write_file`. For complete database CSV requests, call `export_teradata_csv` or `export_impala_csv` with the validated SQL and report the returned manifest.
 
 ### Memory Evolution & Learning Protocol:
 - **Operator Preferences (USER.md)**: When the user expresses a personal preference, workflow habit, formatting requirement, or gives you a correction (e.g. "I prefer pytest", "don't use pip", "keep answers under 3 bullets"), immediately call `update_user_profile(category, preference)`.
@@ -139,11 +141,14 @@ Below is the catalog of learned project skills. When a task relates to any avail
     def __init__(
         self,
         model: str = "Qwen-32b",
+        compaction_model: Optional[str] = None,
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         max_iterations: int = 30,
         max_context_tokens: int = 40960,     # Default to 40K (40,960 tokens) for Qwen-32B
         compaction_threshold: float = 0.70, # Triggers compaction at ~28,672 tokens
+        compaction_max_context_tokens: Optional[int] = None,
+        compaction_output_tokens: Optional[int] = None,
         confirm_all_terminal_commands: bool = True,
         enable_skills: bool = True,
         enable_memory: bool = True,
@@ -154,6 +159,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
         use_hermes_xml_protocol: bool = False,
     ):
         self.model = model or "Qwen-32b"
+        self.compaction_model = compaction_model or self.model
         self.max_iterations = max_iterations
         self.confirm_all_terminal_commands = confirm_all_terminal_commands
         self.enable_skills = enable_skills
@@ -180,7 +186,9 @@ Below is the catalog of learned project skills. When a task relates to any avail
         self.logger = TrajectoryLogger(write_enabled=not self.read_only)
         self.context_manager = ContextManager(
             max_context_tokens=max_context_tokens,
-            trigger_threshold=compaction_threshold
+            trigger_threshold=compaction_threshold,
+            compaction_max_context_tokens=compaction_max_context_tokens,
+            compaction_output_tokens=compaction_output_tokens,
         )
         self.skill_extractor = AutoSkillExtractor(skill_store=skill_store)
         self.memory_extractor = auto_memory_extractor
@@ -379,7 +387,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
             memory_context = "None."
         compacted_msgs, was_compacted, msg = self.context_manager.compact(
             client=self.client,
-            model=self.model,
+            model=self.compaction_model,
             messages=self.messages,
             current_step=self.step_counter,
             force=force,
@@ -733,12 +741,13 @@ Below is the catalog of learned project skills. When a task relates to any avail
                 self._active_skill_injection = None
                 return final_answer
 
-        print(f"\n[!] Agent reached iteration limit ({self.max_iterations}).")
+        continue_instruction = 'Type "Continue" to continue the analysis.'
+        print(f"\n[!] Agent reached iteration limit ({self.max_iterations}).\n{continue_instruction}")
         self.logger.end_session(self.session_id, status="MAX_ITERATIONS")
         self._active_skill_injection = None
         if partial_answer:
-            return f"Task incomplete: iteration limit reached after partial response: {partial_answer}"
-        return "Task incomplete: iteration limit reached without a complete response."
+            return f"Task incomplete: iteration limit reached after partial response: {partial_answer}\n{continue_instruction}"
+        return f"Task incomplete: iteration limit reached without a complete response.\n{continue_instruction}"
 
 
 # ==============================================================================
@@ -787,6 +796,23 @@ def parse_args():
         help="Context window token limit before compaction triggers (default: 40960 / 40K tokens for Qwen-32B)."
     )
     parser.add_argument(
+        "--compaction-model",
+        default=os.environ.get("AGENT_COMPACTION_MODEL") or None,
+        help="Optional model used only for checkpoint compaction (default: primary model).",
+    )
+    parser.add_argument(
+        "--compaction-max-tokens",
+        type=int,
+        default=os.environ.get("AGENT_COMPACTION_MAX_TOKENS") or None,
+        help="Compactor context capacity (default: inherit --max-tokens).",
+    )
+    parser.add_argument(
+        "--compaction-output-tokens",
+        type=int,
+        default=os.environ.get("AGENT_COMPACTION_OUTPUT_TOKENS") or None,
+        help="Maximum checkpoint output tokens (default: bounded automatic value).",
+    )
+    parser.add_argument(
         "--resume",
         type=str,
         default=None,
@@ -833,7 +859,22 @@ def parse_args():
         action="store_true",
         help="Disable automatic post-task memory reflection."
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.max_tokens <= 0:
+        parser.error("--max-tokens must be positive")
+    if args.compaction_max_tokens is not None and args.compaction_max_tokens <= 0:
+        parser.error("--compaction-max-tokens must be positive")
+    if args.compaction_output_tokens is not None and args.compaction_output_tokens <= 0:
+        parser.error("--compaction-output-tokens must be positive")
+    compaction_capacity = args.compaction_max_tokens or args.max_tokens
+    if (
+        args.compaction_output_tokens is not None
+        and args.compaction_output_tokens >= compaction_capacity
+    ):
+        parser.error(
+            "--compaction-output-tokens must be smaller than the compactor context capacity"
+        )
+    return args
 
 
 def handle_cli_command(agent: HermesCodingAgent, prompt: str) -> bool:
@@ -890,6 +931,13 @@ def main():
     print(f"Model:      {args.model}")
     print(f"Endpoint:   {args.base_url}")
     print(f"Max Tokens: {args.max_tokens} (Compaction threshold: ~{int(args.max_tokens * 0.70)} tokens)")
+    compactor_model = args.compaction_model or args.model
+    compactor_capacity = args.compaction_max_tokens or args.max_tokens
+    compactor_output = args.compaction_output_tokens or "auto"
+    print(
+        f"Compactor:  {compactor_model} "
+        f"(context={compactor_capacity}, output={compactor_output})"
+    )
     print(f"Protocol:   {'Hermes XML (<tool_call>)' if args.xml else 'OpenAI JSON Tool Calling'}")
     print(f"Mode:       {'Stateless Benchmark' if is_stateless else ('Read-Only (No Saving)' if is_read_only else 'Normal Persistence')}")
     print("Security:   Interactive user review is active for EVERY system command.\n")
@@ -897,9 +945,12 @@ def main():
 
     agent = HermesCodingAgent(
         model=args.model,
+        compaction_model=args.compaction_model,
         base_url=args.base_url,
         api_key=args.api_key,
         max_context_tokens=args.max_tokens,
+        compaction_max_context_tokens=args.compaction_max_tokens,
+        compaction_output_tokens=args.compaction_output_tokens,
         confirm_all_terminal_commands=True,
         enable_skills=enable_skills,
         enable_memory=enable_memory,

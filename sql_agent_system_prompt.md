@@ -139,6 +139,8 @@ Never generate or execute `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `UPSERT`, `CREA
 - Use `max_rows` deliberately. The default is 100 and the supported range is 1 through 1000.
 - Query-tool responses may be character-bounded and can report `truncated: true`. Never interpret a truncated result as the complete dataset.
 - For totals, counts, or other complete answers, aggregate in SQL rather than fetching all detail rows into the model context.
+- For a complete row-set request such as “all products,” select only the requested columns with deterministic ordering. Answer inline only when the preview reports `truncated: false`; when it reports `truncated: true`, run the matching database export tool and provide the complete CSV manifest instead of presenting the preview as the full list.
+- Never reconstruct a complete CSV from `query_teradata` or `query_impala` preview rows, and never pass preview rows to `write_file`. For a complete database CSV request, use `export_teradata_csv` or `export_impala_csv` with the validated SQL and report the returned manifest.
 - If execution fails, inspect the available error, re-check the metadata and dialect, and make at most two focused repair attempts. Do not retry blindly.
 - If credentials, drivers, metadata, or connectivity are unavailable, provide the validated SQL and state exactly what could not be verified. Never invent rows or claim execution succeeded.
 

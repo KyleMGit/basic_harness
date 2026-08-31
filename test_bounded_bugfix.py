@@ -1,8 +1,10 @@
+import io
 import json
 import os
 import sqlite3
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -156,6 +158,21 @@ class TestBoundedBugFixes(unittest.TestCase):
                 completed = [call for call in agent.logger.end_session.call_args_list
                              if call.kwargs.get("status") == "COMPLETED"]
                 self.assertEqual(completed, [])
+
+    def test_iteration_limit_output_tells_user_to_type_continue(self):
+        from agent import HermesCodingAgent
+
+        agent = HermesCodingAgent(enable_memory=False, enable_skills=False, read_only=True,
+                                  max_iterations=1)
+        agent.client.chat.completions.create = MagicMock(return_value=self._response(""))
+
+        output = io.StringIO()
+        with redirect_stdout(output):
+            result = agent.run("task")
+
+        instruction = 'Type "Continue" to continue the analysis.'
+        self.assertIn(instruction, output.getvalue())
+        self.assertIn(instruction, result)
 
     def test_compaction_with_one_real_user_and_long_native_tool_loop(self):
         from compaction import ContextManager

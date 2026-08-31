@@ -119,7 +119,11 @@ def _database_query_parameters() -> Dict[str, Any]:
 
 @registry.register(
     name="query_teradata",
-    description="Run one bounded, read-only query against Teradata using environment-configured credentials.",
+    description=(
+        "Run one bounded, read-only Teradata query preview. This is not for complete CSV "
+        "output. If a complete row set is required and the preview is truncated, use "
+        "export_teradata_csv instead."
+    ),
     parameters=_database_query_parameters(),
 )
 def query_teradata(sql: str, max_rows: int = 100) -> str:
@@ -128,7 +132,11 @@ def query_teradata(sql: str, max_rows: int = 100) -> str:
 
 @registry.register(
     name="query_impala",
-    description="Run one bounded, read-only query against Hadoop Impala using environment configuration.",
+    description=(
+        "Run one bounded, read-only Hadoop Impala query preview. This is not for complete "
+        "CSV output. If a complete row set is required and the preview is truncated, use "
+        "export_impala_csv instead."
+    ),
     parameters=_database_query_parameters(),
 )
 def query_impala(sql: str, max_rows: int = 100) -> str:
@@ -171,7 +179,7 @@ def _prepare_csv_destination(file_path: str, overwrite: bool) -> tuple[str, str]
 
 @registry.register(
     name="export_teradata_csv",
-    description="Stream one read-only Teradata query directly to an atomic workspace CSV file.",
+    description="Stream one read-only Teradata query directly to a complete CSV file in the workspace.",
     parameters=_database_export_parameters(),
 )
 def export_teradata_csv(sql: str, file_path: str, batch_size: int = 1000,
@@ -182,7 +190,7 @@ def export_teradata_csv(sql: str, file_path: str, batch_size: int = 1000,
 
 @registry.register(
     name="export_impala_csv",
-    description="Stream one read-only Impala query directly to an atomic workspace CSV file.",
+    description="Stream one read-only Impala query directly to a complete CSV file in the workspace.",
     parameters=_database_export_parameters(),
 )
 def export_impala_csv(sql: str, file_path: str, batch_size: int = 1000,

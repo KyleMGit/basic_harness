@@ -57,6 +57,33 @@ class FakeConnection:
 
 
 class DatabaseToolTests(unittest.TestCase):
+    def test_agent_contract_uses_export_tools_for_complete_csvs(self):
+        from agent import HermesCodingAgent
+
+        generic_prompt = HermesCodingAgent.SYSTEM_PROMPT_TEMPLATE
+        self.assertIn("Database query tools return bounded previews", generic_prompt)
+        self.assertIn("Never reconstruct a complete CSV", generic_prompt)
+        self.assertIn("complete row-set request", generic_prompt)
+        self.assertIn("export_teradata_csv", generic_prompt)
+        self.assertIn("export_impala_csv", generic_prompt)
+
+        prompt_path = os.path.join(os.path.dirname(__file__), "sql_agent_system_prompt.md")
+        with open(prompt_path, encoding="utf-8") as handle:
+            sql_prompt = handle.read()
+        self.assertIn("Never reconstruct a complete CSV", sql_prompt)
+        self.assertIn("complete row-set request", sql_prompt)
+        self.assertIn("export_teradata_csv", sql_prompt)
+        self.assertIn("export_impala_csv", sql_prompt)
+
+        schemas = {item["function"]["name"]: item["function"] for item in registry.schemas}
+        for name in ("query_teradata", "query_impala"):
+            description = schemas[name]["description"]
+            self.assertIn("preview", description.lower())
+            self.assertIn("not for complete csv", description.lower())
+            self.assertIn("complete row set", description.lower())
+        for name in ("export_teradata_csv", "export_impala_csv"):
+            self.assertIn("complete csv", schemas[name]["description"].lower())
+
     def test_export_registry_schema_write_classification_and_dispatch(self):
         schemas = {item["function"]["name"]: item["function"] for item in registry.schemas}
         for name in ("export_teradata_csv", "export_impala_csv"):
