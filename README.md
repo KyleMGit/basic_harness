@@ -116,7 +116,7 @@ Whenever the agent proposes a system or terminal command, execution pauses for r
 | **`--stateless`** | `--benchmark` | `False` | **Benchmark Baseline**: Disables skills, memory, and disk saving (pure zero-shot). |
 | **`--no-skills`** | | `False` | Completely disables skill catalog and skill retrieval. |
 | **`--no-memory`** | | `False` | Completely disables USER.md and MEMORY.md injection. |
-| **`--auto-skills`** | | `False` | Opts in to a visible post-task skill reflection provider call (extra latency/tokens). Existing procedures are not autonomously overwritten. |
+| **`--auto-skills`** | | `False` | Opts in to a visible post-task skill reflection provider call (extra latency/tokens). Once enabled, safe CREATE and UPDATE proposals are applied automatically, including deduplicated CREATE proposals rerouted to an existing skill. |
 | **`--auto-memory`** | | `False` | Opts in to a visible post-task memory reflection provider call (extra latency/tokens). |
 | **`--no-auto-skills`**| | `False` | Compatibility alias that disables `--auto-skills`. |
 | **`--no-auto-memory`**| | `False` | Compatibility alias that disables `--auto-memory`. |

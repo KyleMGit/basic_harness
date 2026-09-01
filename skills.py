@@ -473,8 +473,6 @@ Respond ONLY with a JSON object in this format:
                             action = "UPDATE"
                             break
 
-                if action == "UPDATE" and self.skill_store.resolve_skill_file(name):
-                    return {"action": "SKIP", "name": name, "description": "Existing skill retained; autonomous replacement requires review."}
                 save_status = self.skill_store.save_skill(name, desc, instr)
                 if "successfully saved" not in str(save_status).lower():
                     return {

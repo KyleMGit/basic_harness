@@ -156,13 +156,13 @@ class TestHermesAgentComponents(unittest.TestCase):
         )
 
         self.assertIsNotNone(result)
-        self.assertEqual(result["action"], "SKIP")
+        self.assertEqual(result["action"], "UPDATE")
         self.assertEqual(result["name"], "setup_pytest_env")
         
         # Verify only 1 skill file exists (no duplicates)
         all_skills = store.get_all_skills()
         self.assertEqual(len(all_skills), 1)
-        self.assertNotIn("pytest-cov", all_skills[0]["instructions"])
+        self.assertIn("pytest-cov", all_skills[0]["instructions"])
 
         # Case B: LLM action NONE (trivial / duplicate)
         mock_resp.choices = [MagicMock(message=MagicMock(content=json.dumps({"action": "NONE"})))]

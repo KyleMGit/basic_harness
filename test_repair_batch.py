@@ -526,7 +526,7 @@ class TestSliceELearningSafety(unittest.TestCase):
                 return
             self.assertNotIn("outside", store.load_skill("linked"))
 
-    def test_auto_learning_defaults_off_and_existing_skill_is_not_overwritten(self):
+    def test_auto_learning_defaults_off_but_enabled_update_replaces_existing_skill(self):
         from agent import HermesCodingAgent
         from skills import SkillStore, AutoSkillExtractor
         agent = HermesCodingAgent(read_only=True)
@@ -537,7 +537,40 @@ class TestSliceELearningSafety(unittest.TestCase):
             response = MagicMock(); response.choices = [MagicMock(message=MagicMock(content='{"action":"UPDATE","target_skill_name":"existing","description":"d","instructions":"replacement"}'))]
             client = MagicMock(); client.chat.completions.create.return_value = response
             result = extractor.extract_and_save(client, "m", [{"role":"system","content":"s"},{"role":"user","content":"u"},{"role":"assistant","content":"a"},{"role":"user","content":"u2"}], "task")
-            self.assertIn(result.get("action"), ("SKIP", "PROPOSE"))
+            self.assertEqual(result.get("action"), "UPDATE")
+            loaded = store.load_skill("existing")
+            self.assertIn("replacement", loaded)
+            self.assertNotIn("original procedure", loaded)
+
+    def test_auto_update_reports_real_atomic_persistence_failure_and_retains_existing_skill(self):
+        from skills import SkillStore, AutoSkillExtractor
+        messages = [{"role":"system","content":"s"}, {"role":"user","content":"u"},
+                    {"role":"assistant","content":"a"}, {"role":"user","content":"u2"}]
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SkillStore(tmp); store.save_skill("existing", "desc", "original procedure")
+            original_md = Path(tmp, "existing.md").read_bytes()
+            original_json = Path(tmp, "existing.json").read_bytes()
+            extractor = AutoSkillExtractor(store)
+            response = MagicMock(); response.choices = [MagicMock(message=MagicMock(content=__import__("json").dumps({
+                "action":"UPDATE", "target_skill_name":"existing", "description":"updated",
+                "instructions":"replacement"}))) ]
+            client = MagicMock(); client.chat.completions.create.return_value = response
+            real_replace = os.replace
+            replace_calls = 0
+
+            def fail_second_replace(source, destination):
+                nonlocal replace_calls
+                replace_calls += 1
+                if replace_calls == 2:
+                    raise OSError("disk full")
+                return real_replace(source, destination)
+
+            with patch("skills.os.replace", side_effect=fail_second_replace):
+                result = extractor.extract_and_save(client, "m", messages, "task")
+            self.assertEqual(result.get("action"), "ERROR")
+            self.assertIn("disk full", result.get("description", ""))
+            self.assertEqual(Path(tmp, "existing.md").read_bytes(), original_md)
+            self.assertEqual(Path(tmp, "existing.json").read_bytes(), original_json)
             self.assertIn("original procedure", store.load_skill("existing"))
 
     def test_auto_create_reports_screening_and_persistence_failure(self):
