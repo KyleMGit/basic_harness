@@ -174,6 +174,37 @@ class TestHermesAgentComponents(unittest.TestCase):
         )
         self.assertIsNone(result_none)
 
+    def test_auto_skill_reflection_has_finite_json_completion_contract_without_timeout(self):
+        skill_dir = os.path.join(self.test_dir, "skills_completion_contract")
+        extractor = AutoSkillExtractor(skill_store=SkillStore(storage_dir=skill_dir))
+        messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "build it"},
+            {"role": "assistant", "content": "working"},
+            {"role": "assistant", "content": "done"},
+        ]
+        mock_client = MagicMock()
+        mock_response = MagicMock()
+        mock_response.choices = [
+            MagicMock(message=MagicMock(content=json.dumps({"action": "NONE"})))
+        ]
+        mock_client.chat.completions.create.return_value = mock_response
+
+        result = extractor.extract_and_save(
+            client=mock_client,
+            model="Qwen-32b",
+            messages=messages,
+            task_summary="Build a reusable feature",
+        )
+
+        self.assertIsNone(result)
+        request = mock_client.chat.completions.create.call_args.kwargs
+        self.assertEqual(
+            request["max_tokens"], AutoSkillExtractor.MAX_REFLECTION_OUTPUT_TOKENS
+        )
+        self.assertEqual(request["response_format"], {"type": "json_object"})
+        self.assertNotIn("timeout", request)
+
     def test_hermes_xml_protocol_parsing(self):
         sample_model_response = """
 I will check the files in the directory.

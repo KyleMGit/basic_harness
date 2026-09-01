@@ -365,6 +365,9 @@ class AutoSkillExtractor:
     3. Synthesize novel skills into standard Markdown & JSON.
     """
 
+    # Finite output budget for the post-task JSON reflection response.
+    MAX_REFLECTION_OUTPUT_TOKENS = 2048
+
     REFLECTION_PROMPT = """You are an autonomous AI Skill Curator and Synthesis Engine.
 Review the completed conversation trajectory against the existing library of skills.
 
@@ -442,6 +445,8 @@ Respond ONLY with a JSON object in this format:
                     {"role": "user", "content": f"Evaluate and curate skills for this session:\n\n{transcript_text}"}
                 ],
                 temperature=0.1,
+                max_tokens=self.MAX_REFLECTION_OUTPUT_TOKENS,
+                response_format={"type": "json_object"},
             )
 
             raw_resp = response.choices[0].message.content or ""
