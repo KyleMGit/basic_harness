@@ -436,9 +436,14 @@ Below is the catalog of learned project skills. When a task relates to any avail
             print(f"\n[Memory Evolution] Project fact recorded in MEMORY.md: {result['project_updated']}")
             refreshed = True
 
+        errors = [result.get("user_error"), result.get("project_error")]
+        errors = [error for error in errors if error]
+        for error in errors:
+            print(f"\n[Memory Reflection Error] {error}")
+
         if refreshed:
             self.refresh_system_prompt()
-        else:
+        elif not errors:
             print("[Memory Reflection] No safe durable updates applied.")
 
     def run_auto_skill_synthesis(self, task_summary: str):
