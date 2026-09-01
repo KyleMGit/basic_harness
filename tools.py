@@ -647,30 +647,18 @@ def read_user_profile() -> str:
         "properties": {
             "category": {
                 "type": "string",
-                "description": "Single-line category heading in USER.md (e.g. 'Communication Preferences', 'Technical Preferences & Conventions', 'Operational Constraints & Safety'); CR/LF are rejected."
+                "description": "Category heading in USER.md (e.g. 'Communication Preferences', 'Technical Preferences & Conventions', 'Operational Constraints & Safety')."
             },
             "preference": {
                 "type": "string",
-                "description": "Single-line new preference text (no CR/LF). Required and non-empty for ADD and REPLACE; pass an empty string for REMOVE."
-            },
-            "action": {
-                "type": "string", "enum": ["ADD", "REPLACE", "REMOVE"], "default": "ADD",
-                "description": "ADD appends/deduplicates; REPLACE corrects exactly one existing bullet; REMOVE retracts exactly one existing bullet."
-            },
-            "old_text": {
-                "type": "string",
-                "description": "Required only for REPLACE or REMOVE: single-line exact existing bullet text (no CR/LF) in the named category, case-insensitive after bullet normalization. Omit for ADD."
+                "description": "The specific user preference, background detail, or rule to record."
             }
         },
         "required": ["category", "preference"]
     }
 )
-def update_user_profile(
-    category: str, preference: str, action: str = "ADD", old_text: Optional[str] = None
-) -> str:
-    return user_profile_manager.update_preference(
-        category=category, note=preference, action=action, old_text=old_text
-    )
+def update_user_profile(category: str, preference: str) -> str:
+    return user_profile_manager.update_preference(category=category, note=preference)
 
 
 @registry.register(
@@ -690,27 +678,15 @@ def read_project_memory() -> str:
         "properties": {
             "category": {
                 "type": "string",
-                "description": "Single-line category heading in MEMORY.md (e.g. 'Codebase Architecture & Tech Stack', 'Environment & Configuration', 'Key Patterns & Conventions', 'Known Gotchas & Resolved Issues'); CR/LF are rejected."
+                "description": "Category heading in MEMORY.md (e.g. 'Codebase Architecture & Tech Stack', 'Environment & Configuration', 'Key Patterns & Conventions', 'Known Gotchas & Resolved Issues')."
             },
             "fact": {
                 "type": "string",
-                "description": "Single-line new fact text (no CR/LF). Required and non-empty for ADD and REPLACE; pass an empty string for REMOVE."
-            },
-            "action": {
-                "type": "string", "enum": ["ADD", "REPLACE", "REMOVE"], "default": "ADD",
-                "description": "ADD appends/deduplicates; REPLACE corrects exactly one existing bullet; REMOVE retracts exactly one existing bullet."
-            },
-            "old_text": {
-                "type": "string",
-                "description": "Required only for REPLACE or REMOVE: single-line exact existing bullet text (no CR/LF) in the named category, case-insensitive after bullet normalization. Omit for ADD."
+                "description": "The specific technical fact, architectural note, or convention to record."
             }
         },
         "required": ["category", "fact"]
     }
 )
-def update_project_memory(
-    category: str, fact: str, action: str = "ADD", old_text: Optional[str] = None
-) -> str:
-    return project_memory_manager.update_fact(
-        category=category, fact=fact, action=action, old_text=old_text
-    )
+def update_project_memory(category: str, fact: str) -> str:
+    return project_memory_manager.update_fact(category=category, fact=fact)

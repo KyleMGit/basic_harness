@@ -9,156 +9,8 @@ Hermes-inspired Persistent Memory System:
 import json
 import os
 import re
-import tempfile
 from typing import Any, Dict, List, Optional, Tuple
 from safety import screen_prompt_content
-
-
-def _normalized_bullet(text: str) -> str:
-    """Normalize one Markdown bullet for exact, case-insensitive comparison."""
-    value = str(text or "").strip()
-    value = re.sub(r"^[-*+]\s*", "", value)
-    return re.sub(r"\s+", " ", value).strip().casefold()
-
-
-def _single_line_input_error(
-    category: str,
-    new_text: str,
-    action: str,
-    old_text: Optional[str],
-    target_name: str,
-) -> Optional[str]:
-    """Reject operation fields that could alter Markdown structure."""
-    operation = str(action or "ADD").strip().upper()
-    fields = [("category", category)]
-    if operation in {"ADD", "REPLACE"}:
-        fields.append((target_name, new_text))
-    if operation in {"REPLACE", "REMOVE"}:
-        fields.append(("old_text", old_text))
-    for field_name, value in fields:
-        if "\r" in str(value or "") or "\n" in str(value or ""):
-            return (
-                f"Error: {field_name} must be single-line (no CR or LF); "
-                "existing content was not modified."
-            )
-    return None
-
-
-def _apply_bullet_operation(
-    current: str,
-    category: str,
-    new_text: str,
-    action: str,
-    old_text: Optional[str],
-    target_name: str,
-) -> Tuple[Optional[str], Optional[str], bool]:
-    """Build an updated document without writing it."""
-    operation = str(action or "ADD").strip().upper()
-    if operation not in {"ADD", "REPLACE", "REMOVE"}:
-        return None, "Error: action must be ADD, REPLACE, or REMOVE; existing content was not modified.", False
-
-    category = str(category or "").strip()
-    new_text = str(new_text or "").strip()
-    old_text = None if old_text is None else str(old_text).strip()
-    if not category:
-        return None, "Error: category must be non-empty; existing content was not modified.", False
-    if operation in {"ADD", "REPLACE"} and not _normalized_bullet(new_text):
-        return None, f"Error: {operation} requires a non-empty new {target_name}; existing content was not modified.", False
-    if operation in {"REPLACE", "REMOVE"} and not _normalized_bullet(old_text or ""):
-        return None, f"Error: {operation} requires old_text; existing content was not modified.", False
-
-    category_pattern = re.compile(
-        rf"(?im)^##\s+{re.escape(category)}\s*$.*?(?=^##\s+|\Z)", re.DOTALL
-    )
-    sections = list(category_pattern.finditer(current))
-    clean_new = f"- {_normalized_display_bullet(new_text)}"
-
-    if operation == "ADD":
-        if len(sections) > 1:
-            return None, f"Error: multiple category headers match '{category}'; existing content was not modified.", False
-        if sections:
-            section = sections[0]
-            existing = [
-                _normalized_bullet(match.group(0))
-                for match in re.finditer(r"(?m)^[ \t]*[-*+]\s+.*$", section.group(0))
-            ]
-            if _normalized_bullet(new_text) in existing:
-                return current, None, False
-            section_text = section.group(0)
-            trailing_newlines = re.search(r"\n+$", section_text)
-            separator = trailing_newlines.group(0) if trailing_newlines else ""
-            body = section_text[:-len(separator)] if separator else section_text
-            if section.end() < len(current) and len(separator) < 2:
-                separator = "\n\n"
-            elif section.end() == len(current):
-                separator = "\n"
-            updated_section = body.rstrip() + "\n" + clean_new + separator
-            return current[:section.start()] + updated_section + current[section.end():], None, True
-        return f"{current.rstrip()}\n\n## {category}\n{clean_new}", None, True
-
-    wanted = _normalized_bullet(old_text or "")
-    matches = []
-    for section in sections:
-        for bullet in re.finditer(r"(?m)^[ \t]*[-*+]\s+.*(?:\n|$)", section.group(0)):
-            if _normalized_bullet(bullet.group(0)) == wanted:
-                matches.append((section.start() + bullet.start(), section.start() + bullet.end()))
-    if not matches:
-        return None, f"Error: no matching bullet for old_text in category '{category}'; existing content was not modified.", False
-    if len(matches) != 1:
-        return None, f"Error: multiple matching bullets for old_text in category '{category}'; existing content was not modified.", False
-
-    start, end = matches[0]
-    if operation == "REPLACE":
-        normalized_new = _normalized_bullet(new_text)
-        for section in sections:
-            for bullet in re.finditer(r"(?m)^[ \t]*[-*+]\s+.*(?:\n|$)", section.group(0)):
-                bullet_start = section.start() + bullet.start()
-                bullet_end = section.start() + bullet.end()
-                if (bullet_start, bullet_end) != (start, end) and _normalized_bullet(bullet.group(0)) == normalized_new:
-                    return None, (
-                        f"Error: the replacement {target_name} already exists elsewhere in "
-                        f"category '{category}'; existing content was not modified."
-                    ), False
-    replacement = clean_new + "\n" if operation == "REPLACE" else ""
-    return current[:start] + replacement + current[end:], None, True
-
-
-def _normalized_display_bullet(text: str) -> str:
-    value = str(text or "").strip()
-    return re.sub(r"^[-*+]\s*", "", value).strip()
-
-
-def _atomic_save(file_path: str, content: str, label: str) -> Optional[str]:
-    """Publish UTF-8 text atomically from a same-directory temporary file."""
-    directory = os.path.dirname(file_path) or "."
-    temp_path = None
-    try:
-        newline = "\n"
-        if os.path.exists(file_path):
-            with open(file_path, "rb") as existing:
-                if b"\r\n" in existing.read():
-                    newline = "\r\n"
-        content = content.replace("\r\n", "\n").replace("\r", "\n").replace("\n", newline)
-        os.makedirs(directory, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", newline="", dir=directory,
-            prefix=f".{os.path.basename(file_path)}.", suffix=".tmp", delete=False,
-        ) as handle:
-            temp_path = handle.name
-            handle.write(content + newline)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temp_path, file_path)
-        temp_path = None
-        return None
-    except Exception as exc:
-        return f"Error saving {label}; existing content was not modified: {exc}"
-    finally:
-        if temp_path:
-            try:
-                os.unlink(temp_path)
-            except OSError:
-                pass
 
 
 class UserProfileManager:
@@ -257,30 +109,41 @@ class UserProfileManager:
                 "budget; existing content was not modified."
             )
 
-        error = _atomic_save(self.file_path, content, "USER.md")
-        return error or f"Successfully updated USER.md ({len(content)} chars)."
+        try:
+            os.makedirs(os.path.dirname(self.file_path) or ".", exist_ok=True)
+            with open(self.file_path, "w", encoding="utf-8") as f:
+                f.write(content + "\n")
+            return f"Successfully updated USER.md ({len(content)} chars)."
+        except Exception as e:
+            return f"Error saving USER.md: {str(e)}"
 
-    def update_preference(
-        self, category: str, note: str, action: str = "ADD", old_text: Optional[str] = None
-    ) -> str:
-        """Apply an ADD, REPLACE, or REMOVE preference operation to USER.md."""
-        line_error = _single_line_input_error(category, note, action, old_text, "preference")
-        if line_error:
-            return line_error
-        safe, status = screen_prompt_content(f"{category}\n{note}\n{action}\n{old_text or ''}")
+    def update_preference(self, category: str, note: str) -> str:
+        """Append or update a specific preference under a category section in USER.md."""
+        safe, status = screen_prompt_content(f"{category}\n{note}")
         if not safe:
             return status
         current, load_error = self._load_profile_for_update()
         if load_error:
             return load_error
-        new_content, error, changed = _apply_bullet_operation(
-            current, category, note, action, old_text, "preference"
-        )
-        if error:
-            return error
-        if not changed:
-            return "Preference already recorded in USER.md."
-        return self.save_profile(new_content or "")
+        category_header = f"## {category}"
+
+        clean_note = note.strip()
+        if not clean_note.startswith("-"):
+            clean_note = f"- {clean_note}"
+
+        if category_header.lower() in current.lower():
+            pattern = re.compile(rf"({re.escape(category_header)}.*?)(\n##|\Z)", re.IGNORECASE | re.DOTALL)
+            match = pattern.search(current)
+            if match:
+                section_body = match.group(1).rstrip()
+                if clean_note.lower() not in section_body.lower():
+                    updated_section = f"{section_body}\n{clean_note}\n"
+                    new_content = current[:match.start()] + updated_section + current[match.end(1):]
+                    return self.save_profile(new_content)
+                return "Preference already recorded in USER.md."
+        
+        new_content = f"{current}\n\n## {category}\n{clean_note}"
+        return self.save_profile(new_content)
 
     def format_system_prompt_block(self) -> str:
         """Format USER.md into the standard Hermes frozen snapshot XML block."""
@@ -384,30 +247,41 @@ class ProjectMemoryManager:
                 "budget; existing content was not modified."
             )
 
-        error = _atomic_save(self.file_path, content, "MEMORY.md")
-        return error or f"Successfully updated MEMORY.md ({len(content)} chars)."
+        try:
+            os.makedirs(os.path.dirname(self.file_path) or ".", exist_ok=True)
+            with open(self.file_path, "w", encoding="utf-8") as f:
+                f.write(content + "\n")
+            return f"Successfully updated MEMORY.md ({len(content)} chars)."
+        except Exception as e:
+            return f"Error saving MEMORY.md: {str(e)}"
 
-    def update_fact(
-        self, category: str, fact: str, action: str = "ADD", old_text: Optional[str] = None
-    ) -> str:
-        """Apply an ADD, REPLACE, or REMOVE fact operation to MEMORY.md."""
-        line_error = _single_line_input_error(category, fact, action, old_text, "fact")
-        if line_error:
-            return line_error
-        safe, status = screen_prompt_content(f"{category}\n{fact}\n{action}\n{old_text or ''}")
+    def update_fact(self, category: str, fact: str) -> str:
+        """Append or update a specific fact under a category section in MEMORY.md."""
+        safe, status = screen_prompt_content(f"{category}\n{fact}")
         if not safe:
             return status
         current, load_error = self._load_memory_for_update()
         if load_error:
             return load_error
-        new_content, error, changed = _apply_bullet_operation(
-            current, category, fact, action, old_text, "fact"
-        )
-        if error:
-            return error
-        if not changed:
-            return "Fact already recorded in MEMORY.md."
-        return self.save_memory(new_content or "")
+        category_header = f"## {category}"
+
+        clean_fact = fact.strip()
+        if not clean_fact.startswith("-"):
+            clean_fact = f"- {clean_fact}"
+
+        if category_header.lower() in current.lower():
+            pattern = re.compile(rf"({re.escape(category_header)}.*?)(\n##|\Z)", re.IGNORECASE | re.DOTALL)
+            match = pattern.search(current)
+            if match:
+                section_body = match.group(1).rstrip()
+                if clean_fact.lower() not in section_body.lower():
+                    updated_section = f"{section_body}\n{clean_fact}\n"
+                    new_content = current[:match.start()] + updated_section + current[match.end(1):]
+                    return self.save_memory(new_content)
+                return "Fact already recorded in MEMORY.md."
+        
+        new_content = f"{current}\n\n## {category}\n{clean_fact}"
+        return self.save_memory(new_content)
 
     def format_system_prompt_block(self) -> str:
         """Format MEMORY.md into the standard Hermes frozen snapshot XML block."""
@@ -447,24 +321,15 @@ Review the conversation turns to determine if any durable user preferences, work
 3. **DEDUPLICATION**:
    - If a preference or fact is ALREADY present in the current profile or memory, do NOT duplicate it. Set to null.
 
-4. **OPERATIONS**:
-   - Use ADD for a new durable bullet.
-   - Use REPLACE for a direct correction of one existing bullet and include old_text exactly identifying it.
-   - Use REMOVE for a retraction of one existing bullet and include old_text; omit or leave the new value empty.
-
 Respond ONLY with a JSON object in this format:
 {
   "user_profile_update": {
-    "action": "ADD" | "REPLACE" | "REMOVE",
     "category": "Communication Preferences" | "Technical Preferences & Conventions" | "Operational Constraints & Safety" | "Role & Background",
-    "preference": "New concise bullet; required for ADD/REPLACE and empty for REMOVE.",
-    "old_text": "Exact existing bullet required for REPLACE/REMOVE; omit for ADD."
+    "preference": "Specific concise bullet point to record."
   } | null,
   "project_memory_update": {
-    "action": "ADD" | "REPLACE" | "REMOVE",
     "category": "Codebase Architecture & Tech Stack" | "Environment & Configuration" | "Key Patterns & Conventions" | "Known Gotchas & Resolved Issues",
-    "fact": "New concise bullet; required for ADD/REPLACE and empty for REMOVE.",
-    "old_text": "Exact existing bullet required for REPLACE/REMOVE; omit for ADD."
+    "fact": "Specific concise bullet point to record."
   } | null
 }
 """
@@ -523,49 +388,35 @@ Respond ONLY with a JSON object in this format:
             # Extract JSON block
             json_match = re.search(r"\{.*\}", raw_text, re.DOTALL)
             if not json_match:
-                return {"user_updated": None, "project_updated": None, "user_error": None, "project_error": None}
+                return {"user_updated": None, "project_updated": None}
 
             data = json.loads(json_match.group(0))
-            applied = {
-                "user_updated": None, "project_updated": None,
-                "user_error": None, "project_error": None,
-            }
+            applied = {"user_updated": None, "project_updated": None}
 
             # 1. Process USER.md update
             user_update = data.get("user_profile_update")
             if user_update and isinstance(user_update, dict):
                 cat = user_update.get("category")
-                pref = user_update.get("preference", "")
-                action = user_update.get("action") or "ADD"
-                old_text = user_update.get("old_text")
-                if cat:
-                    res = self.user_manager.update_preference(cat, pref, action=action, old_text=old_text)
+                pref = user_update.get("preference")
+                if cat and pref:
+                    res = self.user_manager.update_preference(cat, pref)
                     if "Successfully updated" in res:
-                        applied["user_updated"] = f"[{action.upper()}] [{cat}] {pref or old_text}"
-                    elif "already recorded" not in res:
-                        applied["user_error"] = res
+                        applied["user_updated"] = f"[{cat}] {pref}"
 
             # 2. Process MEMORY.md update
             proj_update = data.get("project_memory_update")
             if proj_update and isinstance(proj_update, dict):
                 cat = proj_update.get("category")
-                fact = proj_update.get("fact", "")
-                action = proj_update.get("action") or "ADD"
-                old_text = proj_update.get("old_text")
-                if cat:
-                    res = self.project_manager.update_fact(cat, fact, action=action, old_text=old_text)
+                fact = proj_update.get("fact")
+                if cat and fact:
+                    res = self.project_manager.update_fact(cat, fact)
                     if "Successfully updated" in res:
-                        applied["project_updated"] = f"[{action.upper()}] [{cat}] {fact or old_text}"
-                    elif "already recorded" not in res:
-                        applied["project_error"] = res
+                        applied["project_updated"] = f"[{cat}] {fact}"
 
             return applied
 
-        except Exception as exc:
-            return {
-                "user_updated": None, "project_updated": None,
-                "user_error": f"Memory reflection failed: {exc}", "project_error": None,
-            }
+        except Exception:
+            return {"user_updated": None, "project_updated": None}
 
 
 # Shared singleton instances

@@ -23,8 +23,6 @@ An open-source, terminal-native Python agent harness optimized for local models 
    - `USER.md`: Stores operator profile, communication style, technical background, and safety constraints (`<user_profile>`).
    - `MEMORY.md`: Stores project architecture facts, tech stack details, and environment conventions (`<project_memory>`).
    - Tools: `read_user_profile`, `update_user_profile`, `read_project_memory`, `update_project_memory`.
-   - Updates are host-enforced, single-line operations: `category`, new preference/fact values, and `old_text` cannot contain CR/LF. `ADD` records a new deduplicated bullet, `REPLACE` applies a direct correction without duplicating a sibling bullet, and `REMOVE` applies a retraction. Corrections/retractions require `old_text` to match exactly one normalized bullet in the named category; invalid input, no match, ambiguity, or a duplicate replacement leaves the file unchanged.
-   - Every update screens both inputs and the complete result, enforces the document character budget, and publishes through a same-directory temporary file plus atomic `os.replace`. Validation, loading, or publication failures preserve the original bytes and clean temporary files.
 3. **Session Resumption & Trajectory Continuity ([`storage.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/storage.py))**:
    - Pick up past sessions directly via `--resume <session_id>` or interactive `/resume <session_id>`.
    - View past session logs, dates, and step counts with `/sessions`.
@@ -144,9 +142,9 @@ Whenever the agent proposes a system or terminal command, execution pauses for r
 | **`load_skill` / `<skill_name>()`** | `name` | Reads instructions and workflow details for any learned project skill. |
 | **`save_skill`** | `name`, `description`, `instructions` | Saves a newly discovered procedural workflow to `.agent_skills/`. |
 | **`read_user_profile`** | *(none)* | Reads operator profile from `USER.md`. |
-| **`update_user_profile`** | `category`, `preference`, optional `action`, `old_text` | Applies single-line `ADD` (default), `REPLACE`, or `REMOVE` operations to preferences in `USER.md`; `old_text` is required for corrections/retractions. |
+| **`update_user_profile`** | `category`, `preference` | Appends or updates preferences in `USER.md`. |
 | **`read_project_memory`** | *(none)* | Reads project architecture facts from `MEMORY.md`. |
-| **`update_project_memory`** | `category`, `fact`, optional `action`, `old_text` | Applies single-line `ADD` (default), `REPLACE`, or `REMOVE` operations to facts in `MEMORY.md`; `old_text` is required for corrections/retractions. |
+| **`update_project_memory`** | `category`, `fact` | Appends or updates technical facts in `MEMORY.md`. |
 
 ### Optional database query drivers
 
