@@ -68,6 +68,15 @@ python agent.py --model qwen2.5:32b
 python agent.py --model Qwen-32b --resume <session_id>
 ```
 
+### Progress Display
+```bash
+# Concise tool-derived progress (default; model thoughts are not printed).
+python agent.py --progress concise
+
+# Preserve the full thought display on tool-calling iterations.
+python agent.py --progress verbose
+```
+
 ### 4. Named Profiles with an Independent Workspace
 ```bash
 # Omit --workspace for separate, automatically created profile workspaces.
@@ -78,35 +87,43 @@ python agent.py --profile bob
 python agent.py --profile alice --workspace C:\src\shared-project
 python agent.py --profile bob --workspace C:\src\shared-project
 
-# Store named profiles somewhere else.
-python agent.py --profile alice --profiles-dir D:\agent-state --workspace C:\src\shared-project
+# Store named profile state and default workspaces in independent roots.
+python agent.py --profile alice --profiles-dir D:\agent-state --workspaces-dir D:\agent-work
 ```
 
-Named profiles live under `.agent_profiles/<name>/` beside `agent.py` by default.
-Each contains `.agent_memories/USER.md`, `.agent_memories/MEMORY.md`,
-`.agent_skills/`, `.agent_history.db`, and an automatically created `workspace/`:
+Named profile state lives under `.agent_profiles/<name>/` beside `agent.py` by
+default. Default workspaces are independent sibling-root entries under
+`.agent_workspaces/<name>/`:
 
 ```text
 .agent_profiles/
 ├── alice/
-│   ├── .agent_memories/
-│   ├── .agent_skills/
-│   ├── .agent_history.db
-│   └── workspace/
+│   ├── memories/
+│   │   ├── USER.md
+│   │   └── MEMORY.md
+│   ├── skills/
+│   └── history.db
 └── bob/
-    └── workspace/
+    └── ...
+
+.agent_workspaces/
+├── alice/
+└── bob/
 ```
 
-Profile names are 1-64 letters, digits, hyphens, or underscores. An explicit
+Profile names are 1-64 letters, digits, hyphens, or underscores.
+`--profiles-dir` and `--workspaces-dir` are independent roots. An explicit
 `--workspace` overrides the profile default for terminal/file-tool confinement
-and must name an already-existing directory; it is not created automatically.
+and must name an already-existing directory; the override is not created and
+does not create an unused default profile workspace.
 
 Without `--profile`, legacy behavior is unchanged: persistence remains in the
 process launch directory (`.agent_memories`, `.agent_skills`, and
 `.agent_history.db`) and the launch directory is also the default workspace.
 Read-only/stateless startup never creates a named profile and fails clearly if
 the selected named profile does not already exist. When `--workspace` is omitted
-in those modes, the profile's existing `workspace/` must also already exist.
+in those modes, the profile's existing `<workspaces-dir>/<name>` directory must
+also already exist.
 
 ---
 
@@ -117,10 +134,10 @@ in those modes, the profile's existing `workspace/` must also already exist.
 | **`/mode`** | | Shows current testing mode or switches mode: `/mode [normal \| read-only \| stateless]`. |
 | **`/context`** | `context` | Displays a visual progress bar, total token usage, compaction headroom, and breakdown (System Prompt vs. History vs. Checkpoints). |
 | **`/compact`** | `compact` | Forces an immediate 2-phase context checkpoint compaction without waiting for the 70% threshold. |
-| **`/user`** | `/profile`, `user` | Displays the active operator profile and preferences contract ([`USER.md`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/.agent_memories/USER.md)). |
-| **`/memory`** | `memory` | Displays the persistent project architecture and environment facts ([`MEMORY.md`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/.agent_memories/MEMORY.md)). |
-| **`/skills`** | `skills` | Lists all learned procedures and recipes stored in the repository ([`.agent_skills/`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/.agent_skills)). |
-| **`/sessions`** | `sessions` | Displays past recorded sessions from [`.agent_history.db`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/.agent_history.db) with dates, status, and turn counts. |
+| **`/user`** | `/profile`, `user` | Displays the active operator profile and preferences contract (`memories/USER.md` for named profiles; `.agent_memories/USER.md` in legacy mode). |
+| **`/memory`** | `memory` | Displays persistent project facts (`memories/MEMORY.md` for named profiles; `.agent_memories/MEMORY.md` in legacy mode). |
+| **`/skills`** | `skills` | Lists the active profile's learned procedures (`skills/` for named profiles; `.agent_skills/` in legacy mode). |
+| **`/sessions`** | `sessions` | Displays sessions from the active history database (`history.db` for named profiles; `.agent_history.db` in legacy mode). |
 | **`/resume <id>`** | `resume <id>` | Switches to and resumes a past conversation session by its ID. |
 | **`export-trajectory [file.jsonl]`** | | Exports the current session trajectory to a JSONL dataset file. |
 | **`exit`** | `quit` | Saves the active trajectory and gracefully exits the harness. |
@@ -149,12 +166,13 @@ Whenever the agent proposes a system or terminal command, execution pauses for r
 | **`--api-key`** | `-k` | `local` | API Key (optional for local models). |
 | **`--profile <name>`** | | `None` (legacy mode) | Select an isolated named persistence profile. |
 | **`--profiles-dir <path>`** | | `.agent_profiles` beside `agent.py` | Root containing named profile state; independent of the workspace. |
-| **`--workspace <path>`** | | Profile `workspace/`; launch directory in legacy mode | Override with an existing directory used as the canonical terminal/file-tool workspace. |
+| **`--workspaces-dir <path>`** | | `.agent_workspaces` beside `agent.py` | Independent root containing named profiles' default workspaces. |
+| **`--workspace <path>`** | | `<workspaces-dir>/<profile>`; launch directory in legacy mode | Override with an existing directory used as the canonical terminal/file-tool workspace. |
 | **`--max-tokens`** | | `40960` | Max context token capacity (compaction triggers at 70% $\approx$ 28,672 tokens). |
 | **`--compaction-model`** | | Primary model | Optional model used only for checkpoint generation (`AGENT_COMPACTION_MODEL`). |
 | **`--compaction-max-tokens`** | | Primary context | Compactor context capacity (`AGENT_COMPACTION_MAX_TOKENS`). Every compactor request is preflighted against it. |
 | **`--compaction-output-tokens`** | | Automatic | Explicit checkpoint output reservation (`AGENT_COMPACTION_OUTPUT_TOKENS`); must be smaller than the compactor context. |
-| **`--resume <id>`** | | `None` | Session ID to resume from `.agent_history.db` on startup. |
+| **`--resume <id>`** | | `None` | Session ID to resume from the active profile's history database (`history.db` for named profiles; `.agent_history.db` in legacy mode). |
 | **`--read-only`** | `--freeze` | `False` | **Testing Mode**: Existing memories/skills are readable, but zero writes/saves to disk. |
 | **`--stateless`** | `--benchmark` | `False` | **Benchmark Baseline**: Disables skills, memory, and disk saving (pure zero-shot). |
 | **`--no-skills`** | | `False` | Completely disables skill catalog and skill retrieval. |
@@ -164,6 +182,7 @@ Whenever the agent proposes a system or terminal command, execution pauses for r
 | **`--no-auto-skills`**| | `False` | Compatibility alias that disables `--auto-skills`. |
 | **`--no-auto-memory`**| | `False` | Compatibility alias that disables `--auto-memory`. |
 | **`--xml`** | | `False` | Switches from OpenAI JSON tool calling to Hermes XML `<tool_call>` syntax. |
+| **`--progress`** | | `concise` | Selects concise tool-derived progress or the existing verbose thought display (`concise` or `verbose`). |
 
 ---
 

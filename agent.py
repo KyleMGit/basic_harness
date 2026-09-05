@@ -47,6 +47,7 @@ READ_THIS_MAX_CHARS = 20_000
 READ_THIS_START_MARKER = "<!-- READ_THIS.md:START -->"
 READ_THIS_END_MARKER = "<!-- READ_THIS.md:END -->"
 DEFAULT_PROFILES_DIR = Path(__file__).resolve().parent / ".agent_profiles"
+DEFAULT_WORKSPACES_DIR = Path(__file__).resolve().parent / ".agent_workspaces"
 ACTIVE_HISTORY_DB: Optional[str] = None
 
 
@@ -73,9 +74,9 @@ def configure_runtime(args: argparse.Namespace) -> RuntimeConfig:
         if legacy or args.workspace_explicit:
             raise ValueError(f"Workspace does not exist or is not a directory: {workspace}")
 
-    memory_dir = state_root / ".agent_memories"
-    skills_dir = state_root / ".agent_skills"
-    history_db = state_root / ".agent_history.db"
+    memory_dir = state_root / (".agent_memories" if legacy else "memories")
+    skills_dir = state_root / (".agent_skills" if legacy else "skills")
+    history_db = state_root / (".agent_history.db" if legacy else "history.db")
     user_profile_manager.storage_dir = str(memory_dir)
     user_profile_manager.file_path = str(memory_dir / "USER.md")
     user_profile_manager.allow_root_fallback = legacy
@@ -213,6 +214,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
         read_only: bool = False,
         stateless: bool = False,
         use_hermes_xml_protocol: bool = False,
+        progress_mode: str = "concise",
     ):
         self.model = model or "Qwen-32b"
         self.compaction_model = compaction_model or self.model
@@ -227,6 +229,10 @@ Below is the catalog of learned project skills. When a task relates to any avail
         self.auto_learn_skills = configured_auto_skills and not read_only
         self.auto_learn_memory = configured_auto_memory and not read_only
         self.use_hermes_xml_protocol = use_hermes_xml_protocol
+        self.progress_mode = progress_mode
+        self._sql_troubleshooting_backend: Optional[str] = None
+        self._sql_diagnostic_kind: Optional[str] = None
+        self._zero_result_sql: Optional[str] = None
         self._startup_config = (enable_skills, enable_memory, configured_auto_skills, configured_auto_memory)
         
         # Local models running on Ollama/vLLM/LMStudio do not require a real API key,
@@ -330,7 +336,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
         self.messages = [{"role": "system", "content": system_content}]
 
     def resume_session(self, target_session_id: str) -> bool:
-        """Resume a past conversation session from .agent_history.db."""
+        """Resume a past conversation session from the active profile history database."""
         if self.stateless:
             print("[Testing Mode] Stateless mode: persisted sessions are unavailable.")
             return False
@@ -536,6 +542,145 @@ Below is the catalog of learned project skills. When a task relates to any avail
         else:
             print("[Skill Reflection] No safe skill proposal applied.")
 
+    def _reset_sql_diagnostic_state(self) -> None:
+        self._sql_troubleshooting_backend = None
+        self._sql_diagnostic_kind = None
+        self._zero_result_sql = None
+
+    @staticmethod
+    def _normalize_sql(sql: Any) -> str:
+        normalized = re.sub(r"\s+", " ", str(sql or "").strip()).rstrip(";").rstrip()
+        return normalized.casefold()
+
+    @staticmethod
+    def _database_result_envelope(tool_result: Any) -> Optional[Dict[str, Any]]:
+        try:
+            result = json.loads(tool_result)
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(result, dict):
+            return None
+        if not isinstance(result.get("database"), str):
+            return None
+        if not isinstance(result.get("columns"), list):
+            return None
+        if not isinstance(result.get("rows"), list):
+            return None
+        if type(result.get("row_count")) is not int:
+            return None
+        if type(result.get("truncated")) is not bool:
+            return None
+        return result
+
+    def _update_sql_diagnostic_state(self, tool_name: str, sql: Any, tool_result: Any) -> None:
+        backend = "Teradata" if tool_name == "query_teradata" else "Impala"
+        if str(tool_result).startswith("Error"):
+            self._sql_troubleshooting_backend = backend
+            self._sql_diagnostic_kind = "error"
+            self._zero_result_sql = None
+            return
+
+        envelope = self._database_result_envelope(tool_result)
+        if envelope is not None and envelope["row_count"] == 0 and envelope["rows"] == []:
+            self._sql_troubleshooting_backend = backend
+            self._sql_diagnostic_kind = "empty"
+            self._zero_result_sql = self._normalize_sql(sql)
+        elif envelope is not None and envelope["row_count"] > 0 and envelope["rows"]:
+            self._reset_sql_diagnostic_state()
+        elif self._sql_diagnostic_kind == "error":
+            # Preserve the established behavior: any non-error query result ends
+            # SQL error troubleshooting.
+            self._reset_sql_diagnostic_state()
+
+    def _concise_progress(self, tool_calls: List[Dict[str, Any]]) -> str:
+        """Return one bounded, tool-derived progress sentence."""
+        first = tool_calls[0]
+        name = re.sub(r"\s+", " ", str(first.get("name") or "unknown tool")).strip()[:48]
+        arguments = first.get("arguments") or {}
+        actions = {
+            "read_file": ("Reading", ("file_path",)),
+            "write_file": ("Writing", ("file_path",)),
+            "patch_file": ("Updating", ("file_path",)),
+            "grep_search": ("Searching for", ("query",)),
+            "find_files_by_pattern": ("Finding", ("pattern",)),
+            "list_directory": ("Listing", ("directory_path",)),
+            "run_terminal_command": ("Running", ("command",)),
+            "load_skill": ("Loading", ("name",)),
+            "save_skill": ("Saving", ("name",)),
+            "query_teradata": ("Querying Teradata for", ("sql",)),
+            "query_impala": ("Querying Impala for", ("sql",)),
+            "export_teradata_csv": ("Exporting Teradata data to", ("file_path",)),
+            "export_impala_csv": ("Exporting Impala data to", ("file_path",)),
+            "__protocol_error__": ("Handling a tool protocol error", ()),
+        }
+        verb, preferred_keys = actions.get(name, (f"Using {name}", ()))
+        preview = ""
+        for key in preferred_keys:
+            value = arguments.get(key)
+            if isinstance(value, (str, int, float, bool)) and str(value).strip():
+                preview = re.sub(r"\s+", " ", str(value)).strip()
+                break
+        if preview:
+            preview = preview[:112].rstrip()
+            if len(re.sub(r"\s+", " ", str(arguments.get(preferred_keys[0]))).strip()) > 112:
+                preview += "..."
+            sentence = f"{verb} {preview}."
+        else:
+            sentence = f"{verb}."
+        if self._sql_troubleshooting_backend and self._sql_diagnostic_kind == "error":
+            backend = self._sql_troubleshooting_backend
+            sql = str(arguments.get("sql") or "").strip()
+            leading_token = re.match(r"[A-Za-z]+", sql)
+            leading_token = leading_token.group(0).upper() if leading_token else ""
+            if name in ("query_teradata", "query_impala"):
+                if (
+                    leading_token in {"SHOW", "HELP", "DESCRIBE", "DESC"}
+                    or re.search(r"\b(?:INFORMATION_SCHEMA|DBC)\b", sql, re.IGNORECASE)
+                ):
+                    method = "inspecting schema metadata"
+                elif leading_token == "EXPLAIN":
+                    method = "checking the query plan"
+                else:
+                    method = "retrying with revised SQL"
+            elif (
+                backend == "Teradata"
+                and name == "run_terminal_command"
+                and re.search(r"(?:^|[\\/\s])diagnose_teradata(?:sql)?\.py(?:\s|$)", str(arguments.get("command") or ""), re.IGNORECASE)
+            ):
+                method = "running connection diagnostics"
+            else:
+                method = sentence[:-1]
+                method = method[:1].lower() + method[1:]
+            sentence = f"Troubleshooting {backend} SQL by {method}."
+        elif self._sql_troubleshooting_backend and self._sql_diagnostic_kind == "empty":
+            backend = self._sql_troubleshooting_backend
+            sql = str(arguments.get("sql") or "").strip()
+            leading_token = re.match(r"[A-Za-z]+", sql)
+            leading_token = leading_token.group(0).upper() if leading_token else ""
+            if name in ("query_teradata", "query_impala"):
+                if (
+                    leading_token in {"SHOW", "HELP", "DESCRIBE", "DESC"}
+                    or re.search(r"\b(?:INFORMATION_SCHEMA|DBC)\b", sql, re.IGNORECASE)
+                ):
+                    method = "inspecting schema metadata"
+                elif leading_token == "EXPLAIN":
+                    method = "checking the query plan"
+                elif re.search(r"\bCOUNT\s*\(", sql, re.IGNORECASE):
+                    method = "checking intermediate row counts"
+                elif self._normalize_sql(sql) == self._zero_result_sql:
+                    method = "rerunning the original query"
+                else:
+                    method = "testing the query piece by piece"
+            else:
+                method = sentence[:-1]
+                method = method[:1].lower() + method[1:]
+            sentence = f"Investigating zero {backend} results by {method}."
+
+        remaining = len(tool_calls) - 1
+        if remaining:
+            sentence += f" (+{remaining} more {'tool' if remaining == 1 else 'tools'})"
+        return sentence
+
     def step(self) -> Any:
         """Invoke the LLM for one turn."""
         request_messages = self.messages
@@ -562,6 +707,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
 
     def run(self, user_task: str) -> str:
         """Execute the autonomous agent loop for a given task."""
+        self._reset_sql_diagnostic_state()
         user_message_content = user_task
         self._active_skill_injection = None
         if not self.messages or len(self.messages) <= 1:
@@ -634,6 +780,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
                     print(f"[!] {err_msg}")
                     self.logger.end_session(self.session_id, status="FAILED")
                     self._active_skill_injection = None
+                    self._reset_sql_diagnostic_state()
                     return err_msg
 
             thought_content, tool_calls = ToolProtocol.extract_tool_calls(raw_message)
@@ -679,8 +826,10 @@ Below is the catalog of learned project skills. When a task relates to any avail
 
             # Case 1: Agent invokes tools
             if tool_calls:
-                if thought_content:
+                if self.progress_mode == "verbose" and thought_content:
                     print(f"\n[Agent Thought]:\n{thought_content.strip()}")
+                elif self.progress_mode == "concise":
+                    print(f"\n[Agent Progress]: {self._concise_progress(tool_calls)}")
 
                 assistant_message_ref = self.messages[-1]
                 assistant_step_index = self.step_counter
@@ -732,6 +881,11 @@ Below is the catalog of learned project skills. When a task relates to any avail
 
                     preview = tool_result if len(tool_result) < 350 else tool_result[:350] + "\n... [TRUNCATED]"
                     print(f"[Tool Result]:\n{preview}\n" + "-" * 50)
+
+                    if fn_name in ("query_teradata", "query_impala"):
+                        self._update_sql_diagnostic_state(
+                            fn_name, fn_args.get("sql"), tool_result
+                        )
 
                     if fn_name in ("update_user_profile", "update_project_memory", "save_skill") and not self.read_only:
                         self.refresh_system_prompt()
@@ -795,12 +949,14 @@ Below is the catalog of learned project skills. When a task relates to any avail
                 self.run_auto_memory_reflection(user_task)
                 self.run_auto_skill_synthesis(user_task)
                 self._active_skill_injection = None
+                self._reset_sql_diagnostic_state()
                 return final_answer
 
         continue_instruction = 'Type "Continue" to continue the analysis.'
         print(f"\n[!] Agent reached iteration limit ({self.max_iterations}).\n{continue_instruction}")
         self.logger.end_session(self.session_id, status="MAX_ITERATIONS")
         self._active_skill_injection = None
+        self._reset_sql_diagnostic_state()
         if partial_answer:
             return f"Task incomplete: iteration limit reached after partial response: {partial_answer}\n{continue_instruction}"
         return f"Task incomplete: iteration limit reached without a complete response.\n{continue_instruction}"
@@ -832,9 +988,14 @@ def parse_args():
         help="Root directory for named profiles (default: .agent_profiles beside agent.py).",
     )
     parser.add_argument(
+        "--workspaces-dir",
+        default=str(DEFAULT_WORKSPACES_DIR),
+        help="Root directory for named profile workspaces (default: .agent_workspaces beside agent.py).",
+    )
+    parser.add_argument(
         "--workspace",
         default=None,
-        help="Existing directory used by terminal and file tools (default: profile workspace, or launch cwd in legacy mode).",
+        help="Existing directory used by terminal and file tools (default: <workspaces-dir>/<profile>, or launch cwd in legacy mode).",
     )
     parser.add_argument(
         "-m", "--model",
@@ -859,6 +1020,12 @@ def parse_args():
         action="store_true",
         default=os.environ.get("HERMES_XML", "false").lower() in ("true", "1"),
         help="Use Hermes XML <tool_call> format instead of standard OpenAI function calling."
+    )
+    parser.add_argument(
+        "--progress",
+        choices=("concise", "verbose"),
+        default="concise",
+        help="Tool-call progress display (default: concise).",
     )
     parser.add_argument(
         "--max-tokens",
@@ -887,7 +1054,7 @@ def parse_args():
         "--resume",
         type=str,
         default=None,
-        help="Session ID to resume from .agent_history.db."
+        help="Session ID to resume from the active profile's history database."
     )
     # Testing & Evaluation Modes
     parser.add_argument(
@@ -935,11 +1102,12 @@ def parse_args():
         parser.error("--profile must be 1-64 letters, digits, hyphens, or underscores")
     args.launch_cwd = str(Path(launch_cwd).resolve())
     args.profiles_dir = str(Path(args.profiles_dir).expanduser().resolve())
+    args.workspaces_dir = str(Path(args.workspaces_dir).expanduser().resolve())
     args.workspace_explicit = args.workspace is not None
     if args.workspace_explicit:
         args.workspace = str(Path(args.workspace).expanduser().resolve())
     elif args.profile is not None:
-        args.workspace = str(Path(args.profiles_dir, args.profile, "workspace").resolve())
+        args.workspace = str(Path(args.workspaces_dir, args.profile).resolve())
     else:
         args.workspace = args.launch_cwd
     if args.workspace_explicit and not Path(args.workspace).is_dir():
@@ -1029,6 +1197,7 @@ def main():
         f"(context={compactor_capacity}, output={compactor_output})"
     )
     print(f"Protocol:   {'Hermes XML (<tool_call>)' if args.xml else 'OpenAI JSON Tool Calling'}")
+    print(f"Progress:   {args.progress}")
     print(f"Mode:       {'Stateless Benchmark' if is_stateless else ('Read-Only (No Saving)' if is_read_only else 'Normal Persistence')}")
     print(f"Profile:    {args.profile if args.profile else 'legacy mode'}")
     print(f"State:      {runtime.state_root}")
@@ -1051,7 +1220,8 @@ def main():
         auto_learn_memory=auto_learn_memory,
         read_only=is_read_only,
         stateless=is_stateless,
-        use_hermes_xml_protocol=args.xml
+        use_hermes_xml_protocol=args.xml,
+        progress_mode=args.progress,
     )
 
     if args.resume:

@@ -45,7 +45,7 @@ class ProfilePersistenceTests(unittest.TestCase):
         with patch.object(sys, "argv", ["agent.py", *arguments]):
             return agent_module.parse_args()
 
-    def test_cli_defaults_preserve_launch_cwd_and_source_adjacent_profiles_root(self):
+    def test_cli_defaults_preserve_launch_cwd_and_source_adjacent_state_roots(self):
         with tempfile.TemporaryDirectory() as launch:
             with patch.object(os, "getcwd", return_value=launch):
                 args = self.parse()
@@ -54,6 +54,10 @@ class ProfilePersistenceTests(unittest.TestCase):
         self.assertEqual(
             args.profiles_dir,
             str(Path(agent_module.__file__).resolve().parent / ".agent_profiles"),
+        )
+        self.assertEqual(
+            args.workspaces_dir,
+            str(Path(agent_module.__file__).resolve().parent / ".agent_workspaces"),
         )
 
     def test_cli_accepts_named_profile_custom_root_and_independent_workspace(self):
@@ -66,10 +70,15 @@ class ProfilePersistenceTests(unittest.TestCase):
         self.assertEqual(args.profiles_dir, str(Path(root).resolve()))
         self.assertEqual(args.workspace, str(Path(workspace).resolve()))
 
-    def test_named_profile_omitted_workspace_is_profile_local_and_bootstrapped(self):
-        with tempfile.TemporaryDirectory() as root:
-            args = self.parse("--profile", "alice", "--profiles-dir", root)
-            expected = Path(root, "alice", "workspace").resolve()
+    def test_named_profile_omitted_workspace_bootstraps_exact_sibling_layout(self):
+        with tempfile.TemporaryDirectory() as temp:
+            profiles = Path(temp, "profiles")
+            workspaces = Path(temp, "workspaces")
+            args = self.parse(
+                "--profile", "alice", "--profiles-dir", str(profiles),
+                "--workspaces-dir", str(workspaces),
+            )
+            expected = (workspaces / "alice").resolve()
             self.assertEqual(Path(args.workspace), expected)
             self.assertFalse(expected.exists())
 
@@ -77,23 +86,36 @@ class ProfilePersistenceTests(unittest.TestCase):
 
             self.assertEqual(config.workspace, expected)
             self.assertTrue(expected.is_dir())
-            self.assertTrue((Path(root, "alice", ".agent_memories", "USER.md")).is_file())
-            self.assertTrue((Path(root, "alice", ".agent_memories", "MEMORY.md")).is_file())
-            self.assertTrue((Path(root, "alice", ".agent_skills")).is_dir())
-            self.assertTrue((Path(root, "alice", ".agent_history.db")).is_file())
+            profile = profiles / "alice"
+            self.assertTrue((profile / "memories" / "USER.md").is_file())
+            self.assertTrue((profile / "memories" / "MEMORY.md").is_file())
+            self.assertTrue((profile / "skills").is_dir())
+            self.assertTrue((profile / "history.db").is_file())
+            for obsolete in (".agent_memories", ".agent_skills", ".agent_history.db", "workspace"):
+                self.assertFalse((profile / obsolete).exists())
 
     def test_named_profile_defaults_are_distinct_and_bind_terminal_and_files(self):
-        with tempfile.TemporaryDirectory() as root:
-            alice = self.parse("--profile", "alice", "--profiles-dir", root)
+        with tempfile.TemporaryDirectory() as temp:
+            profiles, workspaces = Path(temp, "profiles"), Path(temp, "workspaces")
+            common = ("--profiles-dir", str(profiles), "--workspaces-dir", str(workspaces))
+            alice = self.parse("--profile", "alice", *common)
             alice_config = agent_module.configure_runtime(alice)
             self.assertEqual(Path(tools.terminal_session.workspace_root), alice_config.workspace)
 
-            bob = self.parse("--profile", "bob", "--profiles-dir", root)
+            tools.write_file("alice.txt", "alice")
+            alice_file = alice_config.workspace / "alice.txt"
+            bob = self.parse("--profile", "bob", *common)
             bob_config = agent_module.configure_runtime(bob)
             self.assertEqual(Path(tools.terminal_session.workspace_root), bob_config.workspace)
             self.assertNotEqual(alice_config.workspace, bob_config.workspace)
-            self.assertEqual(alice_config.workspace, Path(root, "alice", "workspace").resolve())
-            self.assertEqual(bob_config.workspace, Path(root, "bob", "workspace").resolve())
+            tools.write_file("bob.txt", "bob")
+            bob_file = bob_config.workspace / "bob.txt"
+            self.assertEqual(alice_config.workspace, (workspaces / "alice").resolve())
+            self.assertEqual(bob_config.workspace, (workspaces / "bob").resolve())
+            self.assertEqual(alice_file, alice_config.workspace / "alice.txt")
+            self.assertEqual(bob_file, bob_config.workspace / "bob.txt")
+            self.assertEqual(alice_file.read_text(encoding="utf-8"), "alice")
+            self.assertEqual(bob_file.read_text(encoding="utf-8"), "bob")
 
     def test_invalid_profile_names_and_missing_workspace_are_rejected(self):
         invalid = ("", ".", "..", "a/b", "a\\b", "../alice", "C:\\alice", "a b", "x" * 65)
@@ -105,21 +127,27 @@ class ProfilePersistenceTests(unittest.TestCase):
                 self.parse("--workspace", str(Path(root) / "missing"))
 
     def test_writable_profile_bootstrap_and_all_consumers_are_rebound(self):
-        with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as workspace:
-            args = self.parse("--profile", "alice", "--profiles-dir", root, "--workspace", workspace)
+        with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as workspace:
+            root = Path(temp, "profiles")
+            defaults = Path(temp, "workspaces")
+            args = self.parse(
+                "--profile", "alice", "--profiles-dir", str(root),
+                "--workspaces-dir", str(defaults), "--workspace", workspace,
+            )
             config = agent_module.configure_runtime(args)
             profile = Path(root, "alice")
             self.assertEqual(config.state_root, profile.resolve())
-            self.assertTrue((profile / ".agent_memories" / "USER.md").is_file())
-            self.assertTrue((profile / ".agent_memories" / "MEMORY.md").is_file())
-            self.assertTrue((profile / ".agent_skills").is_dir())
-            self.assertTrue((profile / ".agent_history.db").is_file())
-            self.assertEqual(Path(tools.skill_store.storage_dir), profile / ".agent_skills")
-            self.assertEqual(Path(tools.user_profile_manager.file_path), profile / ".agent_memories" / "USER.md")
-            self.assertEqual(Path(tools.project_memory_manager.file_path), profile / ".agent_memories" / "MEMORY.md")
+            self.assertTrue((profile / "memories" / "USER.md").is_file())
+            self.assertTrue((profile / "memories" / "MEMORY.md").is_file())
+            self.assertTrue((profile / "skills").is_dir())
+            self.assertTrue((profile / "history.db").is_file())
+            self.assertFalse(defaults.exists())
+            self.assertEqual(Path(tools.skill_store.storage_dir), profile / "skills")
+            self.assertEqual(Path(tools.user_profile_manager.file_path), profile / "memories" / "USER.md")
+            self.assertEqual(Path(tools.project_memory_manager.file_path), profile / "memories" / "MEMORY.md")
             self.assertEqual(Path(tools.terminal_session.workspace_root), Path(workspace).resolve())
             instance = agent_module.HermesCodingAgent(enable_memory=False, enable_skills=False)
-            self.assertEqual(Path(instance.logger.db_path), profile / ".agent_history.db")
+            self.assertEqual(Path(instance.logger.db_path), profile / "history.db")
             self.assertIs(instance.memory_extractor.user_manager, tools.user_profile_manager)
             self.assertIs(instance.skill_extractor.skill_store, tools.skill_store)
 
@@ -156,13 +184,17 @@ class ProfilePersistenceTests(unittest.TestCase):
                 profile = Path(root, "alice")
                 profile.mkdir()
                 before = tuple(profile.iterdir())
-                args = self.parse("--profile", "alice", "--profiles-dir", root, flag)
+                workspaces = Path(root, "workspaces")
+                args = self.parse(
+                    "--profile", "alice", "--profiles-dir", root,
+                    "--workspaces-dir", str(workspaces), flag,
+                )
 
                 with self.assertRaisesRegex(ValueError, "default workspace.*does not exist"):
                     agent_module.configure_runtime(args)
 
                 self.assertEqual(tuple(profile.iterdir()), before)
-                self.assertFalse((profile / "workspace").exists())
+                self.assertFalse(workspaces.exists())
 
     def test_cli_missing_read_only_profile_exits_nonzero_without_creating_state(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -193,7 +225,8 @@ class ProfilePersistenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             profiles_root = Path(temp, "profiles")
             profile = profiles_root / "alice"
-            workspace = profile / "workspace"
+            workspaces_root = Path(temp, "workspaces")
+            workspace = workspaces_root / "alice"
 
             result = subprocess.run(
                 [
@@ -201,6 +234,7 @@ class ProfilePersistenceTests(unittest.TestCase):
                     str(Path(agent_module.__file__).resolve()),
                     "--profile", "alice",
                     "--profiles-dir", str(profiles_root),
+                    "--workspaces-dir", str(workspaces_root),
                 ],
                 input="",
                 text=True,
@@ -213,14 +247,32 @@ class ProfilePersistenceTests(unittest.TestCase):
             self.assertIn(f"State:      {profile.resolve()}", result.stdout)
             self.assertIn(f"Workspace:  {workspace.resolve()}", result.stdout)
             self.assertIn("Shutting down.", result.stdout)
-            self.assertTrue((profile / ".agent_memories" / "USER.md").is_file())
-            self.assertTrue((profile / ".agent_memories" / "MEMORY.md").is_file())
-            self.assertTrue((profile / ".agent_skills").is_dir())
-            self.assertTrue((profile / ".agent_history.db").is_file())
+            self.assertTrue((profile / "memories" / "USER.md").is_file())
+            self.assertTrue((profile / "memories" / "MEMORY.md").is_file())
+            self.assertTrue((profile / "skills").is_dir())
+            self.assertTrue((profile / "history.db").is_file())
             self.assertTrue(workspace.is_dir())
             self.assertFalse((workspace / ".agent_memories").exists())
             self.assertFalse((workspace / ".agent_skills").exists())
             self.assertFalse((workspace / ".agent_history.db").exists())
+
+    def test_partial_named_profile_read_only_and_stateless_create_nothing(self):
+        for flag in ("--read-only", "--stateless"):
+            with self.subTest(flag=flag), tempfile.TemporaryDirectory() as temp:
+                profiles = Path(temp, "profiles")
+                profile = profiles / "alice"
+                (profile / "memories").mkdir(parents=True)
+                (profile / "memories" / "USER.md").write_text("existing", encoding="utf-8")
+                workspaces = Path(temp, "workspaces")
+                before = sorted(str(path.relative_to(temp)) for path in Path(temp).rglob("*"))
+                args = self.parse(
+                    "--profile", "alice", "--profiles-dir", str(profiles),
+                    "--workspaces-dir", str(workspaces), flag,
+                )
+                with self.assertRaisesRegex(ValueError, "default workspace.*does not exist"):
+                    agent_module.configure_runtime(args)
+                after = sorted(str(path.relative_to(temp)) for path in Path(temp).rglob("*"))
+                self.assertEqual(after, before)
 
     def test_legacy_runtime_uses_launch_cwd_locations_exactly(self):
         with tempfile.TemporaryDirectory() as launch:

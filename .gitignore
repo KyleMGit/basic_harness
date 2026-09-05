@@ -4,5 +4,6 @@ __pycache__/
 .agent_memories/
 .agent_skills/
 .agent_profiles/
+.agent_workspaces/
 _test_tmp/
 database.json
