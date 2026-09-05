@@ -3,5 +3,6 @@ __pycache__/
 .agent_history.db
 .agent_memories/
 .agent_skills/
+.agent_profiles/
 _test_tmp/
 database.json

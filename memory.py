@@ -40,14 +40,15 @@ class UserProfileManager:
 - Maintain test coverage and verify changes before marking tasks complete.
 """
 
-    def __init__(self, storage_dir: Optional[str] = None):
+    def __init__(self, storage_dir: Optional[str] = None, allow_root_fallback: bool = True):
         self.storage_dir = os.path.abspath(storage_dir or os.path.join(os.getcwd(), ".agent_memories"))
         self.file_path = os.path.join(self.storage_dir, "USER.md")
+        self.allow_root_fallback = allow_root_fallback
 
     def _ensure_file_exists(self):
         """Create default USER.md if it doesn't already exist."""
         root_user_md = os.path.join(os.getcwd(), "USER.md")
-        if os.path.isfile(root_user_md) and not os.path.isfile(self.file_path):
+        if self.allow_root_fallback and os.path.isfile(root_user_md) and not os.path.isfile(self.file_path):
             self.file_path = root_user_md
             return
 
@@ -63,7 +64,7 @@ class UserProfileManager:
         """Load raw USER.md content."""
         if not os.path.exists(self.file_path):
             root_user_md = os.path.join(os.getcwd(), "USER.md")
-            if os.path.isfile(root_user_md):
+            if self.allow_root_fallback and os.path.isfile(root_user_md):
                 self.file_path = root_user_md
             else:
                 return self.DEFAULT_TEMPLATE.strip()
@@ -82,7 +83,7 @@ class UserProfileManager:
         """Read existing profile content without substituting display/status text."""
         if not os.path.exists(self.file_path):
             root_user_md = os.path.join(os.getcwd(), "USER.md")
-            if os.path.isfile(root_user_md):
+            if self.allow_root_fallback and os.path.isfile(root_user_md):
                 self.file_path = root_user_md
             else:
                 return self.DEFAULT_TEMPLATE.strip(), None
@@ -178,14 +179,15 @@ class ProjectMemoryManager:
 - Process State: Working directory (cwd) persists across tool calls via stateful terminal session.
 """
 
-    def __init__(self, storage_dir: Optional[str] = None):
+    def __init__(self, storage_dir: Optional[str] = None, allow_root_fallback: bool = True):
         self.storage_dir = os.path.abspath(storage_dir or os.path.join(os.getcwd(), ".agent_memories"))
         self.file_path = os.path.join(self.storage_dir, "MEMORY.md")
+        self.allow_root_fallback = allow_root_fallback
 
     def _ensure_file_exists(self):
         """Create default MEMORY.md if it doesn't already exist."""
         root_mem_md = os.path.join(os.getcwd(), "MEMORY.md")
-        if os.path.isfile(root_mem_md) and not os.path.isfile(self.file_path):
+        if self.allow_root_fallback and os.path.isfile(root_mem_md) and not os.path.isfile(self.file_path):
             self.file_path = root_mem_md
             return
 
@@ -201,7 +203,7 @@ class ProjectMemoryManager:
         """Load raw MEMORY.md content."""
         if not os.path.exists(self.file_path):
             root_mem_md = os.path.join(os.getcwd(), "MEMORY.md")
-            if os.path.isfile(root_mem_md):
+            if self.allow_root_fallback and os.path.isfile(root_mem_md):
                 self.file_path = root_mem_md
             else:
                 return self.DEFAULT_TEMPLATE.strip()
@@ -220,7 +222,7 @@ class ProjectMemoryManager:
         """Read existing memory content without substituting display/status text."""
         if not os.path.exists(self.file_path):
             root_mem_md = os.path.join(os.getcwd(), "MEMORY.md")
-            if os.path.isfile(root_mem_md):
+            if self.allow_root_fallback and os.path.isfile(root_mem_md):
                 self.file_path = root_mem_md
             else:
                 return self.DEFAULT_TEMPLATE.strip(), None

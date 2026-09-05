@@ -68,6 +68,46 @@ python agent.py --model qwen2.5:32b
 python agent.py --model Qwen-32b --resume <session_id>
 ```
 
+### 4. Named Profiles with an Independent Workspace
+```bash
+# Omit --workspace for separate, automatically created profile workspaces.
+python agent.py --profile alice
+python agent.py --profile bob
+
+# Explicitly override the default to share one existing checkout instead.
+python agent.py --profile alice --workspace C:\src\shared-project
+python agent.py --profile bob --workspace C:\src\shared-project
+
+# Store named profiles somewhere else.
+python agent.py --profile alice --profiles-dir D:\agent-state --workspace C:\src\shared-project
+```
+
+Named profiles live under `.agent_profiles/<name>/` beside `agent.py` by default.
+Each contains `.agent_memories/USER.md`, `.agent_memories/MEMORY.md`,
+`.agent_skills/`, `.agent_history.db`, and an automatically created `workspace/`:
+
+```text
+.agent_profiles/
+├── alice/
+│   ├── .agent_memories/
+│   ├── .agent_skills/
+│   ├── .agent_history.db
+│   └── workspace/
+└── bob/
+    └── workspace/
+```
+
+Profile names are 1-64 letters, digits, hyphens, or underscores. An explicit
+`--workspace` overrides the profile default for terminal/file-tool confinement
+and must name an already-existing directory; it is not created automatically.
+
+Without `--profile`, legacy behavior is unchanged: persistence remains in the
+process launch directory (`.agent_memories`, `.agent_skills`, and
+`.agent_history.db`) and the launch directory is also the default workspace.
+Read-only/stateless startup never creates a named profile and fails clearly if
+the selected named profile does not already exist. When `--workspace` is omitted
+in those modes, the profile's existing `workspace/` must also already exist.
+
 ---
 
 ## 💬 1. In-Session Chat Commands (Typed at `User >`)
@@ -107,6 +147,9 @@ Whenever the agent proposes a system or terminal command, execution pauses for r
 | **`--model`** | `-m` | `Qwen-32b` | Model identifier (e.g. `Qwen-32b`, `qwen2.5-coder:32b`, `Qwen/Qwen2.5-32B-Instruct`). |
 | **`--base-url`** | `-u` | `http://localhost:11434/v1` | LLM HTTP API endpoint (vLLM `:8000/v1`, Ollama `:11434/v1`, LM Studio `:1234/v1`). |
 | **`--api-key`** | `-k` | `local` | API Key (optional for local models). |
+| **`--profile <name>`** | | `None` (legacy mode) | Select an isolated named persistence profile. |
+| **`--profiles-dir <path>`** | | `.agent_profiles` beside `agent.py` | Root containing named profile state; independent of the workspace. |
+| **`--workspace <path>`** | | Profile `workspace/`; launch directory in legacy mode | Override with an existing directory used as the canonical terminal/file-tool workspace. |
 | **`--max-tokens`** | | `40960` | Max context token capacity (compaction triggers at 70% $\approx$ 28,672 tokens). |
 | **`--compaction-model`** | | Primary model | Optional model used only for checkpoint generation (`AGENT_COMPACTION_MODEL`). |
 | **`--compaction-max-tokens`** | | Primary context | Compactor context capacity (`AGENT_COMPACTION_MAX_TOKENS`). Every compactor request is preflighted against it. |

@@ -23,6 +23,7 @@ import os
 import re
 import sys
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -45,6 +46,61 @@ READ_THIS_PATH = Path(__file__).resolve().parent / "READ_THIS.md"
 READ_THIS_MAX_CHARS = 20_000
 READ_THIS_START_MARKER = "<!-- READ_THIS.md:START -->"
 READ_THIS_END_MARKER = "<!-- READ_THIS.md:END -->"
+DEFAULT_PROFILES_DIR = Path(__file__).resolve().parent / ".agent_profiles"
+ACTIVE_HISTORY_DB: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class RuntimeConfig:
+    profile: Optional[str]
+    state_root: Path
+    workspace: Path
+    history_db: Path
+    legacy: bool
+
+
+def configure_runtime(args: argparse.Namespace) -> RuntimeConfig:
+    """Bind all process-wide consumers to one persistence profile and workspace."""
+    global ACTIVE_HISTORY_DB
+    workspace = Path(args.workspace).resolve()
+    legacy = args.profile is None
+    state_root = Path(args.launch_cwd).resolve() if legacy else Path(args.profiles_dir, args.profile).resolve()
+    if not legacy and (args.read_only or args.stateless) and not state_root.is_dir():
+        raise ValueError(f"Named profile '{args.profile}' does not exist: {state_root}")
+    if not workspace.is_dir():
+        if not legacy and not args.workspace_explicit and (args.read_only or args.stateless):
+            raise ValueError(f"Named profile default workspace does not exist: {workspace}")
+        if legacy or args.workspace_explicit:
+            raise ValueError(f"Workspace does not exist or is not a directory: {workspace}")
+
+    memory_dir = state_root / ".agent_memories"
+    skills_dir = state_root / ".agent_skills"
+    history_db = state_root / ".agent_history.db"
+    user_profile_manager.storage_dir = str(memory_dir)
+    user_profile_manager.file_path = str(memory_dir / "USER.md")
+    user_profile_manager.allow_root_fallback = legacy
+    project_memory_manager.storage_dir = str(memory_dir)
+    project_memory_manager.file_path = str(memory_dir / "MEMORY.md")
+    project_memory_manager.allow_root_fallback = legacy
+    auto_memory_extractor.user_manager = user_profile_manager
+    auto_memory_extractor.project_manager = project_memory_manager
+    skill_store.storage_dir = str(skills_dir)
+    terminal_session.cwd = str(workspace)
+    ACTIVE_HISTORY_DB = str(history_db)
+
+    if not legacy and not args.read_only and not args.stateless:
+        state_root.mkdir(parents=True, exist_ok=True)
+        workspace.mkdir(parents=True, exist_ok=True)
+        user_profile_manager._ensure_file_exists()
+        project_memory_manager._ensure_file_exists()
+        if not Path(user_profile_manager.file_path).is_file():
+            raise RuntimeError(f"Could not initialize named profile USER.md: {user_profile_manager.file_path}")
+        if not Path(project_memory_manager.file_path).is_file():
+            raise RuntimeError(f"Could not initialize named profile MEMORY.md: {project_memory_manager.file_path}")
+        skills_dir.mkdir(parents=True, exist_ok=True)
+        TrajectoryLogger(str(history_db))._ensure_db()
+
+    return RuntimeConfig(args.profile, state_root, workspace, history_db, legacy)
 
 
 def load_read_this_block() -> str:
@@ -183,7 +239,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
             base_url=resolved_base_url
         )
         
-        self.logger = TrajectoryLogger(write_enabled=not self.read_only)
+        self.logger = TrajectoryLogger(ACTIVE_HISTORY_DB, write_enabled=not self.read_only)
         self.context_manager = ContextManager(
             max_context_tokens=max_context_tokens,
             trigger_threshold=compaction_threshold,
@@ -762,8 +818,23 @@ def export_current_trajectory(agent: "HermesCodingAgent", filename: str) -> str:
 
 
 def parse_args():
+    launch_cwd = os.getcwd()
     parser = argparse.ArgumentParser(
         description="Hermes-Refined Coding Agent Harness for Local & Remote LLMs."
+    )
+    parser.add_argument(
+        "--profile",
+        help="Named persistence profile (letters, digits, hyphen, or underscore; max 64 characters).",
+    )
+    parser.add_argument(
+        "--profiles-dir",
+        default=str(DEFAULT_PROFILES_DIR),
+        help="Root directory for named profiles (default: .agent_profiles beside agent.py).",
+    )
+    parser.add_argument(
+        "--workspace",
+        default=None,
+        help="Existing directory used by terminal and file tools (default: profile workspace, or launch cwd in legacy mode).",
     )
     parser.add_argument(
         "-m", "--model",
@@ -860,6 +931,19 @@ def parse_args():
         help="Disable automatic post-task memory reflection."
     )
     args = parser.parse_args()
+    if args.profile is not None and not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", args.profile):
+        parser.error("--profile must be 1-64 letters, digits, hyphens, or underscores")
+    args.launch_cwd = str(Path(launch_cwd).resolve())
+    args.profiles_dir = str(Path(args.profiles_dir).expanduser().resolve())
+    args.workspace_explicit = args.workspace is not None
+    if args.workspace_explicit:
+        args.workspace = str(Path(args.workspace).expanduser().resolve())
+    elif args.profile is not None:
+        args.workspace = str(Path(args.profiles_dir, args.profile, "workspace").resolve())
+    else:
+        args.workspace = args.launch_cwd
+    if args.workspace_explicit and not Path(args.workspace).is_dir():
+        parser.error("--workspace must resolve to an existing directory")
     if args.max_tokens <= 0:
         parser.error("--max-tokens must be positive")
     if args.compaction_max_tokens is not None and args.compaction_max_tokens <= 0:
@@ -917,6 +1001,12 @@ def handle_cli_command(agent: HermesCodingAgent, prompt: str) -> bool:
 def main():
     args = parse_args()
 
+    try:
+        runtime = configure_runtime(args)
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
     # Determine testing modes
     is_stateless = args.stateless
     is_read_only = args.read_only or is_stateless
@@ -940,6 +1030,9 @@ def main():
     )
     print(f"Protocol:   {'Hermes XML (<tool_call>)' if args.xml else 'OpenAI JSON Tool Calling'}")
     print(f"Mode:       {'Stateless Benchmark' if is_stateless else ('Read-Only (No Saving)' if is_read_only else 'Normal Persistence')}")
+    print(f"Profile:    {args.profile if args.profile else 'legacy mode'}")
+    print(f"State:      {runtime.state_root}")
+    print(f"Workspace:  {runtime.workspace}")
     print("Security:   Interactive user review is active for EVERY system command.\n")
     print("Commands:   /skills | /user | /memory | /mode [normal|read-only|stateless] | /context | exit")
 
@@ -1069,4 +1162,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
