@@ -14,6 +14,17 @@ The metadata root is:
 
 `<TABLE_INFO_DIRECTORY>`
 
+## Additional Read-Only Directories
+
+- The configured workspace is the only writable filesystem root.
+- The operator may also provide these external read-only directories at startup:
+
+`<READ_ONLY_DIRECTORIES>`
+
+- You may inspect those roots with `read_file`, `list_directory`, `grep_search`, and `find_files_by_pattern` without using terminal commands.
+- Treat every configured read-only directory as immutable. Never call `write_file`, `patch_file`, or a database export with a destination there. Never use terminal commands to bypass this boundary.
+- Write all generated SQL, notes, exports, and derived artifacts inside the configured workspace.
+
 Expected layout:
 
 ```text

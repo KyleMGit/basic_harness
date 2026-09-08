@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import sys
@@ -15,6 +16,7 @@ class ProfilePersistenceTests(unittest.TestCase):
         snapshot = {
             "history": agent_module.ACTIVE_HISTORY_DB,
             "workspace": tools.terminal_session.cwd,
+            "read_only_roots": tools.terminal_session.read_only_roots,
             "skill_dir": tools.skill_store.storage_dir,
             "user": (
                 tools.user_profile_manager.storage_dir,
@@ -31,6 +33,7 @@ class ProfilePersistenceTests(unittest.TestCase):
         def restore():
             agent_module.ACTIVE_HISTORY_DB = snapshot["history"]
             tools.terminal_session.cwd = snapshot["workspace"]
+            tools.terminal_session.set_read_only_roots(snapshot["read_only_roots"])
             tools.skill_store.storage_dir = snapshot["skill_dir"]
             (tools.user_profile_manager.storage_dir,
              tools.user_profile_manager.file_path,
@@ -69,6 +72,67 @@ class ProfilePersistenceTests(unittest.TestCase):
         self.assertEqual(args.profile, "alice-_2")
         self.assertEqual(args.profiles_dir, str(Path(root).resolve()))
         self.assertEqual(args.workspace, str(Path(workspace).resolve()))
+
+    def test_cli_accepts_repeated_read_only_directories_and_binds_them(self):
+        with tempfile.TemporaryDirectory() as temp, tempfile.TemporaryDirectory() as workspace:
+            first = Path(temp, "schemas-a")
+            second = Path(temp, "schemas-b")
+            first.mkdir()
+            second.mkdir()
+            args = self.parse(
+                "--profile", "alice",
+                "--profiles-dir", str(Path(temp, "profiles")),
+                "--workspace", workspace,
+                "--read-only-dir", str(first),
+                "--read-only-dir", str(second),
+                "--read-only-dir", str(first),
+            )
+
+            self.assertEqual(args.read_only_dirs, [str(first.resolve()), str(second.resolve())])
+            config = agent_module.configure_runtime(args)
+            instance = agent_module.HermesCodingAgent(
+                enable_memory=False,
+                enable_skills=False,
+            )
+
+            self.assertEqual(config.read_only_dirs, (first.resolve(), second.resolve()))
+            self.assertEqual(
+                tools.terminal_session.read_only_roots,
+                (str(first.resolve()), str(second.resolve())),
+            )
+            system_prompt = instance.messages[0]["content"]
+            self.assertIn("Configured Read-Only Directories", system_prompt)
+            self.assertIn(json.dumps(str(first.resolve())), system_prompt)
+            self.assertIn(json.dumps(str(second.resolve())), system_prompt)
+
+    def test_cli_rejects_missing_read_only_directory(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            missing = Path(workspace, "missing")
+            with self.assertRaises(SystemExit):
+                self.parse("--workspace", workspace, "--read-only-dir", str(missing))
+
+    def test_cli_rejects_empty_read_only_directory_value(self):
+        with tempfile.TemporaryDirectory() as workspace:
+            for value in ("", "   "):
+                with self.subTest(value=value), self.assertRaises(SystemExit):
+                    self.parse("--workspace", workspace, "--read-only-dir", value)
+
+    def test_cli_rejects_read_only_roots_that_overlap_the_workspace(self):
+        with tempfile.TemporaryDirectory() as temp:
+            parent = Path(temp)
+            workspace = parent / "workspace"
+            nested = workspace / "database_information"
+            workspace.mkdir()
+            nested.mkdir()
+
+            for read_only_root in (parent, workspace, nested):
+                with self.subTest(read_only_root=read_only_root), self.assertRaises(SystemExit):
+                    self.parse(
+                        "--workspace",
+                        str(workspace),
+                        "--read-only-dir",
+                        str(read_only_root),
+                    )
 
     def test_named_profile_omitted_workspace_bootstraps_exact_sibling_layout(self):
         with tempfile.TemporaryDirectory() as temp:

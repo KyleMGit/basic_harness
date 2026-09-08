@@ -87,6 +87,9 @@ python agent.py --profile bob
 python agent.py --profile alice --workspace C:\src\shared-project
 python agent.py --profile bob --workspace C:\src\shared-project
 
+# Add any number of external reference directories as read-only roots.
+python agent.py --profile alice --read-only-dir C:\schemas\database_information --read-only-dir D:\shared\data_dictionary
+
 # Store named profile state and default workspaces in independent roots.
 python agent.py --profile alice --profiles-dir D:\agent-state --workspaces-dir D:\agent-work
 ```
@@ -116,6 +119,14 @@ Profile names are 1-64 letters, digits, hyphens, or underscores.
 `--workspace` overrides the profile default for terminal/file-tool confinement
 and must name an already-existing directory; the override is not created and
 does not create an unused default profile workspace.
+
+`--read-only-dir` is repeatable. Each value must name an existing directory and
+must not overlap the writable workspace; values are canonicalized at startup.
+`read_file`, `list_directory`, `grep_search`, and
+`find_files_by_pattern` can inspect those roots, while all file writes, patches,
+and database CSV exports remain confined to the writable workspace. Terminal
+commands remain subject to interactive review; agents should use the dedicated
+file/search tools for approval-free inspection of read-only roots.
 
 Without `--profile`, legacy behavior is unchanged: persistence remains in the
 process launch directory (`.agent_memories`, `.agent_skills`, and
@@ -168,6 +179,7 @@ Whenever the agent proposes a system or terminal command, execution pauses for r
 | **`--profiles-dir <path>`** | | `.agent_profiles` beside `agent.py` | Root containing named profile state; independent of the workspace. |
 | **`--workspaces-dir <path>`** | | `.agent_workspaces` beside `agent.py` | Independent root containing named profiles' default workspaces. |
 | **`--workspace <path>`** | | `<workspaces-dir>/<profile>`; launch directory in legacy mode | Override with an existing directory used as the canonical terminal/file-tool workspace. |
+| **`--read-only-dir <path>`** | | None; repeatable | Add an existing external directory that file/search tools may inspect but write/patch/export tools cannot modify. |
 | **`--max-tokens`** | | `40960` | Max context token capacity (compaction triggers at 70% $\approx$ 28,672 tokens). |
 | **`--compaction-model`** | | Primary model | Optional model used only for checkpoint generation (`AGENT_COMPACTION_MODEL`). |
 | **`--compaction-max-tokens`** | | Primary context | Compactor context capacity (`AGENT_COMPACTION_MAX_TOKENS`). Every compactor request is preflighted against it. |
@@ -190,17 +202,17 @@ Whenever the agent proposes a system or terminal command, execution pauses for r
 
 | Tool Name | Parameters | Description |
 | :--- | :--- | :--- |
-| **`grep_search`** | `query`, `search_path`, `is_regex`, `file_pattern`, `max_results` | Bounded regex/literal search confined to the canonical workspace; includes relevant hidden config folders and excludes VCS/runtime/cache folders and credential files. |
-| **`find_files_by_pattern`** | `pattern`, `search_path`, `max_results` | Confined glob search (`*.py`, `src/**/*.ts`, `*router*`) across workspace folders. |
+| **`grep_search`** | `query`, `search_path`, `is_regex`, `file_pattern`, `max_results` | Bounded regex/literal search across the workspace and configured read-only roots; includes relevant hidden config folders and excludes VCS/runtime/cache folders and credential files. |
+| **`find_files_by_pattern`** | `pattern`, `search_path`, `max_results` | Confined glob search (`*.py`, `src/**/*.ts`, `*router*`) across the workspace and configured read-only roots. |
 | **`run_terminal_command`** | `command`, `timeout` | Executes terminal commands with persistent `cwd` across turns. |
 | **`query_teradata`** | `sql`, `max_rows` | Runs one bounded, read-only Teradata query using environment configuration. |
 | **`query_impala`** | `sql`, `max_rows` | Runs one bounded, read-only Hadoop Impala query using environment configuration. |
 | **`export_teradata_csv`** | `sql`, `file_path`, `batch_size`, `overwrite` | Streams a read-only Teradata query to an atomic workspace CSV file. |
 | **`export_impala_csv`** | `sql`, `file_path`, `batch_size`, `overwrite` | Streams a read-only Impala query to an atomic workspace CSV file. |
-| **`read_file`** | `file_path`, `start_line`, `end_line` | Bounded file reads inside the configured workspace. Traversal, symlink escape, and sensitive credential targets are denied. |
+| **`read_file`** | `file_path`, `start_line`, `end_line` | Bounded file reads inside the workspace or configured read-only roots. Traversal, symlink escape, and sensitive credential targets are denied. |
 | **`write_file`** | `file_path`, `content` | Writes/creates normal source files inside the canonical workspace; outside and sensitive targets are denied. |
 | **`patch_file`** | `file_path`, `search_content`, `replace_content` | Performs targeted search-and-replace on existing files. |
-| **`list_directory`** | `directory_path` | Inspects directory contents and file sizes. |
+| **`list_directory`** | `directory_path` | Inspects directory contents and file sizes inside the workspace or configured read-only roots. |
 | **`load_skill` / `<skill_name>()`** | `name` | Reads instructions and workflow details for any learned project skill. |
 | **`save_skill`** | `name`, `description`, `instructions` | Saves a newly discovered procedural workflow to `.agent_skills/`. |
 | **`read_user_profile`** | *(none)* | Reads operator profile from `USER.md`. |

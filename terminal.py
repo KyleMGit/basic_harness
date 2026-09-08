@@ -8,7 +8,7 @@ import os
 import re
 import shlex
 import subprocess
-from typing import Dict, Optional, Tuple
+from typing import Dict, Iterable, Optional, Tuple
 
 
 class TerminalSession:
@@ -38,6 +38,7 @@ class TerminalSession:
     def __init__(self, cwd: Optional[str] = None, max_output_chars: int = 8000):
         self._cwd = os.path.abspath(cwd or os.getcwd())
         self.workspace_root = os.path.realpath(self._cwd)
+        self.read_only_roots: Tuple[str, ...] = ()
         self.env = os.environ.copy()
         self.max_output_chars = max_output_chars
 
@@ -50,6 +51,15 @@ class TerminalSession:
         """Explicit assignment configures a new workspace (used by embedders/tests)."""
         self._cwd = os.path.abspath(value)
         self.workspace_root = os.path.realpath(self._cwd)
+
+    def set_read_only_roots(self, paths: Iterable[str]) -> None:
+        """Bind canonical, deduplicated roots that file tools may only read."""
+        roots = []
+        for path in paths:
+            resolved = os.path.realpath(os.path.abspath(os.path.expanduser(str(path))))
+            if resolved not in roots:
+                roots.append(resolved)
+        self.read_only_roots = tuple(roots)
 
     def is_destructive(self, command: str) -> bool:
         """Check if a command matches potentially destructive patterns."""

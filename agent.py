@@ -56,6 +56,7 @@ class RuntimeConfig:
     profile: Optional[str]
     state_root: Path
     workspace: Path
+    read_only_dirs: Tuple[Path, ...]
     history_db: Path
     legacy: bool
 
@@ -87,6 +88,7 @@ def configure_runtime(args: argparse.Namespace) -> RuntimeConfig:
     auto_memory_extractor.project_manager = project_memory_manager
     skill_store.storage_dir = str(skills_dir)
     terminal_session.cwd = str(workspace)
+    terminal_session.set_read_only_roots(getattr(args, "read_only_dirs", ()))
     ACTIVE_HISTORY_DB = str(history_db)
 
     if not legacy and not args.read_only and not args.stateless:
@@ -101,7 +103,14 @@ def configure_runtime(args: argparse.Namespace) -> RuntimeConfig:
         skills_dir.mkdir(parents=True, exist_ok=True)
         TrajectoryLogger(str(history_db))._ensure_db()
 
-    return RuntimeConfig(args.profile, state_root, workspace, history_db, legacy)
+    return RuntimeConfig(
+        profile=args.profile,
+        state_root=state_root,
+        workspace=workspace,
+        read_only_dirs=tuple(Path(path) for path in getattr(args, "read_only_dirs", ())),
+        history_db=history_db,
+        legacy=legacy,
+    )
 
 
 def load_read_this_block() -> str:
@@ -172,6 +181,9 @@ You have access to tools that allow you to inspect the system, manage files, sea
 - **Interactive Terminal Commands**: Every system/terminal command you propose will be reviewed interactively by the user before execution. The user may approve it, modify it, or provide feedback.
 - **Context Compaction**: In long-running tasks, earlier conversation segments may be compressed into structured summary blocks. Use the summary to maintain continuity.
 - **Persistent Workspace**: The terminal environment maintains your working directory (`cwd`) across tool calls. Use `cd <dir>` to navigate projects.
+- **Additional Read-Only Directories**: The operator may configure external directories that `read_file`, `list_directory`, `grep_search`, and `find_files_by_pattern` may inspect. These directories are immutable: use the dedicated file/search tools and never attempt to write or patch them. Never use terminal commands to bypass their read-only boundary.
+- **Configured Read-Only Directories**:
+{read_only_directories}
 - **Codebase Exploration**: Use `grep_search` and `find_files_by_pattern` for fast multi-file navigation instead of reading entire files repeatedly.
 - **Verification & Testing**: Always verify changes by running tests, linters, or checking file content.
 - **Analyze Output**: Inspect command outputs (stdout, stderr, exit codes). If errors occur, diagnose and repair them iteratively.
@@ -272,10 +284,14 @@ Below is the catalog of learned project skills. When a task relates to any avail
         catalog_xml = skill_store.format_catalog_prompt() if self.enable_skills else "<available_skills>\nNone (Skills disabled for testing).\n</available_skills>"
         user_profile_xml = user_profile_manager.format_system_prompt_block() if self.enable_memory else "<user_profile>\nDefault testing profile.\n</user_profile>"
         project_mem_xml = project_memory_manager.format_system_prompt_block() if self.enable_memory else "<project_memory>\nDefault testing memory.\n</project_memory>"
+        read_only_directories = "\n".join(
+            f"  - {json.dumps(path)}" for path in terminal_session.read_only_roots
+        ) or "  - None configured."
         base_prompt = self.SYSTEM_PROMPT_TEMPLATE.format(
             skills_catalog=catalog_xml,
             user_profile=user_profile_xml,
-            project_memory=project_mem_xml
+            project_memory=project_mem_xml,
+            read_only_directories=read_only_directories,
         )
         return _append_read_this(base_prompt)
 
@@ -998,6 +1014,17 @@ def parse_args():
         help="Existing directory used by terminal and file tools (default: <workspaces-dir>/<profile>, or launch cwd in legacy mode).",
     )
     parser.add_argument(
+        "--read-only-dir",
+        dest="read_only_dirs",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help=(
+            "Existing directory that file discovery tools may read but never modify. "
+            "Repeat the flag to allow multiple directories."
+        ),
+    )
+    parser.add_argument(
         "-m", "--model",
         type=str,
         default=os.environ.get("AGENT_MODEL", "Qwen-32b"),
@@ -1112,6 +1139,24 @@ def parse_args():
         args.workspace = args.launch_cwd
     if args.workspace_explicit and not Path(args.workspace).is_dir():
         parser.error("--workspace must resolve to an existing directory")
+    resolved_read_only_dirs = []
+    workspace_path = Path(args.workspace).expanduser().resolve()
+    for value in args.read_only_dirs:
+        if not value.strip():
+            parser.error("--read-only-dir must not be empty")
+        resolved_path = Path(value).expanduser().resolve()
+        if not resolved_path.is_dir():
+            parser.error(f"--read-only-dir must resolve to an existing directory: {value}")
+        if (
+            resolved_path == workspace_path
+            or resolved_path.is_relative_to(workspace_path)
+            or workspace_path.is_relative_to(resolved_path)
+        ):
+            parser.error("--read-only-dir must not overlap the writable workspace")
+        resolved = str(resolved_path)
+        if resolved not in resolved_read_only_dirs:
+            resolved_read_only_dirs.append(resolved)
+    args.read_only_dirs = resolved_read_only_dirs
     if args.max_tokens <= 0:
         parser.error("--max-tokens must be positive")
     if args.compaction_max_tokens is not None and args.compaction_max_tokens <= 0:
@@ -1202,6 +1247,10 @@ def main():
     print(f"Profile:    {args.profile if args.profile else 'legacy mode'}")
     print(f"State:      {runtime.state_root}")
     print(f"Workspace:  {runtime.workspace}")
+    print(
+        "Read-only:  "
+        + ("; ".join(str(path) for path in runtime.read_only_dirs) or "none")
+    )
     print("Security:   Interactive user review is active for EVERY system command.\n")
     print("Commands:   /skills | /user | /memory | /mode [normal|read-only|stateless] | /context | exit")
 

@@ -199,25 +199,47 @@ def export_impala_csv(sql: str, file_path: str, batch_size: int = 1000,
     return db_tools.export_impala_csv(sql, resolved, batch_size, root, overwrite)
 
 
-def _resolve_workspace_path(path: str) -> tuple[Optional[str], Optional[str]]:
-    root = os.path.realpath(getattr(terminal_session, "workspace_root", terminal_session.cwd))
-    candidate = os.path.realpath(os.path.abspath(os.path.join(terminal_session.cwd, path)))
-    try:
-        inside = os.path.commonpath((root, candidate)) == root
-    except ValueError:
-        inside = False
-    if not inside:
-        return None, f"Denied: Path '{path}' is outside the configured workspace."
-    return candidate, None
-
-
-def _is_within_workspace(path: str) -> bool:
-    root = os.path.realpath(getattr(terminal_session, "workspace_root", terminal_session.cwd))
+def _is_within_root(path: str, root: str) -> bool:
+    root = os.path.realpath(root)
     candidate = os.path.realpath(path)
     try:
         return os.path.commonpath((root, candidate)) == root
     except ValueError:
         return False
+
+
+def _resolve_workspace_path(
+    path: str, *, allow_read_only: bool = False
+) -> tuple[Optional[str], Optional[str]]:
+    root = os.path.realpath(getattr(terminal_session, "workspace_root", terminal_session.cwd))
+    candidate = os.path.realpath(os.path.abspath(os.path.join(terminal_session.cwd, path)))
+    for read_only_root in getattr(terminal_session, "read_only_roots", ()):
+        if _is_within_root(candidate, read_only_root):
+            if allow_read_only:
+                return candidate, None
+            return None, f"Denied: Path '{path}' is inside a configured read-only directory."
+    if _is_within_root(candidate, root):
+        return candidate, None
+    return None, f"Denied: Path '{path}' is outside the configured workspace and read-only directories."
+
+
+def _is_within_workspace(path: str, *, include_read_only: bool = False) -> bool:
+    root = os.path.realpath(getattr(terminal_session, "workspace_root", terminal_session.cwd))
+    candidate = os.path.realpath(path)
+    if _is_within_root(candidate, root):
+        return True
+    return include_read_only and any(
+        _is_within_root(candidate, read_only_root)
+        for read_only_root in getattr(terminal_session, "read_only_roots", ())
+    )
+
+
+def _path_for_display(path: str) -> str:
+    """Prefer a cwd-relative path, falling back across Windows drive boundaries."""
+    try:
+        return os.path.relpath(path, terminal_session.cwd)
+    except ValueError:
+        return os.path.realpath(path)
 
 
 def _is_sensitive_path(path: str) -> bool:
@@ -280,7 +302,7 @@ def run_terminal_command(command: str, timeout: int = 60) -> str:
 
 @registry.register(
     name="read_file",
-    description="Read file contents with optional line range slicing (1-indexed) or character-offset continuation for long single lines.",
+    description="Read a file inside the workspace or a configured external read-only directory, with optional line-range or character-offset continuation.",
     parameters={
         "type": "object",
         "properties": {
@@ -295,7 +317,7 @@ def run_terminal_command(command: str, timeout: int = 60) -> str:
 def read_file(file_path: str, start_line: Optional[int] = None, end_line: Optional[int] = None,
               char_offset: Optional[int] = None) -> str:
     try:
-        resolved_path, denied = _resolve_workspace_path(file_path)
+        resolved_path, denied = _resolve_workspace_path(file_path, allow_read_only=True)
         if denied:
             return denied
         if _is_sensitive_path(resolved_path):
@@ -413,7 +435,7 @@ def patch_file(file_path: str, search_content: str, replace_content: str) -> str
 
 @registry.register(
     name="list_directory",
-    description="List bounded contents of a directory inside the configured workspace; sensitive credential directories are denied.",
+    description="List bounded contents inside the workspace or a configured external read-only directory; sensitive credential directories are denied.",
     parameters={
         "type": "object",
         "properties": {
@@ -427,7 +449,7 @@ def patch_file(file_path: str, search_content: str, replace_content: str) -> str
 )
 def list_directory(directory_path: str = ".") -> str:
     try:
-        resolved_path, denied = _resolve_workspace_path(directory_path)
+        resolved_path, denied = _resolve_workspace_path(directory_path, allow_read_only=True)
         if denied:
             return denied
         if _is_sensitive_path(resolved_path):
@@ -451,7 +473,7 @@ def list_directory(directory_path: str = ".") -> str:
 
 @registry.register(
     name="grep_search",
-    description="Fast regex or literal text search across files in the codebase (ripgrep-style). Returns file paths, line numbers, and matching snippets.",
+    description="Fast regex or literal search across the workspace or configured external read-only directories. Returns paths, line numbers, and matching snippets.",
     parameters={
         "type": "object",
         "properties": {
@@ -471,7 +493,7 @@ def grep_search(
     file_pattern: Optional[str] = None,
     max_results: int = 30
 ) -> str:
-    resolved_root, denied = _resolve_workspace_path(search_path)
+    resolved_root, denied = _resolve_workspace_path(search_path, allow_read_only=True)
     if denied:
         return denied
     if not os.path.exists(resolved_root):
@@ -487,7 +509,7 @@ def grep_search(
     
     def search_file(fpath: str):
         nonlocal sensitive_skipped
-        if not _is_within_workspace(fpath):
+        if not _is_within_workspace(fpath, include_read_only=True):
             return False
         if _is_sensitive_path(fpath):
             sensitive_skipped = True
@@ -497,7 +519,7 @@ def grep_search(
                 for line_idx, line in enumerate(f, 1):
                     is_match = bool(matcher.search(line)) if is_regex else (query.lower() in line.lower())
                     if is_match:
-                        rel_path = os.path.relpath(fpath, terminal_session.cwd)
+                        rel_path = _path_for_display(fpath)
                         matches.append(f"{rel_path}:{line_idx}: {line.strip()}")
                         if len(matches) >= max_results:
                             return True
@@ -509,7 +531,7 @@ def grep_search(
         search_file(resolved_root)
     else:
         for root, dirs, files in os.walk(resolved_root):
-            dirs[:] = [d for d in dirs if d not in IGNORED_DIRS and (not d.startswith(".agent_") and (not d.startswith(".") or d in VISIBLE_HIDDEN_DIRS)) and _is_within_workspace(os.path.join(root, d))]
+            dirs[:] = [d for d in dirs if d not in IGNORED_DIRS and (not d.startswith(".agent_") and (not d.startswith(".") or d in VISIBLE_HIDDEN_DIRS)) and _is_within_workspace(os.path.join(root, d), include_read_only=True)]
             for filename in files:
                 if file_pattern and not fnmatch.fnmatch(filename, file_pattern):
                     continue
@@ -532,7 +554,7 @@ def grep_search(
 
 @registry.register(
     name="find_files_by_pattern",
-    description="Find files and directories matching a glob pattern across the workspace (e.g. '*.py', '*test*', 'src/**/*.ts').",
+    description="Find files matching a glob pattern across the workspace or configured external read-only directories (e.g. '*.py', '*test*').",
     parameters={
         "type": "object",
         "properties": {
@@ -544,7 +566,7 @@ def grep_search(
     }
 )
 def find_files_by_pattern(pattern: str, search_path: str = ".", max_results: int = 40) -> str:
-    resolved_root, denied = _resolve_workspace_path(search_path)
+    resolved_root, denied = _resolve_workspace_path(search_path, allow_read_only=True)
     if denied:
         return denied
     if _is_sensitive_path(resolved_root):
@@ -555,10 +577,10 @@ def find_files_by_pattern(pattern: str, search_path: str = ".", max_results: int
     matched_files = []
 
     for root, dirs, files in os.walk(resolved_root):
-        dirs[:] = [d for d in dirs if d not in IGNORED_DIRS and (not d.startswith(".agent_") and (not d.startswith(".") or d in VISIBLE_HIDDEN_DIRS)) and _is_within_workspace(os.path.join(root, d))]
+        dirs[:] = [d for d in dirs if d not in IGNORED_DIRS and (not d.startswith(".agent_") and (not d.startswith(".") or d in VISIBLE_HIDDEN_DIRS)) and _is_within_workspace(os.path.join(root, d), include_read_only=True)]
         for f in files:
             full_path = os.path.join(root, f)
-            if not _is_within_workspace(full_path):
+            if not _is_within_workspace(full_path, include_read_only=True):
                 continue
             relative_to_root = os.path.relpath(full_path, resolved_root).replace(os.sep, "/")
             normalized_pattern = pattern.replace("\\", "/")
@@ -569,7 +591,7 @@ def find_files_by_pattern(pattern: str, search_path: str = ".", max_results: int
             if any(fnmatch.fnmatchcase(relative_to_root, candidate) for candidate in patterns):
                 if _is_sensitive_path(full_path):
                     return f"Denied: Sensitive credential files matching '{pattern}' cannot be listed."
-                rel_path = os.path.relpath(full_path, terminal_session.cwd)
+                rel_path = _path_for_display(full_path)
                 matched_files.append(rel_path)
                 if len(matched_files) >= max_results:
                     break

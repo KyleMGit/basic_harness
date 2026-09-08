@@ -66,6 +66,8 @@ class DatabaseToolTests(unittest.TestCase):
         self.assertIn("complete row-set request", generic_prompt)
         self.assertIn("export_teradata_csv", generic_prompt)
         self.assertIn("export_impala_csv", generic_prompt)
+        self.assertIn("Additional Read-Only Directories", generic_prompt)
+        self.assertIn("Never use terminal commands to bypass", generic_prompt)
 
         prompt_path = os.path.join(os.path.dirname(__file__), "sql_agent_system_prompt.md")
         with open(prompt_path, encoding="utf-8") as handle:
@@ -74,6 +76,16 @@ class DatabaseToolTests(unittest.TestCase):
         self.assertIn("complete row-set request", sql_prompt)
         self.assertIn("export_teradata_csv", sql_prompt)
         self.assertIn("export_impala_csv", sql_prompt)
+        self.assertIn("Additional Read-Only Directories", sql_prompt)
+        self.assertIn("Never use terminal commands to bypass", sql_prompt)
+
+        concise_prompt_path = os.path.join(
+            os.path.dirname(__file__), "concise_sql_agent_system_prompt.md"
+        )
+        with open(concise_prompt_path, encoding="utf-8") as handle:
+            concise_prompt = handle.read()
+        self.assertIn("Additional Read-Only Directories", concise_prompt)
+        self.assertIn("Never use terminal commands to bypass", concise_prompt)
 
         schemas = {item["function"]["name"]: item["function"] for item in registry.schemas}
         for name in ("query_teradata", "query_impala"):

@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -36,6 +37,7 @@ class TestHermesAgentComponents(unittest.TestCase):
             project_memory_manager.storage_dir,
             project_memory_manager.file_path,
             terminal_session.cwd,
+            terminal_session.read_only_roots,
         )
         os.chdir(self.test_dir)
         skill_store.storage_dir = os.path.join(self.test_dir, ".agent_skills")
@@ -44,6 +46,7 @@ class TestHermesAgentComponents(unittest.TestCase):
         project_memory_manager.storage_dir = user_profile_manager.storage_dir
         project_memory_manager.file_path = os.path.join(project_memory_manager.storage_dir, "MEMORY.md")
         terminal_session.cwd = self.test_dir
+        terminal_session.set_read_only_roots(())
 
     def tearDown(self):
         from memory import user_profile_manager, project_memory_manager
@@ -56,7 +59,9 @@ class TestHermesAgentComponents(unittest.TestCase):
             project_memory_manager.storage_dir,
             project_memory_manager.file_path,
             terminal_session.cwd,
+            read_only_roots,
         ) = self._previous_paths
+        terminal_session.set_read_only_roots(read_only_roots)
         os.chdir(self._previous_cwd)
         self._temporary_directory.cleanup()
 
@@ -79,6 +84,143 @@ class TestHermesAgentComponents(unittest.TestCase):
         self.assertTrue(term.is_destructive("git reset --hard HEAD~1"))
         self.assertFalse(term.is_destructive("git status"))
         self.assertFalse(term.is_destructive("ls -la"))
+
+    def test_changing_terminal_cwd_preserves_read_only_roots(self):
+        first = os.path.join(self.test_dir, "first")
+        second = os.path.join(self.test_dir, "second")
+        os.makedirs(first)
+        os.makedirs(second)
+        term = TerminalSession(cwd=first)
+        term.set_read_only_roots([self.test_dir])
+
+        term.cwd = second
+
+        self.assertEqual(term.read_only_roots, (os.path.realpath(self.test_dir),))
+
+    def test_read_only_root_denial_survives_workspace_reconfiguration(self):
+        from tools import export_teradata_csv, patch_file, terminal_session, write_file
+
+        nested_workspace = os.path.join(self.test_dir, "nested-workspace")
+        os.makedirs(nested_workspace)
+        existing = os.path.join(nested_workspace, "existing.txt")
+        with open(existing, "w", encoding="utf-8") as handle:
+            handle.write("unchanged")
+        terminal_session.set_read_only_roots([self.test_dir])
+        terminal_session.cwd = nested_workspace
+
+        self.assertIn(
+            "read-only",
+            write_file(os.path.join(nested_workspace, "new.txt"), "blocked").lower(),
+        )
+        self.assertIn("read-only", patch_file(existing, "unchanged", "changed").lower())
+        with self.assertRaisesRegex(ValueError, "read-only"):
+            export_teradata_csv(
+                "SELECT 1",
+                os.path.join(nested_workspace, "blocked.csv"),
+            )
+        self.assertFalse(os.path.exists(os.path.join(nested_workspace, "new.txt")))
+        with open(existing, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), "unchanged")
+
+    def test_file_discovery_tools_read_external_roots_but_mutations_stay_in_workspace(self):
+        from tools import (
+            find_files_by_pattern,
+            grep_search,
+            list_directory,
+            patch_file,
+            read_file,
+            terminal_session,
+            write_file,
+        )
+
+        with tempfile.TemporaryDirectory() as external:
+            schema_dir = os.path.join(external, "database_information")
+            os.makedirs(os.path.join(schema_dir, "teradata"))
+            schema_file = os.path.join(schema_dir, "teradata", "orders.sql")
+            with open(schema_file, "w", encoding="utf-8") as handle:
+                handle.write("CREATE TABLE orders (order_id INTEGER);\n")
+            terminal_session.set_read_only_roots([schema_dir])
+
+            self.assertIn("CREATE TABLE orders", read_file(schema_file))
+            self.assertIn("orders.sql", list_directory(os.path.dirname(schema_file)))
+            self.assertIn("orders.sql:1", grep_search("order_id", schema_dir))
+            self.assertIn("orders.sql", find_files_by_pattern("*.sql", schema_dir))
+
+            denied_write = write_file(os.path.join(schema_dir, "new.sql"), "SELECT 1")
+            denied_patch = patch_file(schema_file, "orders", "changed")
+            self.assertIn("read-only", denied_write.lower())
+            self.assertIn("read-only", denied_patch.lower())
+            self.assertFalse(os.path.exists(os.path.join(schema_dir, "new.sql")))
+            with open(schema_file, encoding="utf-8") as handle:
+                self.assertIn("CREATE TABLE orders", handle.read())
+
+    def test_read_only_root_denies_parent_traversal(self):
+        from tools import read_file, terminal_session
+
+        with tempfile.TemporaryDirectory() as external:
+            read_only_root = Path(external, "database_information")
+            outside_file = Path(external, "secret.txt")
+            read_only_root.mkdir()
+            outside_file.write_text("secret", encoding="utf-8")
+            terminal_session.set_read_only_roots([str(read_only_root)])
+
+            traversal = read_file(str(read_only_root / ".." / "secret.txt"))
+            self.assertIn("outside", traversal.lower())
+
+    def test_read_only_root_denies_symlink_escape(self):
+        from tools import read_file, terminal_session
+
+        with tempfile.TemporaryDirectory() as external:
+            read_only_root = Path(external, "database_information")
+            outside_file = Path(external, "secret.txt")
+            read_only_root.mkdir()
+            outside_file.write_text("secret", encoding="utf-8")
+            terminal_session.set_read_only_roots([str(read_only_root)])
+
+            link = read_only_root / "outside-link.txt"
+            try:
+                link.symlink_to(outside_file)
+            except OSError:
+                self.skipTest("file symlinks unavailable")
+            symlink_escape = read_file(str(link))
+            self.assertIn("outside", symlink_escape.lower())
+
+    def test_database_exports_reject_read_only_destinations_before_querying(self):
+        from tools import export_impala_csv, export_teradata_csv, terminal_session
+
+        with tempfile.TemporaryDirectory() as external:
+            read_only_root = Path(external, "database_information")
+            read_only_root.mkdir()
+            terminal_session.set_read_only_roots([str(read_only_root)])
+
+            for export in (export_teradata_csv, export_impala_csv):
+                with self.subTest(export=export.__name__), self.assertRaisesRegex(
+                    ValueError, "read-only"
+                ):
+                    export("SELECT 1", str(read_only_root / "blocked.csv"))
+
+    def test_external_search_results_use_absolute_paths_across_drives(self):
+        from tools import find_files_by_pattern, grep_search, terminal_session
+
+        with tempfile.TemporaryDirectory() as external:
+            read_only_root = Path(external, "database_information")
+            schema_file = read_only_root / "orders.sql"
+            read_only_root.mkdir()
+            schema_file.write_text("order_id", encoding="utf-8")
+            terminal_session.set_read_only_roots([str(read_only_root)])
+            real_relpath = os.path.relpath
+
+            def cross_drive_relpath(path, start):
+                if os.path.realpath(start) == os.path.realpath(terminal_session.cwd):
+                    raise ValueError("path is on a different drive")
+                return real_relpath(path, start)
+
+            with patch("tools.os.path.relpath", side_effect=cross_drive_relpath):
+                grep_result = grep_search("order_id", str(read_only_root))
+                find_result = find_files_by_pattern("*.sql", str(read_only_root))
+
+            self.assertIn(str(schema_file.resolve()), grep_result)
+            self.assertIn(str(schema_file.resolve()), find_result)
 
     def test_skill_store_and_search(self):
         skill_dir = os.path.join(self.test_dir, "skills")
