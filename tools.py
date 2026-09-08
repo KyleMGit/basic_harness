@@ -613,7 +613,11 @@ def find_files_by_pattern(pattern: str, search_path: str = ".", max_results: int
 
 @registry.register(
     name="save_skill",
-    description="Save a newly learned procedure, command workflow, or script to the agent's persistent skill library.",
+    description=(
+        "Create a genuinely new procedure, command workflow, or script in the persistent skill library. "
+        "This create-only tool refuses normalized-name collisions; load and reuse an existing named skill "
+        "or rely on post-task reflection for an explicit curated update."
+    ),
     parameters={
         "type": "object",
         "properties": {

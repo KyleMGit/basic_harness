@@ -125,21 +125,49 @@ tags: {tags_str}
             return next((p for p in found if p.lower().endswith(".md")), found[0])
         return None
 
-    def save_skill(self, name: str, description: str, instructions: str, tags: Optional[List[str]] = None) -> str:
-        """
-        Save skill as standard Hermes Markdown (.md) and JSON for full backward & tool compatibility.
-        """
-        safe = self._safe_name(name)
-        os.makedirs(self.storage_dir, exist_ok=True)
-        md_path = os.path.join(self.storage_dir, f"{safe}.md")
-        json_path = os.path.join(self.storage_dir, f"{safe}.json")
+    def _resolved_skill_name(self, path: str, fallback: str) -> str:
+        """Read only the display name needed for an actionable collision refusal."""
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                if path.lower().endswith(".json"):
+                    return str(json.load(handle).get("name") or fallback)
+                return str(self.parse_markdown_skill(handle.read(), fallback).get("name") or fallback)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return fallback
 
+    def save_skill(self, name: str, description: str, instructions: str, tags: Optional[List[str]] = None,
+                   *, _curated_update: bool = False) -> str:
+        """
+        Create a coherent Markdown/JSON skill pair, or perform an explicitly authorized
+        host-side curated update. Model-facing callers cannot request updates.
+        """
         clean_name = name.strip()
+        safe = self._safe_name(clean_name)
         clean_desc = description.strip()
         clean_instr = instructions.strip()
         safe_content, status = screen_prompt_content(f"{clean_name}\n{clean_desc}\n{clean_instr}")
         if not safe_content:
             return status
+
+        try:
+            existing_path = self.resolve_skill_file(clean_name)
+        except ValueError as exc:
+            return f"Refused to save skill '{clean_name}': {exc}"
+
+        if existing_path and not _curated_update:
+            existing_name = self._resolved_skill_name(existing_path, safe)
+            return (
+                f"Refused to create skill '{clean_name}': it conflicts with existing skill "
+                f"'{existing_name}' after name normalization. Load and reuse the existing skill; "
+                "use post-task reflection for a curated update."
+            )
+
+        if _curated_update and not existing_path:
+            return f"Refused curated update: existing target skill '{clean_name}' was not found."
+
+        os.makedirs(self.storage_dir, exist_ok=True)
+        md_path = os.path.join(self.storage_dir, f"{safe}.md")
+        json_path = os.path.join(self.storage_dir, f"{safe}.json")
 
         # 1. Write Markdown format (.md)
         md_content = self.format_markdown_skill(clean_name, clean_desc, clean_instr, tags)
@@ -395,13 +423,6 @@ Respond ONLY with a JSON object in this format:
     def __init__(self, skill_store: SkillStore):
         self.skill_store = skill_store
 
-    def _compute_text_similarity(self, text_a: str, text_b: str) -> float:
-        words_a = set(re.findall(r"\b\w{3,}\b", text_a.lower()))
-        words_b = set(re.findall(r"\b\w{3,}\b", text_b.lower()))
-        if not words_a or not words_b:
-            return 0.0
-        return len(words_a & words_b) / len(words_a | words_b)
-
     def extract_and_save(
         self,
         client: Any,
@@ -460,20 +481,9 @@ Respond ONLY with a JSON object in this format:
                 if not name or not instr:
                     return None
 
-                # Additional host-side deduplication guard:
-                # If creating, check if an existing skill has very high similarity (> 0.55)
-                if action == "CREATE":
-                    for existing in self.skill_store.get_all_skills():
-                        sim = self._compute_text_similarity(
-                            f"{name} {desc}",
-                            f"{existing['name']} {existing.get('description', '')}"
-                        )
-                        if sim > 0.55:
-                            name = existing["name"]
-                            action = "UPDATE"
-                            break
-
-                save_status = self.skill_store.save_skill(name, desc, instr)
+                save_status = self.skill_store.save_skill(
+                    name, desc, instr, _curated_update=(action == "UPDATE")
+                )
                 if "successfully saved" not in str(save_status).lower():
                     return {
                         "action": "ERROR",

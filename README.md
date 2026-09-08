@@ -197,7 +197,7 @@ are not on the recognized read-only allowlist:
 | **`--stateless`** | `--benchmark` | `False` | **Benchmark Baseline**: Disables skills, memory, and disk saving (pure zero-shot). |
 | **`--no-skills`** | | `False` | Completely disables skill catalog and skill retrieval. |
 | **`--no-memory`** | | `False` | Completely disables USER.md and MEMORY.md injection. |
-| **`--auto-skills`** | | `False` | Opts in to a visible post-task skill reflection provider call (extra latency/tokens). Once enabled, safe CREATE and UPDATE proposals are applied automatically, including deduplicated CREATE proposals rerouted to an existing skill. |
+| **`--auto-skills`** | | `False` | Opts in to a visible post-task skill reflection provider call (extra latency/tokens). Once enabled, safe CREATE and explicit UPDATE proposals are applied automatically. |
 | **`--auto-memory`** | | `False` | Opts in to a visible post-task memory reflection provider call (extra latency/tokens). |
 | **`--no-auto-skills`**| | `False` | Compatibility alias that disables `--auto-skills`. |
 | **`--no-auto-memory`**| | `False` | Compatibility alias that disables `--auto-memory`. |
@@ -222,7 +222,7 @@ are not on the recognized read-only allowlist:
 | **`patch_file`** | `file_path`, `search_content`, `replace_content` | Performs targeted search-and-replace on existing files. |
 | **`list_directory`** | `directory_path` | Inspects directory contents and file sizes inside the workspace or configured read-only roots. |
 | **`load_skill` / `<skill_name>()`** | `name` | Reads instructions and workflow details for any learned project skill. |
-| **`save_skill`** | `name`, `description`, `instructions` | Saves a newly discovered procedural workflow to `.agent_skills/`. |
+| **`save_skill`** | `name`, `description`, `instructions` | Creates a genuinely new procedural workflow in `.agent_skills/`. Direct calls are create-only and fail closed on normalized-name collisions; a different normalized name is allowed regardless of content similarity. Only an explicit catalog-aware post-task reflection UPDATE can modify an existing skill. |
 | **`read_user_profile`** | *(none)* | Reads operator profile from `USER.md`. |
 | **`update_user_profile`** | `category`, `preference` | Appends or updates preferences in `USER.md`. |
 | **`read_project_memory`** | *(none)* | Reads project architecture facts from `MEMORY.md`. |
