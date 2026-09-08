@@ -457,6 +457,55 @@ class TestMessageSequencingAndCommandProvenance(unittest.TestCase):
         self.assertIn("Executed: echo edited", tool_result["content"])
         self.assertNotIn("Not executed", tool_result["content"])
 
+    def test_safe_read_only_terminal_command_skips_interactive_prompt(self):
+        from agent import HermesCodingAgent
+        from storage import TrajectoryLogger
+        from tools import terminal_session
+
+        with tempfile.TemporaryDirectory() as tmp:
+            read_only_root = Path(tmp, "database_information")
+            read_only_root.mkdir()
+            schema_file = read_only_root / "orders.sql"
+            schema_file.write_text("order_id", encoding="utf-8")
+            command = f'head -n 5 "{schema_file}"'
+            previous_cwd = terminal_session.cwd
+            previous_roots = terminal_session.read_only_roots
+            terminal_session.cwd = tmp
+            terminal_session.set_read_only_roots([str(read_only_root)])
+            try:
+                call = MagicMock()
+                call.id = "call_read_only"
+                call.function.name = "run_terminal_command"
+                call.function.arguments = json.dumps({"command": command})
+                first = self._native_message("", [call])
+                final = self._native_message("done")
+                agent = HermesCodingAgent(
+                    max_iterations=2,
+                    enable_skills=False,
+                    enable_memory=False,
+                    auto_learn_skills=False,
+                    auto_learn_memory=False,
+                )
+                agent.logger = TrajectoryLogger(str(Path(tmp, "history.db")))
+                agent.client.chat.completions.create = MagicMock(
+                    side_effect=[self._response(first), self._response(final)]
+                )
+                agent.prompt_user_for_command = MagicMock()
+                with patch("agent.registry.execute", return_value="order_id") as execute:
+                    agent.run("inspect the schema")
+
+                agent.prompt_user_for_command.assert_not_called()
+                execute.assert_any_call(
+                    "run_terminal_command",
+                    {"command": command},
+                    read_only=False,
+                    memory_disabled=True,
+                    skills_disabled=True,
+                )
+            finally:
+                terminal_session.cwd = previous_cwd
+                terminal_session.set_read_only_roots(previous_roots)
+
     def test_second_edited_command_in_parallel_native_turn_is_live_and_durable(self):
         from agent import HermesCodingAgent
         from storage import TrajectoryLogger

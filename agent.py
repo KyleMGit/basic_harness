@@ -168,7 +168,8 @@ class HermesCodingAgent:
     """
     Stateful, autonomous coding agent harness supporting both
     OpenAI structured tool calling and Hermes XML function calling protocols,
-    with interactive human-in-the-loop confirmation for every system command,
+    with fail-closed auto-approval for recognized confined reads and interactive
+    human-in-the-loop confirmation for all other system commands,
     automated context compaction/summarization, local model support (Qwen-32b, etc.),
     dual memory snapshots (USER.md / MEMORY.md), session resumption,
     and flexible testing modes (read-only, stateless, no-skills, no-memory).
@@ -178,7 +179,7 @@ class HermesCodingAgent:
 You have access to tools that allow you to inspect the system, manage files, search codebases, and execute terminal commands.
 
 ### Important Protocol:
-- **Interactive Terminal Commands**: Every system/terminal command you propose will be reviewed interactively by the user before execution. The user may approve it, modify it, or provide feedback.
+- **Terminal Command Review**: Recognized read-only terminal commands are auto-approved only when every filesystem operand resolves inside the writable workspace or a configured read-only directory. Mutating, compound, ambiguous, sensitive-file, outside-root, or unrecognized commands are reviewed interactively; the user may approve, edit, reject, or provide feedback.
 - **Context Compaction**: In long-running tasks, earlier conversation segments may be compressed into structured summary blocks. Use the summary to maintain continuity.
 - **Persistent Workspace**: The terminal environment maintains your working directory (`cwd`) across tool calls. Use `cd <dir>` to navigate projects.
 - **Additional Read-Only Directories**: The operator may configure external directories that `read_file`, `list_directory`, `grep_search`, and `find_files_by_pattern` may inspect. These directories are immutable: use the dedicated file/search tools and never attempt to write or patch them. Never use terminal commands to bypass their read-only boundary.
@@ -419,7 +420,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
         return True
 
     def prompt_user_for_command(self, command: str, args: Dict[str, Any]) -> Tuple[bool, str, Optional[str]]:
-        """Interactive prompt for every system command."""
+        """Interactive prompt for commands that do not qualify for safe auto-approval."""
         print("\n" + "-" * 60)
         print("[SYSTEM COMMAND REVIEW]")
         print(f"   Command: {command}")
@@ -858,6 +859,20 @@ Below is the catalog of learned project skills. When a task relates to any avail
                     if fn_name == "__protocol_error__":
                         tool_result = "Protocol repair required: " + str(fn_args.get("error", "malformed tool call"))
                         print(f"\n[Protocol Error]: {tool_result}")
+                    elif (
+                        fn_name == "run_terminal_command"
+                        and terminal_session.is_auto_approved_read_only_command(
+                            fn_args.get("command", "")
+                        )
+                    ):
+                        print("\n[Auto-approved read-only terminal command]")
+                        tool_result = registry.execute(
+                            fn_name,
+                            fn_args,
+                            read_only=self.read_only,
+                            memory_disabled=not self.enable_memory,
+                            skills_disabled=not self.enable_skills,
+                        )
                     elif fn_name == "run_terminal_command" and self.confirm_all_terminal_commands:
                         orig_cmd = fn_args.get("command", "")
                         should_run, final_cmd, feedback = self.prompt_user_for_command(orig_cmd, fn_args)
@@ -1251,7 +1266,7 @@ def main():
         "Read-only:  "
         + ("; ".join(str(path) for path in runtime.read_only_dirs) or "none")
     )
-    print("Security:   Interactive user review is active for EVERY system command.\n")
+    print("Security:   Confined recognized reads auto-run; all other commands require review.\n")
     print("Commands:   /skills | /user | /memory | /mode [normal|read-only|stateless] | /context | exit")
 
     agent = HermesCodingAgent(

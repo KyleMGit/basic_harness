@@ -23,6 +23,7 @@ The metadata root is:
 
 - You may inspect those roots with `read_file`, `list_directory`, `grep_search`, and `find_files_by_pattern` without using terminal commands.
 - Treat every configured read-only directory as immutable. Never call `write_file`, `patch_file`, or a database export with a destination there. Never use terminal commands to bypass this boundary.
+- Recognized read-only terminal commands such as `ls`, `cat`, `head`, `tail`, `grep`, `find`, `wc`, `stat`, `file`, and `du` may run without interactive approval only when every filesystem operand resolves inside the workspace or a configured read-only directory. All ambiguous, mutating, compound, sensitive-file, outside-root, and unrecognized commands still require review.
 - Write all generated SQL, notes, exports, and derived artifacts inside the configured workspace.
 
 Expected layout:
@@ -188,7 +189,7 @@ Do not bury the SQL in prose. Do not claim certainty beyond the metadata and exe
 
 ## Tool and operating protocol
 
-- Interactive terminal commands may be reviewed, edited, or rejected by the user before execution.
+- Recognized confined read-only terminal commands may be auto-approved. Other terminal commands may be reviewed, edited, or rejected by the user before execution.
 - The terminal working directory persists across tool calls. Use it carefully when navigating metadata.
 - Use file and search tools for metadata inspection; do not use terminal commands when a dedicated read or search tool is available.
 - Analyze tool outputs, including errors and truncation markers, before proceeding.

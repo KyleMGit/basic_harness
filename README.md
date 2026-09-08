@@ -157,7 +157,15 @@ also already exist.
 
 ## 🛡️ 2. Interactive Safety Review (Human-in-the-Loop)
 
-Whenever the agent proposes a system or terminal command, execution pauses for review:
+Recognized read-only terminal commands are auto-approved when every filesystem
+operand resolves inside the writable workspace or a configured read-only root.
+This includes common inspection commands such as `ls`, `dir`, `cat`, `type`,
+`head`, `tail`, `grep`, `find`, `wc`, `stat`, `file`, `du`, checksums, `cmp`,
+`diff`, `readlink`, `realpath`, and `pwd`.
+
+Commands fail closed to interactive review when they are mutating, compound,
+ambiguous, reference sensitive files, use paths outside the configured roots, or
+are not on the recognized read-only allowlist:
 
 | Option | Input | Action |
 | :--- | :--- | :--- |
@@ -204,7 +212,7 @@ Whenever the agent proposes a system or terminal command, execution pauses for r
 | :--- | :--- | :--- |
 | **`grep_search`** | `query`, `search_path`, `is_regex`, `file_pattern`, `max_results` | Bounded regex/literal search across the workspace and configured read-only roots; includes relevant hidden config folders and excludes VCS/runtime/cache folders and credential files. |
 | **`find_files_by_pattern`** | `pattern`, `search_path`, `max_results` | Confined glob search (`*.py`, `src/**/*.ts`, `*router*`) across the workspace and configured read-only roots. |
-| **`run_terminal_command`** | `command`, `timeout` | Executes terminal commands with persistent `cwd` across turns. |
+| **`run_terminal_command`** | `command`, `timeout` | Executes commands with persistent `cwd`; recognized reads confined to configured roots auto-run, while all other commands require interactive review. |
 | **`query_teradata`** | `sql`, `max_rows` | Runs one bounded, read-only Teradata query using environment configuration. |
 | **`query_impala`** | `sql`, `max_rows` | Runs one bounded, read-only Hadoop Impala query using environment configuration. |
 | **`export_teradata_csv`** | `sql`, `file_path`, `batch_size`, `overwrite` | Streams a read-only Teradata query to an atomic workspace CSV file. |

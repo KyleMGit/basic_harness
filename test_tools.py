@@ -85,6 +85,114 @@ class TestHermesAgentComponents(unittest.TestCase):
         self.assertFalse(term.is_destructive("git status"))
         self.assertFalse(term.is_destructive("ls -la"))
 
+    def test_terminal_auto_approves_common_reads_in_read_only_and_workspace_roots(self):
+        with tempfile.TemporaryDirectory() as external:
+            read_only_root = os.path.join(external, "database_information")
+            os.makedirs(read_only_root)
+            schema_file = os.path.join(read_only_root, "orders.sql")
+            workspace_file = os.path.join(self.test_dir, "workspace.sql")
+            for path in (schema_file, workspace_file):
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write("order_id")
+            term = TerminalSession(cwd=self.test_dir)
+            term.set_read_only_roots([read_only_root])
+
+            commands = (
+                f'head -n 20 "{schema_file}"',
+                f'tail -n 5 "{schema_file}"',
+                f'grep -rin "order_id" "{read_only_root}"',
+                f'grep -r order_id "{read_only_root}"',
+                f'ls -la "{read_only_root}"',
+                f'cat "{schema_file}"',
+                f'type "{schema_file}"',
+                f'wc -l "{schema_file}"',
+                f'stat "{schema_file}"',
+                f'file "{schema_file}"',
+                f'du -sh "{read_only_root}"',
+                f'dir "{read_only_root}"',
+                f'find "{read_only_root}" -type f -name "*.sql"',
+                f'sha256sum "{schema_file}"',
+                f'md5sum "{schema_file}"',
+                f'cmp "{schema_file}" "{schema_file}"',
+                f'diff "{schema_file}" "{schema_file}"',
+                f'readlink "{schema_file}"',
+                f'realpath "{schema_file}"',
+                f'cat "{workspace_file}"',
+                "pwd",
+            )
+            for command in commands:
+                with self.subTest(command=command):
+                    self.assertTrue(term.is_auto_approved_read_only_command(command))
+
+    def test_terminal_auto_approval_fails_closed_for_unsafe_or_outside_commands(self):
+        with tempfile.TemporaryDirectory() as external, tempfile.TemporaryDirectory() as forbidden:
+            read_only_root = os.path.join(external, "database_information")
+            os.makedirs(read_only_root)
+            schema_file = os.path.join(read_only_root, "orders.sql")
+            sensitive_file = os.path.join(read_only_root, ".env")
+            outside_file = os.path.join(forbidden, "outside.sql")
+            for path in (schema_file, sensitive_file, outside_file):
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write("order_id")
+            list_file = os.path.join(self.test_dir, "input-list.txt")
+            checksum_file = os.path.join(self.test_dir, "checksums.txt")
+            existing_output = os.path.join(self.test_dir, "existing-output.txt")
+            for path in (list_file, checksum_file, existing_output):
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(outside_file)
+            expansion_dir = os.path.join(self.test_dir, "%USERPROFILE%")
+            os.makedirs(expansion_dir)
+            expansion_decoy = os.path.join(expansion_dir, "outside.sql")
+            with open(expansion_decoy, "w", encoding="utf-8") as handle:
+                handle.write("decoy")
+            term = TerminalSession(cwd=self.test_dir)
+            term.set_read_only_roots([read_only_root])
+
+            commands = (
+                f'head "{outside_file}"',
+                f'head "{sensitive_file}"',
+                f'head "{schema_file}" > "{os.path.join(read_only_root, "copy.sql")}"',
+                f'grep order_id "{read_only_root}"; rm -rf "{read_only_root}"',
+                f'grep "$(touch bad)" "{read_only_root}"',
+                f'find "{read_only_root}" -delete',
+                f'find "{read_only_root}" -exec cat {{}} +',
+                f'file -C "{schema_file}"',
+                f'file --compile "{schema_file}"',
+                f'file -Cm "{schema_file}"',
+                f'file -f "{list_file}"',
+                f'md5sum -c "{checksum_file}"',
+                f'sha256sum --check "{checksum_file}"',
+                f'wc --files0-from "{list_file}"',
+                f'du --files0-from "{list_file}"',
+                f'diff --output "{existing_output}" "{schema_file}" "{schema_file}"',
+                f'grep -r order_id "{read_only_root}"',
+                f'grep -R order_id "{read_only_root}"',
+                f'du -L "{read_only_root}"',
+                f'ls -RL "{read_only_root}"',
+                'cat "%USERPROFILE%\\outside.sql"',
+                "grep order_id",
+                "python -c pass",
+            )
+            for command in commands:
+                with self.subTest(command=command):
+                    self.assertFalse(term.is_auto_approved_read_only_command(command))
+
+    @unittest.skipUnless(os.name == "nt", "Windows command shadowing rule")
+    def test_terminal_auto_approval_rejects_workspace_command_shadow(self):
+        workspace_file = os.path.join(self.test_dir, "workspace.sql")
+        shadow_command = os.path.join(self.test_dir, "cat.bat")
+        for path, content in (
+            (workspace_file, "order_id"),
+            (shadow_command, "@echo off\necho shadowed"),
+        ):
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(content)
+        term = TerminalSession(cwd=self.test_dir)
+
+        self.assertFalse(
+            term.is_auto_approved_read_only_command(f'cat "{workspace_file}"')
+        )
+
     def test_changing_terminal_cwd_preserves_read_only_roots(self):
         first = os.path.join(self.test_dir, "first")
         second = os.path.join(self.test_dir, "second")
