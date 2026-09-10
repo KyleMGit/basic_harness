@@ -42,7 +42,13 @@ def chat(owner, item):
     instance.read_only = instance.stateless = False
     instance.skill_review_owner = owner
     instance._task_evidence = item
-    instance.run_auto_skill_synthesis("unused")
+    if owner is None:
+        instance.run_auto_skill_synthesis("unused")
+    else:
+        # These diagnostics intentionally exercise the preserved legacy direct
+        # enqueue contract; selective caller behavior has dedicated integration tests.
+        with patch.object(owner, "capture_turn", side_effect=owner.enqueue):
+            instance.run_auto_skill_synthesis("unused")
     assert instance._task_evidence is None
     return instance
 
@@ -60,25 +66,25 @@ def assert_refusal(output):
 
 
 @pytest.mark.parametrize("kind,expected", [
-    ("raw", ("capture.traversal", "raw_bytes", "observed_bytes>=", "limit_bytes=256", "lower bound")),
+    ("raw", ("capture.traversal", "raw_bytes", "observed_bytes=", "limit_bytes=256")),
     ("serialized", ("capture.serialized", "serialized_bytes", "observed_bytes=", "limit_bytes=256")),
     ("messages", ("capture.serialized", "message_count", "observed_messages=3", "limit_messages=2")),
-    ("depth", ("capture.traversal", "depth", "observed_depth=13", "limit_depth=12")),
-    ("nodes", ("capture.traversal", "nodes", "observed_nodes=513", "limit_nodes=512")),
+    ("depth", ("capture.traversal", "depth", "observed_depth=25", "limit_depth=24")),
+    ("nodes", ("capture.traversal", "nodes", "observed_nodes=8193", "limit_nodes=8192")),
     ("unsupported", ("capture.traversal", "unsupported_data")),
     ("incomplete", ("capture.completion", "incomplete_completion")),
 ])
 def test_chat_reports_specific_capture_refusals(mailbox, capsys, kind, expected):
     owner, _ = mailbox
     assert owner.enqueue(evidence(task="earlier")).status == "ACCEPTED"
-    item = review.Evidence("session", max_bytes=256 if kind in ("raw", "serialized") else 16384,
-                           max_messages=2 if kind == "messages" else 64)
+    item = review.Evidence("session", max_bytes=256 if kind in ("raw", "serialized") else review.TURN_BYTES,
+                           max_messages=2 if kind == "messages" else review.TURN_MESSAGES)
     content = "x" * 1000 if kind == "raw" else "é" * 100 if kind == "serialized" else "task"
     if kind == "depth":
-        for _ in range(15):
+        for _ in range(25):
             content = [content]
     elif kind == "nodes":
-        content = [None] * 600
+        content = [None] * 9000
     elif kind == "unsupported":
         content = {"unsupported set"}
     item.add({"role": "user", "content": content})
@@ -94,17 +100,17 @@ def test_chat_reports_specific_capture_refusals(mailbox, capsys, kind, expected)
     assert [row["task_id"] for row in rows(owner, "evidence")] == ["earlier"]
 
 
-def test_capture_keeps_16_kib_limit_and_stops_traversing_after_refusal(mailbox, capsys):
+def test_capture_keeps_256_kib_limit_and_stops_traversing_after_refusal(mailbox, capsys):
     owner, _ = mailbox
     item = review.Evidence("session")
-    item.add({"role": "user", "content": "x" * 20000})
+    item.add({"role": "user", "content": "x" * 300000})
     class Untouchable(dict):
         def items(self):
             pytest.fail("Traversal continued after the first refusal")
     item.add({"role": "assistant", "content": Untouchable()})
     chat(owner, item)
     output = capsys.readouterr().out
-    assert "limit_bytes=16384" in output and "observed_bytes>=" in output
+    assert f"limit_bytes={review.TURN_BYTES}" in output and "observed_bytes=" in output
     assert_refusal(output)
 
 
@@ -115,23 +121,23 @@ def test_chat_reports_queue_and_admission_byte_bounds(mailbox, capsys, kind):
         owner.max_records = 1
         owner.enqueue(evidence(task="old"))
     elif kind == "bytes":
-        for index in range(65):
-            assert owner.enqueue(evidence(task=str(index), text="x" * 16000)).status == "ACCEPTED"
+        for index in range(115):
+            assert owner.enqueue(evidence(task=str(index), text="x" * 68000)).status == "ACCEPTED"
     before = rows(owner, "evidence")
     item = capture()
     if kind == "task_bytes":
-        with patch.object(item, "finish", return_value=review.EvidenceResult("READY", "s", "t", "x" * 16385)):
+        with patch.object(item, "finish", return_value=review.EvidenceResult("READY", "s", "t", "x" * (review.TURN_BYTES + 1))):
             chat(owner, item)
     else:
         if kind == "bytes":
             item = review.Evidence("s")
-            item.add({"role": "user", "content": "x" * 16000})
+            item.add({"role": "user", "content": "x" * 68000})
             item.add({"role": "assistant", "content": "Done"})
         chat(owner, item)
     output = capsys.readouterr().out
     assert f"reason={'queue_' + kind if kind != 'task_bytes' else 'serialized_bytes'}" in output
     assert "stage=admission" in output
-    assert ("limit_records=1" if kind == "records" else "limit_bytes=1048576" if kind == "bytes" else "limit_bytes=16384") in output
+    assert ("limit_records=1" if kind == "records" else f"limit_bytes={review.MAX_QUEUE_BYTES - review.QUEUE_HEADROOM_BYTES}" if kind == "bytes" else f"limit_bytes={review.TURN_BYTES}") in output
     assert "observed_" in output
     assert_refusal(output)
     assert rows(owner, "evidence") == before
@@ -188,7 +194,7 @@ def test_chat_unexpected_exception_name_cannot_inject_logs(mailbox, capsys):
     with patch.object(owner, "enqueue", side_effect=evil(PRIVATE)):
         chat(owner, capture())
     output = capsys.readouterr().out
-    assert "stage=admission" in output and "error=RuntimeError" in output
+    assert "stage=episode.admission" in output and "error=RuntimeError" in output
     assert_refusal(output)
 
 

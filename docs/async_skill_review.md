@@ -2,14 +2,15 @@
 
 Run one persistent `agent.py --profile ...` process per authenticated user and
 **one supervised `skill_review.py run` process for the host**. Automatic learning
-is opt-in. The owner has a lightweight preparation/delivery thread; only the
+is opt-in. The owner has a lightweight lifecycle/snapshot/delivery thread; only the
 separate service schedules inference. Default capacity is one request, with a
 fixed pool configurable from 1 to 8 at service startup. No agent starts a service.
 
 Automatic mode derives profile IDs, private mailbox paths and immutable catalog
 identities from one host-controlled profile root. Owners that enable learning and
 the service use the same host model and endpoint; there is no smaller/second-model dependency. The service reads
-sealed prepared snapshots and writes proposals into that user's mailbox. It never
+sealed episode manifests and authorized catalog snapshots, assembles bounded
+whole-exchange evidence, and writes proposals into that user's mailbox. It never
 opens, searches or mutates a catalog. No context, catalog, semantic deduplication
 or learned state is shared between users. Only the bound owner validates and
 publishes CREATE/UPDATE/NONE results.
@@ -93,8 +94,8 @@ twice, so exactly-once remote execution is not promised. No OS service is instal
 by this implementation.
 
 `once` recovers interrupted attempts and processes at most the oldest prepared
-batch present for each eligible profile at entry. It does not wait for disconnected
-owners to prepare new work. `run` picks the oldest prepared batch whenever capacity
+revision present for each eligible profile at entry. It does not wait for disconnected
+owners to prepare new work. `run` picks the oldest prepared revision whenever capacity
 is available. At most one batch per profile is outstanding; a busy user's next
 batch cannot replace another user's older prepared batch. An idle connected owner
 polls for delivery approximately every 100 ms. Normal owner exit is a disconnect:
@@ -148,89 +149,191 @@ queues or migrates catalogs. Explicit reenable creates a fresh generation and
 purges canceled queue generations; changing modes cannot revive old work/results.
 Switching back also requires revocation of the currently selected authority.
 
+This release adds owner-created `episodes`, `episode_sources`, bounded
+fingerprint tables, and additive anchor/association/whole-unit-retirement columns on `episodes` without
+rewriting legacy `evidence`/`jobs`. Existing accepted
+legacy jobs keep their processing and acknowledgement contract and are not
+retrospectively gated or re-captured from history. Schema initialization occurs
+only when an authorized writable owner enables learning; read-only/status/service
+startup does not initialize or migrate a profile. Deploy owner and service code
+together and perform a coordinated stop/start; mixed old/new binaries processing
+new episode manifests are unsupported. Do not delete/revoke queues merely to
+upgrade, and preserve/report a pre-existing mailbox above the 16-MiB page ceiling
+instead of truncating, resetting, or vacuuming it automatically.
+
 To change the automatic review service's model/endpoint, first revoke with the old settings
 and stop all affected processes. Only then remove the external `policy.json`
 for that root and launch both sides with the new matching settings. Keep the
 per-store authority/auth files: they prevent revival of earlier configurations.
 Do not remove control state or queue files as a shortcut around revocation.
 
-## Admission, privacy and bounds
+## Selective episodes, privacy and bounds
 
-The foreground preserves the existing answer, completion log and session
-persistence. It then runs `--auto-memory` **synchronously, in its original order**,
-and performs a short local durable skill enqueue. Memory reflection can still
+The foreground performs one deterministic, bounded caller-start check for an
+explicit procedural challenge before model execution. If matched, the owner
+durably marks the current episode revision challenged and supersedes its pending
+job before the turn proceeds; this uses no provider or catalog scan. The foreground
+otherwise preserves the existing answer, completion log and session persistence.
+After completion it runs `--auto-memory` **synchronously, in its original order**,
+and performs bounded omission plus a short local durable turn-delta capture. Memory reflection can still
 delay return, and background inference still consumes shared endpoint compute.
 The current session's system prompt stays frozen; later constructed prompts can
 see published skills. Pre-turn skill retrieval is unchanged.
 
-Admission necessarily includes local I/O latency. SQLite busy timeout and enqueue
-coordination acquisition each use 50 ms bounds; these are contention limits, not
+Caller-start invalidation and completion admission necessarily include local I/O
+latency. SQLite busy timeout and coordination acquisition each use 50 ms bounds;
+these are contention limits, not
 a guarantee about OS/filesystem latency. No catalog scan, catalog hash, provider
-request or result delivery occurs in foreground enqueue. Snapshot preparation and
-publication run in the owner thread, with no inference in that thread.
+request or result delivery occurs in foreground capture. Catalog snapshot preparation
+and publication run in the owner thread, with no inference in that thread. Evidence
+assembly, whole-exchange selection and final request composition run in the shared
+service after claim and outside the owner/foreground coordination lock.
+
+A completed turn is only a capture boundary. Deterministic host observations make
+an episode eligible after a resolved non-routine SQL/procedural failure, a supported
+substantive correction, or an investigated reusable procedure that was actually
+verified. Dates, filters, sorting, limits, formatting, routine grouping,
+clarifications, acknowledgements and repetitions do not independently qualify.
+There is no eligibility/summarizer model request. Conservative signatures can miss
+learning or admit a duplicate; the existing reviewer still makes CREATE/UPDATE/NONE.
+
+Related turns stay in one bounded episode. Eligible work dispatches after 120 seconds
+idle, a topic/session boundary, normal exit, or at the next completed-turn boundary
+once the oldest eligible signal is 900 seconds old. A newly verified substantive
+correction is ready immediately. A start-boundary challenge requires explicit
+wrong/incorrect language plus procedural or structural terms; routine date, filter,
+sort, limit, format and similar parameter wording does not challenge a revision.
+A recognized challenge increments the revision and supersedes older
+prepared/running/results before model execution. Its durable challenged state
+survives a failed/interrupted turn and same-generation reconnect, so completion is
+not required to block an obsolete proposal. Remote inference is not claimed to be
+cancellable. Already published skills remain linked catalog targets for a later UPDATE.
+
+A routine turn with a changed SQL signature does not revise or invalidate a frozen
+PREPARED/RUNNING/RESULT episode and cannot create a second request. A complete
+post-dispatch turn containing a new failure, metadata finding, verified non-routine
+execution, or correction is retained unbound as a later revision. Acknowledgement
+consumes only sources bound to the frozen job, then promotes those deferred sources;
+stale/superseded bindings are cleared without publishing or reviving the old result.
+
+After acknowledgment, the owner retains only the original user request as a
+separately labelled `context_only` anchor (plus a bounded related-skill association),
+not the acknowledged tool history. The anchor is counted in private payload and
+episode limits and, when needed by a later correction, in selected-view bytes and
+messages. The 16-KiB carry bound applies only after this source becomes a context-only
+anchor; a complete first source may use the 64-KiB selected-view budget. An oversized
+future anchor is omitted whole and replaced by a bounded `missing_context` record.
+If a later revision needs that absent original context, preparation ends with an
+explicit `BUDGET_REFUSED` and zero provider calls rather than sending a truncation.
+
+When a DRAFT episode reaches its byte/message limit, the owner may retire oldest
+optional routine turns as complete units. It preserves the original turn, failures,
+metadata, corrections, verified non-routine support, and every job-bound source.
+Requests report retired source/message/byte counts and the retirement reason. A
+normal agent shutdown explicitly retires source-free ACKED state and unresolved,
+unpinned CHALLENGED state for that session; PREPARED/RUNNING/RESULT work is never
+retired there. A plain owner disconnect does not perform that explicit retirement,
+so same-generation reconnect keeps its challenge freshness fence and pending work.
 
 | Bound | Default/contract |
 | --- | --- |
-| One task's evidence | 16 KiB, 64 messages; traversal limited to 512 nodes/depth 12 |
-| Unconsumed private evidence | 128 tasks or 1 MiB, whichever fills first |
-| Prepared batch | Oldest 4 tasks, at most 64 KiB of message evidence |
+| One completed turn | 256 KiB / 256 retained messages after SQL business-output omission |
+| Raw input inspection | 256 KiB for the complete selected message before JSON/XML/argument/result decoding |
+| Decoded structure | 8,192 nodes / depth 24 per message, including JSON decoded from strings |
+| One episode | 512 KiB / 512 retained messages, including pinned antecedents |
+| Context-only carry anchor | 16 KiB; indispensable larger evidence is refused rather than sliced |
+| Pending private capacity | 128 episode/legacy units / 8 MiB total live payload, with 512 KiB reserved inside it for preparation/results |
+| Repetition index | 1,024 fingerprints / 128 KiB, counted in pending payload |
+| Selected review view | 64 KiB / 128 messages including wrappers, IDs, provenance and omission records |
 | Outstanding batch | One per profile, including retained disconnected results |
 | Catalog prompt context | At most 128 summaries/16 KiB; overall catalog snapshot under 48 KiB |
 | Eligible UPDATE context | At most 8 complete Markdown targets, each at most 12 KiB; never truncated |
 | Supported catalog file | Read at most 256 KiB plus one overflow byte per file |
-| Prepared inference request | At most 128 KiB; otherwise explicitly INVALID |
+| Prepared user-content JSON | At most 128 KiB after composition |
+| Complete SDK JSON body | At most 256 KiB including prompt, settings, envelope and escaping |
 | Model result | At most 24 KiB and the configured token cap |
+| Private mailbox | 16-MiB SQLite page ceiling; DELETE rollback journal and per-connection journal-size limit |
 | Terminal job history | Last 32 metadata outcomes; task/catalog/result bodies cleared at acknowledgement |
 
 Capture is incremental at task/message boundaries before context compaction, not
 a copy of the current session transcript at completion. It omits system prompts
 and uses `TrajectoryLogger._safe` / `ContextManager.redact_sensitive_value` on
-bounded values. Completed tasks remain separate across sessions. A minimal
-user+final-assistant task is valid; incomplete, tool-ending, unanswered-tool,
+bounded values. Native and Hermes XML SQL results are tied to call IDs. Recognized
+business `rows` are removed before admission regardless of size and replaced by a
+labelled receipt retaining database, bounded columns, row count and truncation.
+Only supported metadata commands or queries whose parsed `FROM`/`JOIN` sources are
+all recognized catalog sources may retain bounded results. SQL comments and string
+literals are ignored for classification; comma joins, business/catalog joins,
+subqueries/CTEs with uncertain sources, and other unknown or mixed SQL output are
+not trusted as metadata. Identifiable assistant copies of structured rows/CSV are
+omitted whole. Executed arguments, call IDs, redacted errors and useful schema facts
+remain; interactive outputs, history, exports and synchronous auto-memory do not
+change. This is business-result omission, not comprehensive anonymization of values
+inside arbitrary user prose or SQL literals.
+
+Incomplete, tool-ending, unanswered-tool,
 empty or length-terminated completions are excluded. Oversized evidence refuses
 the task instead of truncating secrets or silently evicting older tasks.
 
-`ACCEPTED` means SQLite committed the bounded task record before return. `OVERFLOW`
+Legacy direct `Owner.enqueue` records retain their earlier processing/consumption
+contract. New automatic capture persists only turn deltas and stays quiet for normal
+non-eligible work. `ELIGIBLE` means a positive local signal is retained, not that a
+provider call or publication has happened. `OVERFLOW`
 means no admission and earlier records remain. `FAILED` means local admission did
 not succeed (for example lock contention/storage failure). `DISABLED` and
 `INCOMPLETE` are refusals. Failures do not change a successful task answer. This
 does not guarantee reviewing every task forever, automatic retry of refused
 tasks, or survival beyond normal local SQLite/filesystem durability guarantees.
-Only evidence included in an acknowledged batch is consumed. Terminal provider
-errors/invalid proposals consume their included batch with an explicit outcome.
+Only references included in an acknowledged result/refusal are consumed. An
+indispensable candidate that cannot fit produces `BUDGET_REFUSED` with zero provider
+requests and does not block later fitting work. Terminal provider errors/invalid
+proposals retain their explicit outcome; transient local preparation/storage faults
+retain accepted work for recovery.
+
+SQL-shape fingerprints from successfully completed semantic-review proposals are
+consulted across episodes to suppress a fully repeated failure/resolution set.
+Zero-request budget refusals and INVALID/FAILED review attempts do not add
+fingerprints; their consumed evidence is not retried, while a new fitting episode
+remains eligible. A correction or any new shape can still progress. The index is
+pruned oldest-first at 1,024 records and 128 KiB; eviction may permit a later
+duplicate review but never restores an acknowledged source or result.
 
 ## Reading the diagnostics
 
-The agent prints admission and refusal diagnostics in the conversation. For example,
-these messages were produced with temporary evidence and the unchanged 16 KiB cap:
+The agent prints exceptional capture/admission refusals in the conversation. Normal
+non-eligible turns are quiet. Example shapes are:
 
 ```text
-[Skill Review] OVERFLOW: stage=capture.traversal reason=raw_bytes observed_bytes>=20015 limit_bytes=16384 (partial message traversal; lower bound, not a task total); NOT queued; no automatic retry; earlier queue work retained.
-[Skill Review] OVERFLOW: stage=capture.serialized reason=serialized_bytes observed_bytes=18031 limit_bytes=16384 (capacity accounting includes a reserved separator byte); NOT queued; no automatic retry; earlier queue work retained.
+[Skill Review] OVERFLOW: stage=capture.traversal reason=raw_bytes observed_bytes=300028 limit_bytes=262144; NOT queued; no automatic retry; earlier queue work retained.
+[Skill Review] OVERFLOW: stage=capture.serialized reason=serialized_bytes observed_bytes=262145 limit_bytes=262144; NOT queued; no automatic retry; earlier queue work retained.
 ```
 
-The first diagnostic stops at the original traversal boundary. Its byte count is
-a lower bound from the visited data, not a serialized task size. The second uses
-the existing serialized capacity counter, including its one reserved separator
-byte; JSON escaping can exceed this cap even when raw UTF-8 fits. Logging does not
-perform another serialization or traverse the rejected remainder.
+The raw count is exact for the complete selected message fields and is checked before
+decoding assistant JSON, native tool arguments, Hermes XML calls, or SQL result JSON.
+An oversized uninspectable message is refused as a whole; safely inspectable
+structured SQL business rows are then projected before admission. The serialized count is the
+exact compact retained-message array (the prior separator off-by-one is removed);
+JSON escaping can make it larger than raw UTF-8. Structured SQL business rows are
+projected before this retained-data path, but projection is not an exemption from
+the raw inspection bound.
 
-`capture.traversal` also distinguishes depth 13 against limit 12, node 513 against
-limit 512, and unsupported data. Depth/node observations describe the partial
+`capture.traversal` also distinguishes depth 25 against limit 24, node 8193 against
+limit 8192, and unsupported data. Depth/node observations describe the partial
 traversal. `capture.serialized` reports message count overflow separately from
 bytes. `capture.completion` reports incomplete evidence and its captured message
-count; two messages alone do not prove a complete task. These limits, the 64-message
-cap, and completion eligibility are unchanged.
+count; two messages alone do not prove a complete task. Decoded JSON inside strings
+uses the same node/depth counters, and message 257 is refused.
 
 `admission.lock`, `admission.authorization`, and `admission.sqlite` distinguish
 local admission failures. Known acquisition and SQLite busy settings appear as
 `coordination_timeout_s=0.05` and `sqlite_busy_timeout_s=0.05`. `admission.queue`
 reports `queue_records` or `queue_bytes` with the observed count including the
-rejected task and the applicable limit (128 records or 1048576 bytes by default).
+rejected unit and the applicable limit (128 units or 7864320 admission bytes after
+the 512-KiB preparation/result reservation).
 Queue byte diagnostics also show the already queued and incoming byte counts.
 Every refusal says the task was **NOT queued**, has **no automatic retry**, and
-retains earlier queue work. `ACCEPTED` is durable admission only; it does not
-promise publication. Unavailable guidance points to the automatic launch settings
+retains earlier queue work. A legacy direct `ACCEPTED` or automatic `ELIGIBLE` is
+durable local state only; it does not promise publication. Unavailable guidance points to the automatic launch settings
 above; a static roster is optional.
 
 The separate service emits errors immediately on stderr, including in `once`.

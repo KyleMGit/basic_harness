@@ -39,9 +39,17 @@ def private_provider():
                 release.wait(10)
             proposal = create_proposal(who + "_skill")
             proposal["description"] = who + " private workflow"
-            content = json.dumps(proposal) if review else who + " task complete"
+            if review:
+                message = dict(role="assistant", content=json.dumps(proposal))
+            elif body["messages"][-1].get("role") == "tool":
+                message = dict(role="assistant", content=who + " task complete")
+            else:
+                message = dict(role="assistant", content="", tool_calls=[{
+                    "id": "verify-file", "type": "function",
+                    "function": {"name": "read_file", "arguments": json.dumps({"file_path": "private.txt"})},
+                }])
             raw = json.dumps(dict(id="fake", object="chat.completion", created=1, model=body["model"],
-                choices=[dict(index=0, finish_reason="stop", message=dict(role="assistant", content=content))],
+                choices=[dict(index=0, finish_reason="stop", message=message)],
                 usage=dict(prompt_tokens=10, completion_tokens=10, total_tokens=20))).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -98,8 +106,11 @@ def job_status(root, who, status):
     mailbox = root / who / "skill_review.db"
     if not mailbox.exists():
         return False
-    with sqlite3.connect(mailbox.as_uri() + "?mode=ro", uri=True, timeout=.05) as conn:
-        return conn.execute("SELECT 1 FROM jobs WHERE status=?", (status,)).fetchone()
+    try:
+        with sqlite3.connect(mailbox.as_uri() + "?mode=ro", uri=True, timeout=.05) as conn:
+            return conn.execute("SELECT 1 FROM jobs WHERE status=?", (status,)).fetchone()
+    except sqlite3.OperationalError:
+        return False
 
 
 @pytest.mark.parametrize("existing", [True, False, True], ids=["existing-live-add", "service-first", "live-add-repeat"])
@@ -118,8 +129,7 @@ def test_same_service_pid_discovers_new_real_owners_during_inflight_review(tmp_p
                 "--workspace", workspace, "--read-only-dir", schema, "--max-tokens", "8192",
                 "--auto-skills", "--no-memory", "--model", "test-model", "--base-url", endpoint))
             owners[who] = owner, output
-            send(owner, f"Complete TASK_{who.upper()} password={who.upper()}_SECRET")
-            await_output(owner, output, "[Skill Review] ACCEPTED")
+            send(owner, f"No, the TASK_{who.upper()} procedure is wrong; verify the corrected approach password={who.upper()}_SECRET")
             wait_for(lambda: job_status(root, who, "PREPARED"))
 
         if existing:
@@ -166,6 +176,7 @@ def test_real_automatic_mode_revocation_and_reenable_fence_late_writes(tmp_path,
     from test_profile_discovery import run_agent, tree_bytes
     root, workspace = tmp_path / "profiles", tmp_path / "workspace"
     workspace.mkdir()
+    (workspace / "private.txt").write_text("isolated verification fixture")
     provision = run_agent(root, workspace, "--no-memory")
     assert provision.returncode == 0, provision.stdout + provision.stderr
     assert not (root / "alice" / "skill_review.db").exists()
@@ -175,8 +186,8 @@ def test_real_automatic_mode_revocation_and_reenable_fence_late_writes(tmp_path,
         await_output(owner, output, "Commands:")
         assert not (root / "alice" / "skill_review.db").exists()
         send(owner, "/mode normal")
-        send(owner, "Complete TASK_ALICE password=ALICE_SECRET")
-        await_output(owner, output, "[Skill Review] ACCEPTED")
+        send(owner, "No, the TASK_ALICE procedure is wrong; verify the corrected approach password=ALICE_SECRET")
+        wait_for(lambda: job_status(root, "alice", "PREPARED"))
         service, service_output = stack.enter_context(process("skill_review.py", "run", "--profiles-dir", root,
             "--model", "test-model", "--base-url", endpoint, "--discovery-interval", ".05", "--timeout", "8"))
         assert entered.wait(5), "".join(service_output)
@@ -188,16 +199,16 @@ def test_real_automatic_mode_revocation_and_reenable_fence_late_writes(tmp_path,
         release.set()
         bob_workspace = tmp_path / "bob-workspace"
         bob_workspace.mkdir()
+        (bob_workspace / "private.txt").write_text("bob isolated verification fixture")
         bob, bob_output = stack.enter_context(process("agent.py", "--profile", "bob", "--profiles-dir", root,
             "--workspace", bob_workspace, "--auto-skills", "--no-memory", "--model", "test-model", "--base-url", endpoint))
-        send(bob, "Complete TASK_BOB")
-        await_output(bob, bob_output, "[Skill Review] ACCEPTED")
+        send(bob, "No, the TASK_BOB procedure is wrong; verify the corrected approach")
         wait_for(lambda: job_status(root, "bob", "APPLIED"), 8)
         # Bob's result proves the one service slot finished Alice's revoked call.
         assert tree_bytes(root / "alice") == before
         assert not (root / "alice" / "skills" / "alice_skill.md").exists()
         send(owner, "/mode normal")
-        send(owner, "Complete new TASK_ALICE")
+        send(owner, "No, the new TASK_ALICE procedure is wrong; verify the corrected approach")
         wait_for(lambda: job_status(root, "alice", "APPLIED"), 8)
         with sqlite3.connect((root / "alice" / "skill_review.db").as_uri() + "?mode=ro", uri=True) as conn:
             assert conn.execute("SELECT count(*) FROM jobs").fetchone()[0] == 1

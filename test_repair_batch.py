@@ -452,9 +452,13 @@ class TestSliceELearningSafety(unittest.TestCase):
         agent = HermesCodingAgent.__new__(HermesCodingAgent)
         agent.auto_learn_skills = True; agent.read_only = False; agent.stateless = False
         agent.skill_review_owner = MagicMock()
-        agent.skill_review_owner.enqueue.return_value = Admission("FAILED", "local durable enqueue failed")
+        agent.skill_review_owner.capture_turn.return_value = Admission("FAILED", "local durable enqueue failed")
         agent._task_evidence = Evidence("session", "task")
-        agent._task_evidence.add({"role":"user", "content":"Task"})
+        agent._task_evidence.add({"role":"user", "content":"No, that procedure is wrong; verify the corrected file workflow"})
+        agent._task_evidence.add({"role":"assistant", "content":"", "tool_calls":[{
+            "id":"verify", "type":"function",
+            "function":{"name":"read_file", "arguments":"{\"file_path\":\"fixture.txt\"}"}}]})
+        agent._task_evidence.add({"role":"tool", "tool_call_id":"verify", "content":"verified fixture"})
         agent._task_evidence.add({"role":"assistant", "content":"Done"})
         agent.refresh_system_prompt = MagicMock(); agent.logger = MagicMock()
         with patch("builtins.print") as output:

@@ -9,10 +9,14 @@ import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
+from unittest.mock import patch
 
+import agent as agent_module
 from skills import SkillStore
 from test_async_skill_review import wait_for, create_proposal, setup_roster, owner_for, evidence, rows
-from skill_review import ReviewService, load_roster
+from skill_review import Evidence, Owner, ReviewService, load_roster
+from test_skill_review_integration import answer_message
 
 
 ROOT = Path(__file__).resolve().parent
@@ -64,6 +68,104 @@ def command(*args):
     return [sys.executable, *map(str, args)]
 
 
+def http_agent(tmp_path, endpoint):
+    setup_roster(tmp_path)
+    roster_path = tmp_path / "roster.json"
+    value = json.loads(roster_path.read_text())
+    value["base_url"] = endpoint
+    value["profiles"][0]["profile_id"] = "user-0"
+    roster_path.write_text(json.dumps(value))
+    roster = load_roster(roster_path)
+    previous = agent_module.skill_store.storage_dir
+    try:
+        agent_module.skill_store.storage_dir = str(tmp_path / "profile-0" / "skills")
+        with patch.object(agent_module, "ACTIVE_HISTORY_DB", str(tmp_path / "history.db")):
+            instance = agent_module.HermesCodingAgent(
+                model=roster.model, base_url=roster.base_url, enable_memory=False,
+                auto_learn_skills=True, read_only=False, review_roster=roster,
+                review_profile="user-0",
+            )
+    finally:
+        agent_module.skill_store.storage_dir = previous
+    return instance, roster, roster_path
+
+
+def native_tool_message(sql, call_id):
+    call = SimpleNamespace(id=call_id, function=SimpleNamespace(
+        name="query_teradata", arguments=json.dumps({"sql": sql})))
+    message = SimpleNamespace(content="", tool_calls=[call])
+    message.model_dump = lambda exclude_none=True: {
+        "role": "assistant", "content": "", "tool_calls": [{
+            "id": call_id, "type": "function",
+            "function": {"name": "query_teradata", "arguments": json.dumps({"sql": sql})},
+        }],
+    }
+    return message
+
+
+def capture_large_multiround_agent_episode(instance):
+    metadata = json.dumps({
+        "database": "warehouse", "columns": ["column_name", "data_type"],
+        "rows": [["RETAINED_AGENT_METADATA_" + "m" * 15000, "VARCHAR"]],
+        "row_count": 1, "truncated": False,
+    })
+    business = json.dumps({
+        "database": "warehouse", "columns": ["amount"],
+        "rows": [["PRIVATE-AGENT-BUSINESS-ROW" * 5000]],
+        "row_count": 1, "truncated": False,
+    })
+    replies = [
+        native_tool_message("SELECT column_name, data_type FROM information_schema.columns", "metadata"),
+        native_tool_message(
+            "SELECT * FROM sales QUALIFY ROW_NUMBER() OVER (ORDER BY sale_date DESC)=1 "
+            "/* RETAINED_AGENT_SQL_" + "x" * 20000 + " */", "business"),
+        answer_message("Verified the large multi-round procedure."),
+    ]
+    with patch.object(instance, "step", side_effect=replies), \
+         patch.object(instance, "manage_context"), \
+         patch.object(agent_module.registry, "execute", side_effect=[metadata, business]):
+        assert instance.run(
+            "No, that procedure is wrong; inspect metadata and use the verified QUALIFY correction "
+            "password=synthetic-private-value") == "Verified the large multi-round procedure."
+    instance.skill_review_owner.flush_session(instance.session_id)
+    instance.skill_review_owner.pump()
+    assert rows(instance.skill_review_owner, "jobs")[-1]["status"] == "PREPARED"
+
+
+def prepared_episode(roster, profile, text="No, that procedure is wrong; use QUALIFY password=private-value"):
+    item = Evidence("process-session", "process-episode")
+    item.add({"role": "user", "content": text})
+    item.add({"role": "assistant", "content": "", "tool_calls": [{
+        "id": "metadata", "type": "function", "function": {
+            "name": "query_teradata", "arguments": json.dumps({
+                "sql": "SELECT column_name, data_type FROM information_schema.columns"})},
+    }]})
+    item.add({"role": "tool", "tool_call_id": "metadata", "content": json.dumps({
+        "database": "warehouse", "columns": ["column_name", "data_type"],
+        "rows": [["RETAINED_METADATA_CONTEXT_" + ("m" * 10000), "VARCHAR"]],
+        "row_count": 1, "truncated": False,
+    })})
+    item.add({"role": "assistant", "content": "", "tool_calls": [{
+        "id": "sql", "type": "function", "function": {
+            "name": "query_teradata", "arguments": json.dumps({
+                "sql": "SELECT * FROM sales QUALIFY ROW_NUMBER() OVER (ORDER BY sale_date DESC)=1 /* RETAINED_SQL_CONTEXT "
+                       + ("x" * 20000) + " */"})},
+    }]})
+    item.add({"role": "tool", "tool_call_id": "sql", "content": json.dumps({
+        "database": "warehouse", "columns": ["amount"], "rows": [["private-row" * 5000]],
+        "row_count": 1, "truncated": False,
+    })})
+    item.add({"role": "assistant", "content": "Verified execution completed."})
+    owner = Owner(roster, "alice", SkillStore(str(profile / "skills")), background=False)
+    try:
+        assert owner.capture_turn(item.finish()).status == "ELIGIBLE"
+        owner.flush_session("process-session")
+        owner.pump()
+        assert rows(owner, "jobs")[0]["status"] == "PREPARED"
+    finally:
+        owner.close()
+
+
 def test_real_owner_and_service_process_with_blocked_http_idle_apply_and_singleton(tmp_path):
     with fake_openai(delay=True) as (endpoint, entered, release, requests):
         profile = tmp_path / "profiles" / "alice"
@@ -72,7 +174,8 @@ def test_real_owner_and_service_process_with_blocked_http_idle_apply_and_singlet
         roster_path = tmp_path / "roster.json"
         roster_path.write_text(json.dumps(dict(control_dir=str(tmp_path / "control"), model="test-model", base_url=endpoint,
             profiles=[dict(profile_id="alice", mailbox=str(profile / "skill_review.db"),
-                           store_id=SkillStore(str(profile / "skills")).store_id)])))
+                               store_id=SkillStore(str(profile / "skills")).store_id)])))
+        prepared_episode(load_roster(roster_path), profile)
         env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8", OPENAI_API_KEY="local-fake-test-key")
         output = []
         owner = subprocess.Popen(command("agent.py", "--profile", "alice", "--profiles-dir", tmp_path / "profiles",
@@ -83,10 +186,6 @@ def test_real_owner_and_service_process_with_blocked_http_idle_apply_and_singlet
         reader.start()
         service = None
         try:
-            owner.stdin.write("Complete this reusable work password=private-value\n")
-            owner.stdin.flush()
-            wait_for(lambda: any("[Skill Review] ACCEPTED" in line for line in output), 8)
-
             def prepared():
                 if not (profile / "skill_review.db").exists():
                     return False
@@ -112,13 +211,18 @@ def test_real_owner_and_service_process_with_blocked_http_idle_apply_and_singlet
             review_request = requests[-1]
             assert review_request["model"] == "test-model" and review_request["max_tokens"] == 4096
             assert "private-value" not in json.dumps(review_request)
+            assert "private-row" not in json.dumps(review_request)
+            assert "RETAINED_SQL_CONTEXT" in json.dumps(review_request)
+            assert "RETAINED_METADATA_CONTEXT" in json.dumps(review_request)
             assert "Global Operator Instructions" not in review_request["messages"][-1]["content"]
+            owner.stdin.write("Complete this ordinary foreground task\n")
+            owner.stdin.flush()
+            wait_for(lambda: any("The subprocess task is complete." in line for line in output))
             owner.stdin.write("exit\n")
             owner.stdin.flush()
             owner.wait(timeout=5)
             reader.join(2)
             assert owner.returncode == 0
-            assert any("The subprocess task is complete." in line for line in output)
             smoke = subprocess.run(command("skill_review.py", "once", "--roster", roster_path), cwd=ROOT,
                 env=env, capture_output=True, text=True, timeout=5)
             assert smoke.returncode == 0 and '"processed":0' in smoke.stdout
@@ -131,6 +235,84 @@ def test_real_owner_and_service_process_with_blocked_http_idle_apply_and_singlet
             for handle in (owner.stdin, owner.stdout, service.stdout if service else None):
                 if handle:
                     handle.close()
+
+
+def test_actual_agent_large_multiround_capture_to_separate_service_real_sdk_http_and_ack(tmp_path):
+    with fake_openai() as (endpoint, _, _, requests):
+        instance, _, roster_path = http_agent(tmp_path, endpoint)
+        try:
+            capture_large_multiround_agent_episode(instance)
+            env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8",
+                       OPENAI_API_KEY="local-fake-test-key")
+            result = subprocess.run(
+                command("skill_review.py", "once", "--roster", roster_path, "--timeout", "3"),
+                cwd=ROOT, env=env, capture_output=True, text=True, timeout=8,
+            )
+            assert result.returncode == 0 and '"processed":1' in result.stdout
+            instance.skill_review_owner.pump()
+            assert "from_service" in instance.skill_store.list_skills()
+            assert rows(instance.skill_review_owner, "jobs")[-1]["status"] == "APPLIED"
+            rendered = json.dumps(requests[-1])
+            assert "RETAINED_AGENT_METADATA_" in rendered
+            assert "RETAINED_AGENT_SQL_" in rendered
+            assert "PRIVATE-AGENT-BUSINESS-ROW" not in rendered
+            assert "synthetic-private-value" not in rendered
+            assert requests[-1]["model"] == "test-model"
+        finally:
+            instance.shutdown_skill_reviews()
+
+
+def test_foreground_question_progresses_while_separate_process_prepares_episode(tmp_path):
+    with fake_openai() as (endpoint, _, _, requests):
+        instance, _, roster_path = http_agent(tmp_path, endpoint)
+        marker = tmp_path / "preparation-entered"
+        release = tmp_path / "preparation-release"
+        child = None
+        try:
+            capture_large_multiround_agent_episode(instance)
+            child_code = "\n".join([
+                "from pathlib import Path",
+                "import sys,time",
+                "from skill_review import ReviewService,load_roster",
+                "marker,release,roster = Path(sys.argv[1]),Path(sys.argv[2]),sys.argv[3]",
+                "original = ReviewService._episode_request",
+                "def blocked(self, entry, job):",
+                "    marker.write_text('entered', encoding='utf-8')",
+                "    deadline = time.monotonic() + 8",
+                "    while not release.exists() and time.monotonic() < deadline: time.sleep(.01)",
+                "    return original(self, entry, job)",
+                "ReviewService._episode_request = blocked",
+                "raise SystemExit(0 if ReviewService(load_roster(roster), timeout=3).once() == 1 else 2)",
+            ])
+            env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8",
+                       OPENAI_API_KEY="local-fake-test-key")
+            child = subprocess.Popen(
+                command("-B", "-c", child_code, marker, release, roster_path),
+                cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                text=True, encoding="utf-8",
+            )
+            wait_for(marker.exists)
+            started = time.monotonic()
+            with patch.object(instance, "step", return_value=answer_message("Synthetic foreground answer.")), \
+                 patch.object(instance, "manage_context"):
+                assert instance.run("What is the next foreground answer?") == "Synthetic foreground answer."
+            synthetic_elapsed = time.monotonic() - started
+            assert synthetic_elapsed < .75
+            assert child.poll() is None
+            release.write_text("release", encoding="utf-8")
+            output, _ = child.communicate(timeout=8)
+            assert child.returncode == 0, output
+            instance.skill_review_owner.pump()
+            assert "from_service" in instance.skill_store.list_skills()
+            assert len(requests) == 1
+        finally:
+            release.write_text("release", encoding="utf-8")
+            if child and child.poll() is None:
+                child.terminate()
+                child.wait(timeout=5)
+            if child and child.stdout:
+                child.stdout.close()
+            instance.shutdown_skill_reviews()
 
 
 def test_real_sdk_timeout_is_finite_and_provider_not_retried(tmp_path):

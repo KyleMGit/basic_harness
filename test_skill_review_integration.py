@@ -64,6 +64,32 @@ def answer_message(text="The task answer."):
     return message
 
 
+def sql_tool_message(sql, call_id="verified-sql"):
+    call = SimpleNamespace(id=call_id, function=SimpleNamespace(
+        name="query_teradata", arguments=json.dumps({"sql": sql})))
+    message = MagicMock(content="", tool_calls=[call])
+    message.model_dump.return_value = {
+        "role": "assistant", "content": "", "tool_calls": [{
+            "id": call_id, "type": "function",
+            "function": {"name": "query_teradata", "arguments": json.dumps({"sql": sql})},
+        }],
+    }
+    return message
+
+
+def verified_result():
+    return json.dumps({"database": "warehouse", "columns": ["amount"],
+                       "rows": [["private-result"]], "row_count": 1, "truncated": False})
+
+
+def run_verified_correction(instance, task="No, that procedure is wrong; use the QUALIFY workaround"):
+    replies = [sql_tool_message("SELECT * FROM sales QUALIFY ROW_NUMBER() OVER (ORDER BY sale_date DESC)=1"),
+               answer_message()]
+    with patch.object(instance, "step", side_effect=replies), patch.object(instance, "manage_context"), \
+         patch.object(agent_module.registry, "execute", return_value=verified_result()):
+        return instance.run(task)
+
+
 def test_actual_run_returns_with_provider_blocked_answer_prompt_and_persistence_preserved(tmp_path):
     instance, roster = make_agent(tmp_path)
     entered, release = threading.Event(), threading.Event()
@@ -72,9 +98,7 @@ def test_actual_run_returns_with_provider_blocked_answer_prompt_and_persistence_
     worker.start()
     prompt = instance.messages[0]["content"]
     try:
-        with patch.object(instance, "step", return_value=answer_message()), \
-             patch.object(instance, "manage_context"):
-            assert instance.run("Complete the bounded task") == "The task answer."
+        assert run_verified_correction(instance) == "The task answer."
         assert entered.wait(2)
         assert instance.messages[0]["content"] == prompt
         assert instance.logger.load_session_state(instance.session_id)["messages"][-1]["content"] == "The task answer."
@@ -122,9 +146,11 @@ def test_incremental_capture_survives_actual_caller_compaction(tmp_path):
         instance.messages = instance.messages[:1] + [{"role":"user","content":"[compacted]"}]
 
     try:
-        with patch.object(instance, "manage_context", side_effect=compact), patch.object(instance, "step", return_value=answer_message()):
-            assert instance.run("EARLY TASK EVIDENCE password=private-token") == "The task answer."
-        saved = rows(instance.skill_review_owner, "evidence")
+        replies = [sql_tool_message("SELECT * FROM sales QUALIFY ROW_NUMBER() OVER (ORDER BY sale_date DESC)=1"), answer_message()]
+        with patch.object(instance, "manage_context", side_effect=compact), patch.object(instance, "step", side_effect=replies), \
+             patch.object(agent_module.registry, "execute", return_value=verified_result()):
+            assert instance.run("No, the EARLY TASK EVIDENCE password=private-token was wrong; use QUALIFY instead") == "The task answer."
+        saved = rows(instance.skill_review_owner, "episode_sources")
         assert "EARLY TASK EVIDENCE" in saved[0]["messages_json"]
         assert "private-token" not in saved[0]["messages_json"]
         assert "[compacted]" not in saved[0]["messages_json"]
@@ -141,8 +167,7 @@ def test_agent_modes_revoke_running_request_and_initial_readonly_restores_optin(
     try:
         instance.set_testing_mode("normal")
         assert instance.auto_learn_skills
-        with patch.object(instance, "step", return_value=answer_message()), patch.object(instance, "manage_context"):
-            instance.run("Task")
+        run_verified_correction(instance)
         wait_for(lambda: len(rows(instance.skill_review_owner, "jobs")) == 1)
         worker = threading.Thread(target=service.once)
         worker.start()

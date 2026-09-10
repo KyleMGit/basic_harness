@@ -162,8 +162,16 @@ state or its current authorization is already revoked, without rewriting review
 state. Active authorization still requires the matching configuration to revoke;
 enabling automatic learning always requires the service's matching policy.
 
-Completion performs a bounded durable local enqueue, including local I/O latency,
-and returns without waiting for skill-review inference. The owning agent applies
+Completion captures a bounded private turn delta, omits recognized SQL business
+rows, and uses deterministic positive signals to review related reusable work
+rather than every message. Eligible episodes consolidate until idle/topic/session/
+normal-exit boundaries; verified substantive corrections are ready immediately.
+An explicit procedural challenge is durably recorded before model execution so a
+failed corrective turn cannot publish its obsolete pending revision; routine
+parameter wording does not trigger that invalidation. A later related correction
+receives the bounded original request as labelled context-only evidence, while SQL
+metadata is retained only when all observed sources are supported catalog sources.
+The call returns without waiting for shared-service preparation or inference. The owning agent applies
 valid results while connected; disconnected results are retained. `--auto-memory`
 remains synchronous and can still delay completion. See
 [asynchronous skill review setup and recovery](docs/async_skill_review.md) for

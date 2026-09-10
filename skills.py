@@ -185,11 +185,32 @@ return NONE. Describe reusable procedures, never persist secrets or personal dat
 """
 
     @staticmethod
+    def sdk_body(model, prepared_json, output_tokens=4096):
+        return {
+            "model": model,
+            "messages": [{"role": "system", "content": AutoSkillExtractor.REFLECTION_PROMPT},
+                         {"role": "user", "content": prepared_json}],
+            "temperature": 0.1,
+            "max_tokens": output_tokens,
+        }
+
+    @staticmethod
+    def sdk_wire_bytes(model, prepared_json, output_tokens=4096):
+        return len(json.dumps(AutoSkillExtractor.sdk_body(model, prepared_json, output_tokens),
+                              ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+    @staticmethod
     def generate_proposal(client, model, prepared_json, *, timeout=30, output_tokens=4096):
         from skill_catalog import validate_proposal, MAX_OUTPUT_BYTES
         if not isinstance(prepared_json, str) or len(prepared_json.encode()) > 128 * 1024:
             raise ValueError("Prepared snapshot exceeds input limit")
         json.loads(prepared_json)
+        # httpx/OpenAI encode JSON with UTF-8, ensure_ascii=False and compact
+        # separators. Measure that complete body, including nested escaping,
+        # before allowing the SDK to open a transport request.
+        wire_bytes = AutoSkillExtractor.sdk_wire_bytes(model, prepared_json, output_tokens)
+        if wire_bytes > 256 * 1024:
+            raise ValueError("Complete SDK wire body exceeds 256 KiB limit")
         response = client.with_options(timeout=timeout, max_retries=0).chat.completions.create(
             model=model,
             messages=[{"role": "system", "content": AutoSkillExtractor.REFLECTION_PROMPT},

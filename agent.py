@@ -570,9 +570,10 @@ Below is the catalog of learned project skills. When a task relates to any avail
             if self._task_evidence is None:
                 return
             evidence = self._task_evidence.finish()
-            stage = "admission"
-            self.last_skill_admission = self.skill_review_owner.enqueue(evidence)
-            print(f"[Skill Review] {self.last_skill_admission.status}: {self.last_skill_admission.detail}")
+            stage = "episode.admission"
+            self.last_skill_admission = self.skill_review_owner.capture_turn(evidence)
+            if self.last_skill_admission.status not in ("SKIPPED", "ELIGIBLE"):
+                print(f"[Skill Review] {self.last_skill_admission.status}: {self.last_skill_admission.detail}")
         except Exception as exc:
             print("[Skill Review] FAILED: " + error_detail(stage, exc) + "; " + REJECTED)
         finally:
@@ -586,6 +587,8 @@ Below is the catalog of learned project skills. When a task relates to any avail
         """Disconnect without revoking retained results; no provider join."""
         self._task_evidence = None
         if self.skill_review_owner:
+            if self.auto_learn_skills and not (self.read_only or self.stateless):
+                self.skill_review_owner.flush_session(self.session_id, retire=True)
             self.skill_review_owner.close()
 
     def _reset_sql_diagnostic_state(self) -> None:
@@ -763,6 +766,10 @@ Below is the catalog of learned project skills. When a task relates to any avail
             self.logger.start_session(self.session_id, user_task, self.messages[0].get("content", ""))
 
         self._task_evidence = Evidence(self.session_id) if self.auto_learn_skills and self.skill_review_owner else None
+        if self._task_evidence is not None:
+            challenge = self.skill_review_owner.begin_turn(self.session_id, user_task)
+            if challenge.status == "FAILED":
+                print(f"[Skill Review] FAILED: {challenge.detail}")
 
         # 1. Pre-Turn Skill Matching (if enabled)
         if self.enable_skills:
