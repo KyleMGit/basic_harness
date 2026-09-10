@@ -364,7 +364,7 @@ class TestMessageSequencingAndCommandProvenance(unittest.TestCase):
         final = self._native_message("done")
         agent.client.chat.completions.create = MagicMock(return_value=self._response(final))
         matched = [{"name": "testing", "description": "d", "instructions": "i"}]
-        with patch("agent.skill_store.find_relevant_skills", return_value=matched):
+        with patch.object(agent.skill_store, "find_relevant_skills", return_value=matched):
             agent.run("active task")
 
         roles = [message["role"] for message in agent.messages]
@@ -501,6 +501,7 @@ class TestMessageSequencingAndCommandProvenance(unittest.TestCase):
                     read_only=False,
                     memory_disabled=True,
                     skills_disabled=True,
+                    bound_skill_store=agent.skill_store,
                 )
             finally:
                 terminal_session.cwd = previous_cwd

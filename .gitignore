@@ -7,3 +7,10 @@ __pycache__/
 .agent_workspaces/
 _test_tmp/
 database.json
+skill_review.db
+skill_review.db-journal
+skill_review.db-wal
+skill_review.db-shm
+.skill_review_control/
+.skill-review-*/
+skill-review-roster.local.json

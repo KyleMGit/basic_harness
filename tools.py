@@ -68,7 +68,9 @@ class ToolRegistry:
         return name in self._write_tools
 
     def execute(self, name: str, arguments: Dict[str, Any], read_only: bool = False,
-                memory_disabled: bool = False, skills_disabled: bool = False) -> str:
+                memory_disabled: bool = False, skills_disabled: bool = False,
+                bound_skill_store: Optional[SkillStore] = None) -> str:
+        selected_store = bound_skill_store if bound_skill_store is not None else skill_store
         if memory_disabled and name in {"read_user_profile", "update_user_profile", "read_project_memory", "update_project_memory"}:
             return f"Capability disabled: memory tool '{name}' is unavailable for this agent."
         if skills_disabled and (name in {"save_skill", "load_skill", "list_skills"} or name not in self._tools):
@@ -78,13 +80,15 @@ class ToolRegistry:
         if name not in self._tools:
             # Check if the model called a skill directly by its name
             try:
-                skill_file = skill_store.resolve_skill_file(name)
+                skill_file = selected_store.resolve_skill_file(name)
             except ValueError as exc:
                 return f"Error: {exc}"
             if skill_file:
-                return skill_store.load_skill(name)
+                return selected_store.load_skill(name)
             return f"Error: Tool '{name}' not found."
         try:
+            if bound_skill_store is not None and name in {"save_skill", "load_skill", "list_skills"}:
+                return str(getattr(selected_store, name)(**arguments))
             result = self._tools[name](**arguments)
             return str(result)
         except TypeError as te:

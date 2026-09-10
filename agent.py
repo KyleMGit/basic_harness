@@ -18,6 +18,7 @@ Key Features:
 """
 
 import argparse
+import atexit
 import json
 import os
 import re
@@ -34,7 +35,12 @@ except ImportError:
     sys.exit(1)
 
 from tools import registry, terminal_session, skill_store
-from skills import AutoSkillExtractor
+from skill_review import (Evidence, Owner, DiscoveryRoster, load_roster, gate,
+                          check_authority, authority_origin, read_auth, revoke_existing)
+from profile_paths import (DEFAULT_PROFILES_DIR, ProfilePaths, absolute_path,
+                           control_directory, default_model, default_base_url,
+                           validate_profile_id)
+from skill_lock import path_identity
 from protocol import ToolProtocol
 from storage import TrajectoryLogger
 from compaction import ContextManager
@@ -46,7 +52,6 @@ READ_THIS_PATH = Path(__file__).resolve().parent / "READ_THIS.md"
 READ_THIS_MAX_CHARS = 20_000
 READ_THIS_START_MARKER = "<!-- READ_THIS.md:START -->"
 READ_THIS_END_MARKER = "<!-- READ_THIS.md:END -->"
-DEFAULT_PROFILES_DIR = Path(__file__).resolve().parent / ".agent_profiles"
 DEFAULT_WORKSPACES_DIR = Path(__file__).resolve().parent / ".agent_workspaces"
 ACTIVE_HISTORY_DB: Optional[str] = None
 
@@ -66,7 +71,10 @@ def configure_runtime(args: argparse.Namespace) -> RuntimeConfig:
     global ACTIVE_HISTORY_DB
     workspace = Path(args.workspace).resolve()
     legacy = args.profile is None
-    state_root = Path(args.launch_cwd).resolve() if legacy else Path(args.profiles_dir, args.profile).resolve()
+    binding = None if legacy else getattr(args, "profile_paths", None) or ProfilePaths(args.profiles_dir, args.profile)
+    if binding:
+        binding.validate(required=False)
+    state_root = Path(args.launch_cwd).resolve() if legacy else binding.directory.path
     if not legacy and (args.read_only or args.stateless) and not state_root.is_dir():
         raise ValueError(f"Named profile '{args.profile}' does not exist: {state_root}")
     if not workspace.is_dir():
@@ -92,7 +100,9 @@ def configure_runtime(args: argparse.Namespace) -> RuntimeConfig:
     ACTIVE_HISTORY_DB = str(history_db)
 
     if not legacy and not args.read_only and not args.stateless:
+        binding.validate(required=False)
         state_root.mkdir(parents=True, exist_ok=True)
+        binding.validate()
         workspace.mkdir(parents=True, exist_ok=True)
         user_profile_manager._ensure_file_exists()
         project_memory_manager._ensure_file_exists()
@@ -228,19 +238,21 @@ Below is the catalog of learned project skills. When a task relates to any avail
         stateless: bool = False,
         use_hermes_xml_protocol: bool = False,
         progress_mode: str = "concise",
+        review_roster=None,
+        review_profile: Optional[str] = None,
     ):
         self.model = model or "Qwen-32b"
         self.compaction_model = compaction_model or self.model
         self.max_iterations = max_iterations
         self.confirm_all_terminal_commands = confirm_all_terminal_commands
-        self.enable_skills = enable_skills
-        self.enable_memory = enable_memory
-        self.read_only = read_only
+        self.enable_skills = enable_skills and not stateless
+        self.enable_memory = enable_memory and not stateless
+        self.read_only = read_only or stateless
         self.stateless = stateless
         configured_auto_skills = auto_learn_skills and enable_skills
         configured_auto_memory = auto_learn_memory and enable_memory
-        self.auto_learn_skills = configured_auto_skills and not read_only
-        self.auto_learn_memory = configured_auto_memory and not read_only
+        self.auto_learn_skills = configured_auto_skills and not (read_only or stateless)
+        self.auto_learn_memory = configured_auto_memory and not self.read_only
         self.use_hermes_xml_protocol = use_hermes_xml_protocol
         self.progress_mode = progress_mode
         self._sql_troubleshooting_backend: Optional[str] = None
@@ -251,7 +263,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
         # Local models running on Ollama/vLLM/LMStudio do not require a real API key,
         # but the OpenAI SDK requires a non-empty string.
         resolved_api_key = api_key or os.environ.get("OPENAI_API_KEY") or "local-no-key-required"
-        resolved_base_url = base_url or os.environ.get("OPENAI_BASE_URL") or "http://localhost:11434/v1"
+        resolved_base_url = base_url or default_base_url()
 
         self.client = OpenAI(
             api_key=resolved_api_key,
@@ -265,7 +277,14 @@ Below is the catalog of learned project skills. When a task relates to any avail
             compaction_max_context_tokens=compaction_max_context_tokens,
             compaction_output_tokens=compaction_output_tokens,
         )
-        self.skill_extractor = AutoSkillExtractor(skill_store=skill_store)
+        self.skill_store = skill_store.bind()
+        self.skill_store.set_write_guard(lambda: self.enable_skills and not (self.read_only or self.stateless))
+        self.skill_review_owner = None
+        self._task_evidence = None
+        self.last_skill_admission = None
+        if review_roster is not None:
+            if (self.model != review_roster.model or resolved_base_url.rstrip('/') != review_roster.base_url):
+                raise ValueError("Skill review service must use this agent's current model and endpoint")
         self.memory_extractor = auto_memory_extractor
         
         self.session_id = str(uuid.uuid4())[:8]
@@ -279,10 +298,13 @@ Below is the catalog of learned project skills. When a task relates to any avail
         self.messages: List[Dict[str, Any]] = [
             {"role": "system", "content": system_content}
         ]
+        if review_roster is not None:
+            self.skill_review_owner = Owner(review_roster, review_profile, self.skill_store,
+                                            enabled=self.auto_learn_skills)
 
     def _build_system_prompt(self) -> str:
         """Build system prompt embedding live skills, USER.md, and MEMORY.md."""
-        catalog_xml = skill_store.format_catalog_prompt() if self.enable_skills else "<available_skills>\nNone (Skills disabled for testing).\n</available_skills>"
+        catalog_xml = self.skill_store.format_catalog_prompt() if self.enable_skills else "<available_skills>\nNone (Skills disabled for testing).\n</available_skills>"
         user_profile_xml = user_profile_manager.format_system_prompt_block() if self.enable_memory else "<user_profile>\nDefault testing profile.\n</user_profile>"
         project_mem_xml = project_memory_manager.format_system_prompt_block() if self.enable_memory else "<project_memory>\nDefault testing memory.\n</project_memory>"
         read_only_directories = "\n".join(
@@ -311,8 +333,20 @@ Below is the catalog of learned project skills. When a task relates to any avail
         )
 
     def set_testing_mode(self, mode: str):
+        with self.skill_store.lock():
+            self._set_testing_mode(mode)
+
+    def _set_testing_mode(self, mode: str):
         """Configure agent testing/learning modes dynamically."""
         mode_clean = mode.lower().strip()
+        if mode_clean not in ("normal", "read-only", "readonly", "freeze", "stateless", "benchmark", "isolated", "no-skills"):
+            print(f"Unknown mode '{mode}'. Options: normal | read-only | stateless | no-skills")
+            return
+        # Revocation synchronizes with all background profile mutations before
+        # acknowledging the mode. It never waits for model inference.
+        if self.skill_review_owner:
+            self.skill_review_owner.set_enabled(False)
+        self._task_evidence = None
         if mode_clean == "normal":
             self.enable_skills, self.enable_memory, configured_skills, configured_memory = self._startup_config
             self.read_only = False
@@ -338,9 +372,10 @@ Below is the catalog of learned project skills. When a task relates to any avail
             self.auto_learn_memory = False
             self.logger.set_write_enabled(False)
             print("[Mode Updated] Stateless Benchmark mode: No skills, No memories, Zero writes to disk.")
-        else:
-            print(f"Unknown mode '{mode}'. Options: normal | read-only | stateless")
-            return
+        elif mode_clean == "no-skills":
+            self.enable_skills = False
+            self.auto_learn_skills = False
+            print("[Mode Updated] Skills disabled; automatic skill jobs invalidated.")
         
         # Privacy boundary: no transcript from the prior mode crosses modes.
         self.session_id = str(uuid.uuid4())[:8]
@@ -351,6 +386,8 @@ Below is the catalog of learned project skills. When a task relates to any avail
         if self.use_hermes_xml_protocol:
             system_content = ToolProtocol.format_hermes_system_prompt(system_content, schemas)
         self.messages = [{"role": "system", "content": system_content}]
+        if self.skill_review_owner and self.auto_learn_skills and not (self.read_only or self.stateless):
+            self.skill_review_owner.set_enabled(True)
 
     def resume_session(self, target_session_id: str) -> bool:
         """Resume a past conversation session from the active profile history database."""
@@ -521,43 +558,31 @@ Below is the catalog of learned project skills. When a task relates to any avail
             print("[Memory Reflection] No safe durable updates applied.")
 
     def run_auto_skill_synthesis(self, task_summary: str):
-        """Analyze trajectory against catalog to automatically extract or refine skills."""
-        if not self.auto_learn_skills or self.read_only:
+        """Bounded local durable admission; inference is owned by the service."""
+        if not self.auto_learn_skills or self.read_only or self.stateless:
             return
-
-        print("\n[Skill Reflection] Reviewing this task (one opt-in provider call)...")
-
-        result = self.skill_extractor.extract_and_save(
-            client=self.client,
-            model=self.model,
-            messages=self.messages,
-            task_summary=task_summary
-        )
-        if result:
-            action = result.get("action", "SAVED")
-            name = result["name"]
-            desc = result.get("description", "")
-            if action == "ERROR":
-                print(f"\n[Skill Reflection] Skill '{name}' was not saved: {desc}")
+        try:
+            if self.skill_review_owner is None:
+                print("[Skill Review] Unavailable: configure a host-authorized review roster.")
                 return
-            if action in ("SKIP", "PROPOSE"):
-                print(f"\n[Skill Reflection] Existing skill '{name}' retained; review required for replacement.")
+            if self._task_evidence is None:
                 return
-            action_label = "Refined existing skill" if action == "UPDATE" else "Synthesized new skill"
-            
-            print(f"\n[Self-Improvement] {action_label}: '{name}'")
-            print(f"  Description: {desc}")
-            
-            self.refresh_system_prompt()
-            
-            self.logger.log_step(
-                self.session_id,
-                self.step_counter,
-                "skill_synthesis",
-                content=f"{action_label}: {name}"
-            )
-        else:
-            print("[Skill Reflection] No safe skill proposal applied.")
+            self.last_skill_admission = self.skill_review_owner.enqueue(self._task_evidence.finish())
+            print(f"[Skill Review] {self.last_skill_admission.status}: {self.last_skill_admission.detail}")
+        except Exception as exc:
+            print(f"[Skill Review] FAILED: {type(exc).__name__}")
+        finally:
+            self._task_evidence = None
+
+    def _capture_skill_evidence(self, message):
+        if self._task_evidence is not None:
+            self._task_evidence.add(message)
+
+    def shutdown_skill_reviews(self):
+        """Disconnect without revoking retained results; no provider join."""
+        self._task_evidence = None
+        if self.skill_review_owner:
+            self.skill_review_owner.close()
 
     def _reset_sql_diagnostic_state(self) -> None:
         self._sql_troubleshooting_backend = None
@@ -733,9 +758,11 @@ Below is the catalog of learned project skills. When a task relates to any avail
             self.context_manager.restore_state()
             self.logger.start_session(self.session_id, user_task, self.messages[0].get("content", ""))
 
+        self._task_evidence = Evidence(self.session_id) if self.auto_learn_skills and self.skill_review_owner else None
+
         # 1. Pre-Turn Skill Matching (if enabled)
         if self.enable_skills:
-            relevant_skills = skill_store.find_relevant_skills(user_task)
+            relevant_skills = self.skill_store.find_relevant_skills(user_task)
             if relevant_skills:
                 skill_blocks = []
                 for sk in relevant_skills:
@@ -756,6 +783,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
 
         # 2. Append user task
         self.messages.append({"role": "user", "content": user_message_content})
+        self._capture_skill_evidence(self.messages[-1])
         self.step_counter += 1
         self.logger.log_step(
             self.session_id, self.step_counter, "user", content=user_message_content
@@ -841,6 +869,8 @@ Below is the catalog of learned project skills. When a task relates to any avail
                     tool_calls=assistant_message.get("tool_calls")
                 )
 
+            self._capture_skill_evidence(self.messages[-1])
+
             # Case 1: Agent invokes tools
             if tool_calls:
                 if self.progress_mode == "verbose" and thought_content:
@@ -872,6 +902,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
                             read_only=self.read_only,
                             memory_disabled=not self.enable_memory,
                             skills_disabled=not self.enable_skills,
+                            bound_skill_store=self.skill_store,
                         )
                     elif fn_name == "run_terminal_command" and self.confirm_all_terminal_commands:
                         orig_cmd = fn_args.get("command", "")
@@ -889,7 +920,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
                                     assistant_step_index,
                                     message_calls,
                                 )
-                            tool_result = registry.execute(fn_name, fn_args, read_only=self.read_only, memory_disabled=not self.enable_memory, skills_disabled=not self.enable_skills)
+                            tool_result = registry.execute(fn_name, fn_args, read_only=self.read_only, memory_disabled=not self.enable_memory, skills_disabled=not self.enable_skills, bound_skill_store=self.skill_store)
                             if final_cmd != orig_cmd:
                                 if self.read_only and registry.is_write_tool(fn_name):
                                     provenance = (
@@ -908,7 +939,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
                     else:
                         print(f"\n[Tool Request]: {fn_name}")
                         print(f"    Arguments: {json.dumps(fn_args, indent=2)}")
-                        tool_result = registry.execute(fn_name, fn_args, read_only=self.read_only, memory_disabled=not self.enable_memory, skills_disabled=not self.enable_skills)
+                        tool_result = registry.execute(fn_name, fn_args, read_only=self.read_only, memory_disabled=not self.enable_memory, skills_disabled=not self.enable_skills, bound_skill_store=self.skill_store)
 
                     preview = tool_result if len(tool_result) < 350 else tool_result[:350] + "\n... [TRUNCATED]"
                     print(f"[Tool Result]:\n{preview}\n" + "-" * 50)
@@ -933,6 +964,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
                             "tool_call_id": call_id,
                             "content": tool_result
                         })
+                        self._capture_skill_evidence(self.messages[-1])
                         self.logger.log_step(
                             self.session_id,
                             self.step_counter,
@@ -944,6 +976,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
                     self.step_counter += 1
                     combined_response = "\n".join(xml_tool_responses)
                     self.messages.append({"role": "user", "content": combined_response})
+                    self._capture_skill_evidence(self.messages[-1])
                     self.logger.log_step(
                         self.session_id, self.step_counter, "user", content=combined_response
                     )
@@ -965,6 +998,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
                     )
                     self.step_counter += 1
                     self.messages.append({"role": "user", "content": repair_prompt})
+                    self._capture_skill_evidence(self.messages[-1])
                     self.logger.log_step(
                         self.session_id, self.step_counter, "user", content=repair_prompt
                     )
@@ -1009,6 +1043,7 @@ def parse_args():
     parser = argparse.ArgumentParser(
         description="Hermes-Refined Coding Agent Harness for Local & Remote LLMs."
     )
+    parser.add_argument("--skill-review-roster", help="Host-authorized roster JSON for the separate skill review service")
     parser.add_argument(
         "--profile",
         help="Named persistence profile (letters, digits, hyphen, or underscore; max 64 characters).",
@@ -1042,13 +1077,13 @@ def parse_args():
     parser.add_argument(
         "-m", "--model",
         type=str,
-        default=os.environ.get("AGENT_MODEL", "Qwen-32b"),
+        default=default_model(),
         help="Model identifier (e.g. 'Qwen-32b', 'qwen2.5-coder:32b'). Default: Qwen-32b"
     )
     parser.add_argument(
         "-u", "--base-url",
         type=str,
-        default=os.environ.get("OPENAI_BASE_URL", "http://localhost:11434/v1"),
+        default=default_base_url(),
         help="Local or remote LLM endpoint (default: http://localhost:11434/v1)."
     )
     parser.add_argument(
@@ -1122,7 +1157,7 @@ def parse_args():
     parser.add_argument(
         "--auto-skills",
         action="store_true",
-        help="Opt in to one visible post-task provider call for skill proposals (costs time/tokens)."
+        help="Opt in to bounded durable skill-review enqueue for --profile; one supervised service discovers the shared --profiles-dir."
     )
     parser.add_argument(
         "--auto-memory",
@@ -1140,10 +1175,14 @@ def parse_args():
         help="Disable automatic post-task memory reflection."
     )
     args = parser.parse_args()
-    if args.profile is not None and not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", args.profile):
-        parser.error("--profile must be 1-64 letters, digits, hyphens, or underscores")
+    try:
+        if args.profile is not None:
+            validate_profile_id(args.profile)
+            args.profile_paths = ProfilePaths(args.profiles_dir, args.profile)
+    except (OSError, ValueError) as exc:
+        parser.error(str(exc))
     args.launch_cwd = str(Path(launch_cwd).resolve())
-    args.profiles_dir = str(Path(args.profiles_dir).expanduser().resolve())
+    args.profiles_dir = str(absolute_path(args.profiles_dir))
     args.workspaces_dir = str(Path(args.workspaces_dir).expanduser().resolve())
     args.workspace_explicit = args.workspace is not None
     if args.workspace_explicit:
@@ -1201,7 +1240,7 @@ def handle_cli_command(agent: HermesCodingAgent, prompt: str) -> bool:
         print(project_memory_manager.load_memory() if agent.enable_memory else "Capability disabled: memory is unavailable for this agent.")
         return True
     if command in ("/skills", "skills"):
-        print("\n" + (skill_store.list_skills() if agent.enable_skills else "Capability disabled: skills are unavailable for this agent."))
+        print("\n" + (agent.skill_store.list_skills() if agent.enable_skills else "Capability disabled: skills are unavailable for this agent."))
         return True
     if command in ("/sessions", "sessions"):
         if agent.stateless:
@@ -1229,19 +1268,49 @@ def handle_cli_command(agent: HermesCodingAgent, prompt: str) -> bool:
 def main():
     args = parse_args()
 
+    review_roster = None
     try:
+        if args.auto_skills and not args.no_auto_skills and not args.profile:
+            raise ValueError("--auto-skills requires --profile")
+        if args.skill_review_roster:
+            if not args.profile:
+                raise ValueError("Skill reviews require a named authenticated profile")
+            review_roster = load_roster(args.skill_review_roster)
+            entry = review_roster.entry(args.profile)
+            expected_root = Path(args.profiles_dir, args.profile).resolve()
+            if (entry.store_id != path_identity(expected_root / "skills")
+                    or Path(entry.mailbox) != expected_root / "skill_review.db"):
+                raise ValueError("Review roster does not match the authenticated runtime profile")
+            if args.model != review_roster.model or args.base_url.rstrip('/') != review_roster.base_url:
+                raise ValueError("Agent and service must use the same current model and endpoint")
+        elif args.profile:
+            review_roster = DiscoveryRoster(args.profiles_dir, args.model, args.base_url)
+            entry = review_roster.entry(args.profile)
+            args.profile_paths = entry.binding
+        if review_roster:
+            # Do not expose the admission root or external authority to model tools.
+            protected = [Path(args.profiles_dir), control_directory(args.profiles_dir), Path(review_roster.control_dir)]
+            for allowed in (Path(args.workspace), *map(Path, args.read_only_dirs)):
+                if any(allowed.is_relative_to(p) or p.is_relative_to(allowed) for p in protected):
+                    raise ValueError("Workspace/read-only directories must be separate from the protected profiles and review control directories")
+            with gate(entry):
+                enabled = args.auto_skills and not (args.no_auto_skills or args.no_skills or args.read_only or args.stateless)
+                if not enabled:
+                    revoke_existing(review_roster, entry)
+                else:
+                    authority = check_authority(review_roster, entry)
+                    if not authority or authority["origin"] == authority_origin(review_roster):
+                        read_auth(review_roster, entry)
         runtime = configure_runtime(args)
-    except (OSError, RuntimeError, ValueError) as exc:
+    except (OSError, RuntimeError, ValueError, TimeoutError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
 
     # Determine testing modes
     is_stateless = args.stateless
     is_read_only = args.read_only or is_stateless
-    enable_skills = not (args.no_skills or is_stateless)
-    enable_memory = not (args.no_memory or is_stateless)
-    auto_learn_skills = args.auto_skills and not (args.no_auto_skills or is_read_only)
-    auto_learn_memory = args.auto_memory and not (args.no_auto_memory or is_read_only)
+    auto_learn_skills = args.auto_skills and not args.no_auto_skills
+    auto_learn_memory = args.auto_memory and not args.no_auto_memory
 
     print("=" * 65)
     print(" Hermes-Refined Coding Agent Harness")
@@ -1267,7 +1336,7 @@ def main():
         + ("; ".join(str(path) for path in runtime.read_only_dirs) or "none")
     )
     print("Security:   Confined recognized reads auto-run; all other commands require review.\n")
-    print("Commands:   /skills | /user | /memory | /mode [normal|read-only|stateless] | /context | exit")
+    print("Commands:   /skills | /user | /memory | /mode [normal|read-only|stateless|no-skills] | /context | exit")
 
     agent = HermesCodingAgent(
         model=args.model,
@@ -1278,15 +1347,19 @@ def main():
         compaction_max_context_tokens=args.compaction_max_tokens,
         compaction_output_tokens=args.compaction_output_tokens,
         confirm_all_terminal_commands=True,
-        enable_skills=enable_skills,
-        enable_memory=enable_memory,
+        enable_skills=not args.no_skills,
+        enable_memory=not args.no_memory,
         auto_learn_skills=auto_learn_skills,
         auto_learn_memory=auto_learn_memory,
         read_only=is_read_only,
         stateless=is_stateless,
         use_hermes_xml_protocol=args.xml,
         progress_mode=args.progress,
+        review_roster=review_roster,
+        review_profile=args.profile,
     )
+
+    atexit.register(agent.shutdown_skill_reviews)
 
     if args.resume:
         resumed = agent.resume_session(args.resume)
@@ -1315,7 +1388,7 @@ def main():
                     print(f"  • Read-Only (Freeze): {agent.read_only}")
                     print(f"  • Auto-Learn Skills:  {agent.auto_learn_skills}")
                     print(f"  • Auto-Learn Memory:  {agent.auto_learn_memory}")
-                    print("\nChange mode with: /mode [normal | read-only | stateless]")
+                    print("\nChange mode with: /mode [normal | read-only | stateless | no-skills]")
                 continue
             if prompt.lower() in ("/user", "/profile", "user", "profile"):
                 print("\n=== USER.md Profile ===")
@@ -1326,7 +1399,7 @@ def main():
                 print(project_memory_manager.load_memory())
                 continue
             if prompt.lower() in ("/skills", "skills"):
-                print("\n" + skill_store.list_skills())
+                print("\n" + agent.skill_store.list_skills())
                 continue
             if prompt.lower() in ("/sessions", "sessions"):
                 past_sessions = agent.logger.list_sessions(limit=10)
@@ -1393,6 +1466,9 @@ def main():
         except (KeyboardInterrupt, EOFError):
             print("\nShutting down.")
             break
+
+    agent.shutdown_skill_reviews()
+    atexit.unregister(agent.shutdown_skill_reviews)
 
 
 if __name__ == "__main__":

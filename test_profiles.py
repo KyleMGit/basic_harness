@@ -213,7 +213,8 @@ class ProfilePersistenceTests(unittest.TestCase):
             instance = agent_module.HermesCodingAgent(enable_memory=False, enable_skills=False)
             self.assertEqual(Path(instance.logger.db_path), profile / "history.db")
             self.assertIs(instance.memory_extractor.user_manager, tools.user_profile_manager)
-            self.assertIs(instance.skill_extractor.skill_store, tools.skill_store)
+            self.assertIsNot(instance.skill_store, tools.skill_store)
+            self.assertEqual(instance.skill_store.storage_dir, tools.skill_store.storage_dir)
 
     def test_two_profiles_share_workspace_without_memory_skill_or_history_bleed(self):
         with tempfile.TemporaryDirectory() as root, tempfile.TemporaryDirectory() as workspace:

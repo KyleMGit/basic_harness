@@ -7,7 +7,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from skills import AutoSkillExtractor, SkillStore
+from skills import SkillStore
+from test_skill_publication import proposal, update_for
 from tools import registry, skill_store as registry_skill_store
 
 
@@ -30,21 +31,22 @@ class TestDirectSkillSaveSafety(unittest.TestCase):
         })
 
     @staticmethod
-    def _client_for(payload):
-        client = MagicMock()
-        response = MagicMock()
-        response.choices = [MagicMock(message=MagicMock(content=json.dumps(payload)))]
-        client.chat.completions.create.return_value = response
-        return client
-
-    @staticmethod
-    def _messages():
-        return [
-            {"role": "user", "content": "Set up pytest coverage."},
-            {"role": "assistant", "content": "Starting."},
-            {"role": "tool", "content": "Environment configured."},
-            {"role": "assistant", "content": "Done."},
-        ]
+    def _apply(store, snapshot, value):
+        # The test host selects an opaque target from the prepared snapshot;
+        # model-selected names are not accepted by the production proposal API.
+        action = value["action"]
+        if action == "UPDATE":
+            normalized = store._safe_name(value["target_skill_name"].strip())
+            target = next((t for t in snapshot.targets if store._safe_name(t.name) == normalized), None)
+            clean = proposal("UPDATE", target_id=target.target_id if target else "unknown",
+                             description=value["description"], instructions=value["instructions"])
+            name = target.name if target else value["target_skill_name"]
+        else:
+            clean = proposal(name=value["name"], description=value["description"], instructions=value["instructions"])
+            name = value["name"]
+        result = store.apply_review(clean, snapshot, "host-test-receipt")
+        return dict(action=action if result.status == "APPLIED" else "ERROR", name=name,
+                    description=result.detail)
 
     def test_direct_same_normalized_name_refuses_and_preserves_pair(self):
         first = self._direct_save(
@@ -120,16 +122,16 @@ class TestDirectSkillSaveSafety(unittest.TestCase):
     def test_reflection_explicit_update_remains_authorized(self):
         store = SkillStore(str(self.skill_dir))
         store.save_skill("pytest_setup", "Configure pytest tooling", "Original instructions.")
-        extractor = AutoSkillExtractor(store)
-        client = self._client_for({
+        snapshot = store.prepare_review()
+        value = {
             "action": "UPDATE",
             "target_skill_name": "pytest_setup",
             "name": "ignored_model_name",
             "description": "Configure pytest tooling with coverage",
             "instructions": "Install pytest and pytest-cov.",
-        })
+        }
 
-        result = extractor.extract_and_save(client, "model", self._messages(), "Improve pytest setup")
+        result = self._apply(store, snapshot, value)
 
         self.assertEqual("UPDATE", result["action"])
         self.assertEqual("pytest_setup", result["name"])
@@ -139,19 +141,19 @@ class TestDirectSkillSaveSafety(unittest.TestCase):
     def test_reflection_update_trailing_whitespace_extension_updates_resolved_pair_only(self):
         store = SkillStore(str(self.skill_dir))
         store.save_skill("foo", "Original description", "Original instructions.")
-        extractor = AutoSkillExtractor(store)
-        client = self._client_for({
+        snapshot = store.prepare_review()
+        value = {
             "action": "UPDATE",
             "target_skill_name": "foo.md ",
             "name": "ignored_model_name",
             "description": "Updated description",
             "instructions": "Updated instructions.",
-        })
+        }
 
-        result = extractor.extract_and_save(client, "model", self._messages(), "Update foo")
+        result = self._apply(store, snapshot, value)
 
         self.assertEqual("UPDATE", result["action"])
-        self.assertEqual("foo.md", result["name"])
+        self.assertEqual("foo", result["name"])
         self.assertIn("Updated instructions", (self.skill_dir / "foo.md").read_text())
         self.assertIn("Updated instructions", (self.skill_dir / "foo.json").read_text())
         self.assertFalse((self.skill_dir / "foo_md.md").exists())
@@ -160,16 +162,16 @@ class TestDirectSkillSaveSafety(unittest.TestCase):
 
     def test_reflection_update_missing_target_returns_error_without_writes(self):
         store = SkillStore(str(self.skill_dir))
-        extractor = AutoSkillExtractor(store)
-        client = self._client_for({
+        snapshot = store.prepare_review()
+        value = {
             "action": "UPDATE",
             "target_skill_name": "missing",
             "name": "ignored_model_name",
             "description": "Missing description",
             "instructions": "Must not be written.",
-        })
+        }
 
-        result = extractor.extract_and_save(client, "model", self._messages(), "Update missing")
+        result = self._apply(store, snapshot, value)
 
         self.assertEqual("ERROR", result["action"])
         self.assertFalse(self.skill_dir.exists())
@@ -188,16 +190,16 @@ class TestDirectSkillSaveSafety(unittest.TestCase):
             for path in self.skill_dir.rglob("*") if path.is_file()
         }
         store = SkillStore(str(self.skill_dir))
-        extractor = AutoSkillExtractor(store)
-        client = self._client_for({
+        snapshot = store.prepare_review()
+        value = {
             "action": "UPDATE",
             "target_skill_name": "foo",
             "name": "ignored_model_name",
             "description": "Updated description",
             "instructions": "Must not replace either copy.",
-        })
+        }
 
-        result = extractor.extract_and_save(client, "model", self._messages(), "Update foo")
+        result = self._apply(store, snapshot, value)
 
         after = {
             path.relative_to(self.skill_dir): path.read_bytes()
@@ -230,16 +232,16 @@ class TestDirectSkillSaveSafety(unittest.TestCase):
             "Configure python virtual environment pytest coverage dependencies",
             "Original instructions.",
         )
-        extractor = AutoSkillExtractor(store)
-        client = self._client_for({
+        snapshot = store.prepare_review()
+        value = {
             "action": "CREATE",
             "target_skill_name": "",
             "name": "python_pytest_environment",
             "description": "Configure python virtual environment pytest coverage dependencies",
             "instructions": "Curated instructions with pytest-cov.",
-        })
+        }
 
-        result = extractor.extract_and_save(client, "model", self._messages(), "Improve pytest setup")
+        result = self._apply(store, snapshot, value)
 
         self.assertEqual("CREATE", result["action"])
         self.assertEqual("python_pytest_environment", result["name"])
@@ -258,16 +260,16 @@ class TestDirectSkillSaveSafety(unittest.TestCase):
         original_md = (self.skill_dir / "deploy_skill.md").read_bytes()
         original_json = (self.skill_dir / "deploy_skill.json").read_bytes()
         original_files = {path.name for path in self.skill_dir.iterdir()}
-        extractor = AutoSkillExtractor(store)
-        client = self._client_for({
+        snapshot = store.prepare_review()
+        value = {
             "action": "CREATE",
             "target_skill_name": "",
             "name": "deploy_skill.json",
             "description": "Diagnose lunar telemetry corruption",
             "instructions": "Use the curated replacement procedure.",
-        })
+        }
 
-        result = extractor.extract_and_save(client, "model", self._messages(), "Improve deployment")
+        result = self._apply(store, snapshot, value)
 
         self.assertEqual("ERROR", result["action"])
         self.assertIn("refused", result["description"].lower())

@@ -28,7 +28,7 @@ An open-source, terminal-native Python agent harness optimized for local models 
    - View past session logs, dates, and step counts with `/sessions`.
 4. **Hermes Skill System & Intelligent Deduplication ([`skills.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/skills.py))**:
    - Injects `<available_skills>` catalog and pre-turn keyword auto-injection.
-   - Catalog-aware deduplication; autonomous reflection proposes/skips changes to existing procedures instead of overwriting them.
+   - Opt-in asynchronous skill review uses one host service and private per-profile queues; the owning agent validates CREATE/UPDATE/NONE proposals before publishing.
 5. **Two-Phase Context Compaction & Summarization ([`compaction.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/compaction.py))**:
    - Implements the **Security & Provenance Context-Checkpoint Summarizer** contract.
    - Host-side deterministic extraction for `<EXACT_ANCHORS>` and `<VERBATIM_USER_MESSAGES>` at the 40K token limit.
@@ -136,6 +136,39 @@ the selected named profile does not already exist. When `--workspace` is omitted
 in those modes, the profile's existing `<workspaces-dir>/<name>` directory must
 also already exist.
 
+### 5. Automatic Skill Learning
+
+`--auto-skills` uses a named `--profile` and **one supervised review service for
+the host**. Existing profiles and later additions are discovered automatically:
+
+```powershell
+python skill_review.py run --profiles-dir C:/host/profiles --model Qwen-32b --base-url http://localhost:11434/v1
+python agent.py --profile alice --auto-skills --profiles-dir C:/host/profiles --model Qwen-32b --base-url http://localhost:11434/v1
+```
+
+The agent provisions new named profiles through normal startup. The service can
+start before the root exists and discovers eligible immediate directories about
+once a second, without restarting or editing a roster. Omitting `--profiles-dir`
+on both commands uses `.agent_profiles` beside `agent.py`, independent of cwd.
+The host must control this root and choose profile IDs and matching model/endpoint
+settings. Directory discovery alone never authorizes learning. Workspace and
+read-only tool roots must be separate from profiles and external review control.
+Explicit `--roster` / `--skill-review-roster` retain the static allowlist mode.
+`--no-skills` and `--no-auto-skills` preserve normal profile/history/memory and
+workspace provisioning while disabling automatic skill learning. Only `--read-only` and
+`--stateless` refuse to create a missing profile.
+Ordinary sessions may use another model/endpoint when their profile has no review
+state or its current authorization is already revoked, without rewriting review
+state. Active authorization still requires the matching configuration to revoke;
+enabling automatic learning always requires the service's matching policy.
+
+Completion performs a bounded durable local enqueue, including local I/O latency,
+and returns without waiting for skill-review inference. The owning agent applies
+valid results while connected; disconnected results are retained. `--auto-memory`
+remains synchronous and can still delay completion. See
+[asynchronous skill review setup and recovery](docs/async_skill_review.md) for
+disabled launches, safe mode switching, service supervision and admission outcomes.
+
 ---
 
 ## 💬 1. In-Session Chat Commands (Typed at `User >`)
@@ -197,8 +230,9 @@ are not on the recognized read-only allowlist:
 | **`--stateless`** | `--benchmark` | `False` | **Benchmark Baseline**: Disables skills, memory, and disk saving (pure zero-shot). |
 | **`--no-skills`** | | `False` | Completely disables skill catalog and skill retrieval. |
 | **`--no-memory`** | | `False` | Completely disables USER.md and MEMORY.md injection. |
-| **`--auto-skills`** | | `False` | Opts in to a visible post-task skill reflection provider call (extra latency/tokens). Once enabled, safe CREATE and explicit UPDATE proposals are applied automatically. |
-| **`--auto-memory`** | | `False` | Opts in to a visible post-task memory reflection provider call (extra latency/tokens). |
+| **`--auto-skills`** | | `False` | Opts in to bounded durable local enqueue. Requires `--profile` and one supervised host service using the same profile root, model and endpoint; returns without waiting for review inference. |
+| **`--skill-review-roster <path>`** | | `None` | Selects the backward-compatible static allowlist mode. The profile must be listed and agent model/endpoint must match the roster. Omit for automatic discovery. |
+| **`--auto-memory`** | | `False` | Opts in to a visible synchronous post-task memory reflection provider call; its latency/tokens and completion delay remain unchanged. |
 | **`--no-auto-skills`**| | `False` | Compatibility alias that disables `--auto-skills`. |
 | **`--no-auto-memory`**| | `False` | Compatibility alias that disables `--auto-memory`. |
 | **`--xml`** | | `False` | Switches from OpenAI JSON tool calling to Hermes XML `<tool_call>` syntax. |
@@ -222,7 +256,7 @@ are not on the recognized read-only allowlist:
 | **`patch_file`** | `file_path`, `search_content`, `replace_content` | Performs targeted search-and-replace on existing files. |
 | **`list_directory`** | `directory_path` | Inspects directory contents and file sizes inside the workspace or configured read-only roots. |
 | **`load_skill` / `<skill_name>()`** | `name` | Reads instructions and workflow details for any learned project skill. |
-| **`save_skill`** | `name`, `description`, `instructions` | Creates a genuinely new procedural workflow in `.agent_skills/`. Direct calls are create-only and fail closed on normalized-name collisions; a different normalized name is allowed regardless of content similarity. Only an explicit catalog-aware post-task reflection UPDATE can modify an existing skill. |
+| **`save_skill`** | `name`, `description`, `instructions` | Creates a procedural workflow in the active profile's skill catalog. Direct calls are CREATE-only and refuse normalized-name collisions; a different normalized name is allowed regardless of content similarity. Only the owning agent can publish a review UPDATE after validating its eligible target and revision. |
 | **`read_user_profile`** | *(none)* | Reads operator profile from `USER.md`. |
 | **`update_user_profile`** | `category`, `preference` | Appends or updates preferences in `USER.md`. |
 | **`read_project_memory`** | *(none)* | Reads project architecture facts from `MEMORY.md`. |

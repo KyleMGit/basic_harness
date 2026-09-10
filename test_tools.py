@@ -368,61 +368,25 @@ class TestHermesAgentComponents(unittest.TestCase):
         self.assertEqual(pytest_matches[0]["name"], "setup_pytest_env")
 
     def test_auto_skill_extractor_deduplication(self):
-        skill_dir = os.path.join(self.test_dir, "skills_auto")
-        store = SkillStore(storage_dir=skill_dir)
-        extractor = AutoSkillExtractor(skill_store=store)
-
-        # Save initial skill
-        store.save_skill(
-            name="setup_pytest_env",
-            description="Configure python virtual environment for pytest",
-            instructions="1. python -m venv venv"
-        )
-
-        messages = [
-            {"role": "user", "content": "Set up virtualenv with pytest and coverage."},
-            {"role": "assistant", "content": "Running setup."},
-            {"role": "tool", "content": "venv created and coverage added."},
-            {"role": "assistant", "content": "Configured."}
-        ]
-
-        # Case A: LLM updates existing skill instead of duplicating
+        from test_skill_publication import update_for
+        from test_skill_review_integration import response
+        store = SkillStore(storage_dir=os.path.join(self.test_dir, "skills_auto"))
+        store.save_skill("setup_pytest_env", "Configure python virtual environment for pytest", "1. python -m venv venv")
+        snapshot = store.prepare_review()
         mock_client = MagicMock()
-        mock_resp = MagicMock()
-        mock_resp.choices = [MagicMock(message=MagicMock(content=json.dumps({
-            "action": "UPDATE",
-            "target_skill_name": "setup_pytest_env",
-            "name": "setup_pytest_env",
-            "description": "Configure python virtual environment with pytest and coverage",
-            "instructions": "1. python -m venv venv\n2. pip install pytest pytest-cov"
-        })))]
-        mock_client.chat.completions.create.return_value = mock_resp
-
-        result = extractor.extract_and_save(
-            client=mock_client,
-            model="Qwen-32b",
-            messages=messages,
-            task_summary="Set up venv with coverage"
-        )
-
-        self.assertIsNotNone(result)
+        mock_client.with_options.return_value = mock_client
+        mock_client.chat.completions.create.return_value = response(json.dumps(update_for(snapshot,
+            instructions="1. python -m venv venv\n2. pip install pytest pytest-cov")))
+        result = AutoSkillExtractor.generate_proposal(mock_client, "Qwen-32b", snapshot.public_json)
         self.assertEqual(result["action"], "UPDATE")
-        self.assertEqual(result["name"], "setup_pytest_env")
-        
-        # Verify only 1 skill file exists (no duplicates)
+        self.assertEqual(store.apply_review(result, snapshot, "host-receipt").status, "APPLIED")
         all_skills = store.get_all_skills()
         self.assertEqual(len(all_skills), 1)
         self.assertIn("pytest-cov", all_skills[0]["instructions"])
+        mock_client.chat.completions.create.return_value = response('{"action":"NONE"}')
+        result_none = AutoSkillExtractor.generate_proposal(mock_client, "Qwen-32b", snapshot.public_json)
+        self.assertEqual(result_none, {"action":"NONE"})
 
-        # Case B: LLM action NONE (trivial / duplicate)
-        mock_resp.choices = [MagicMock(message=MagicMock(content=json.dumps({"action": "NONE"})))]
-        result_none = extractor.extract_and_save(
-            client=mock_client,
-            model="Qwen-32b",
-            messages=messages,
-            task_summary="Routine test"
-        )
-        self.assertIsNone(result_none)
 
     def test_hermes_xml_protocol_parsing(self):
         sample_model_response = """
