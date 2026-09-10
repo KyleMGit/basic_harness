@@ -6,7 +6,7 @@ prepared JSON; only Owner receives a bound catalog object.
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
-from contextlib import closing, nullcontext
+from contextlib import closing, contextmanager, ExitStack, nullcontext
 from dataclasses import asdict, dataclass, field
 import hashlib
 import hmac
@@ -39,6 +39,91 @@ BATCH_COUNT = 4
 BATCH_BYTES = 64 * 1024
 HISTORY_COUNT = 32
 ACTIVE = ("PREPARED", "RUNNING", "RESULT")
+MAX_DIAGNOSTICS = 128
+REJECTED = "NOT queued; no automatic retry; earlier queue work retained."
+DIAGNOSTIC_STAGES = frozenset((
+    "owner.authorization", "owner.mailbox", "owner.delivery", "owner.publication", "owner.acknowledgement",
+    "owner.preparation", "owner.preparation_authorization", "owner.preparation_persistence",
+    "pending.scan", "pending.recovery", "claim", "worker.authorization", "result.persistence",
+    "service.startup.provider", "service.shutdown", "service.status",
+))
+EXCEPTION_NAMES = {
+    "builtins": {"Exception", "OSError", "TimeoutError", "ValueError", "TypeError", "KeyError",
+                 "RuntimeError", "RecursionError", "PermissionError", "FileNotFoundError",
+                 "UnicodeEncodeError", "UnicodeDecodeError", "OverflowError", "ImportError", "ModuleNotFoundError"},
+    "sqlite3": {"Error", "DatabaseError", "OperationalError", "IntegrityError", "ProgrammingError"},
+    "json.decoder": {"JSONDecodeError"},
+    "openai": {"OpenAIError", "APIError", "APITimeoutError", "APIConnectionError", "APIStatusError",
+               "RateLimitError", "AuthenticationError", "PermissionDeniedError", "BadRequestError",
+               "NotFoundError", "ConflictError", "UnprocessableEntityError", "InternalServerError"},
+}
+
+
+def diagnostic_id(value, *, job=False, child=False):
+    pattern = r"[a-f0-9]{32}" if job else r"[A-Za-z0-9_.-]{1,64}" if child else r"[A-Za-z0-9_-]{1,64}"
+    return value if type(value) is str and re.fullmatch(pattern, value) else "<invalid>"
+
+
+def exception_name(exc):
+    # Never inspect exception messages, reprs, requests, responses or headers.
+    # Unknown/custom classes fall back to their nearest allowlisted base class.
+    for cls in type(exc).__mro__:
+        if cls.__name__ in EXCEPTION_NAMES.get(cls.__module__, set()):
+            return cls.__name__
+    return "Exception"
+
+
+class DiagnosticFailure(Exception):
+    """Transient safe context; never persisted as a new error schema."""
+    def __init__(self, stage, exc, job_id=None, **timing):
+        super().__init__("Skill review stage failed")
+        self.stage, self.error = stage, exception_name(exc)
+        self.job_id, self.timing = job_id, timing
+
+
+@contextmanager
+def diagnostic_stage(stage, *, job_id=None, **timing):
+    try:
+        yield
+    except DiagnosticFailure:
+        raise
+    except Exception as exc:
+        raise DiagnosticFailure(stage, exc, job_id, **timing) from None
+
+
+@contextmanager
+def diagnostic_gate(entry, stage, timeout=5, *, job_id=None):
+    # Attach the configured lock timeout only to acquisition failures.
+    with ExitStack() as stack:
+        with diagnostic_stage(stage, job_id=job_id, coordination_timeout_s=timeout):
+            stack.enter_context(gate(entry, timeout))
+        yield
+
+
+def error_detail(stage, exc, *, profile_id=None, job_id=None, use_context=True, **timing):
+    error = exception_name(exc)
+    if (use_context and type(exc) is DiagnosticFailure and type(exc.stage) is str
+            and exc.stage in DIAGNOSTIC_STAGES and type(exc.error) is str
+            and any(exc.error in names for names in EXCEPTION_NAMES.values())):
+        stage, error = exc.stage, exc.error
+        job_id = exc.job_id if exc.job_id is not None else job_id
+        timing = exc.timing
+    parts = [f"stage={stage}", f"error={error}"]
+    if profile_id is not None:
+        parts.append("profile=" + diagnostic_id(profile_id))
+    if job_id is not None:
+        parts.append("job=" + diagnostic_id(job_id, job=True))
+    for key in ("coordination_timeout_s", "sqlite_busy_timeout_s", "provider_timeout_s"):
+        value = timing.get(key)
+        if type(value) in (int, float) and 0 <= value <= 120:
+            parts.append(f"{key}={value:g}")
+    return " ".join(parts)
+
+
+def remember_diagnostic(mapping, key, value):
+    mapping[key] = value
+    while len(mapping) > MAX_DIAGNOSTICS:
+        del mapping[next(iter(mapping))]
 
 
 def packed(value):
@@ -51,6 +136,34 @@ class EvidenceResult:
     session_id: str
     task_id: str
     messages_json: str = ""
+    reason: str = ""
+    observed: int | None = None
+    limit: int | None = None
+    partial: bool = False
+
+    def diagnostic(self):
+        reasons = {
+            "raw_bytes": ("capture.traversal", "bytes"),
+            "serialized_bytes": ("capture.serialized", "bytes"),
+            "message_count": ("capture.serialized", "messages"),
+            "depth": ("capture.traversal", "depth"),
+            "nodes": ("capture.traversal", "nodes"),
+            "unsupported_data": ("capture.traversal", None),
+        }
+        stage, unit = reasons.get(self.reason, ("capture.completion", None))
+        reason = self.reason if self.reason in reasons else "incomplete_completion"
+        detail = f"stage={stage} reason={reason}"
+        if reason == "incomplete_completion" and type(self.observed) is int and 0 <= self.observed <= sys.maxsize:
+            detail += f" observed_messages={self.observed} minimum_messages=2"
+        if unit and type(self.observed) is int and type(self.limit) is int and 0 <= self.observed <= sys.maxsize and 0 <= self.limit <= sys.maxsize:
+            detail += f" observed_{unit}{'>=' if self.partial else '='}{self.observed} limit_{unit}={self.limit}"
+        if self.partial:
+            detail += " (partial message traversal; lower bound, not a task total)"
+        elif reason == "serialized_bytes":
+            detail += " (capacity accounting includes a reserved separator byte)"
+        elif reason in ("nodes", "depth"):
+            detail += " (partial traversal; remaining data was not measured)"
+        return detail
 
 
 @dataclass(frozen=True)
@@ -68,6 +181,7 @@ class Evidence:
         self.messages = []
         self.byte_count = 2
         self.overflow = False
+        self.refusal = ("", None, None, False)
 
     def add(self, message):
         if message.get("role") == "system" or self.overflow:
@@ -78,14 +192,22 @@ class Evidence:
         # mid-value; oversized content refuses the whole task explicitly.
         nodes, budget = 0, self.max_bytes
 
+        def refuse(reason, observed=None, limit=None, partial=False):
+            self.refusal = reason, observed, limit, partial
+            raise ValueError("Evidence refused")
+
         def bounded(value, depth=0):
             nonlocal nodes, budget
             nodes += 1
-            if nodes > 512 or depth > 12 or budget < 0:
-                raise ValueError("Evidence input exceeds limit")
+            if nodes > 512:
+                refuse("nodes", nodes, 512)
+            if depth > 12:
+                refuse("depth", depth, 12)
+            if budget < 0:
+                refuse("raw_bytes", self.max_bytes - budget, self.max_bytes, True)
             if isinstance(value, str):
                 if len(value) > budget:
-                    raise ValueError("Evidence string exceeds limit")
+                    refuse("raw_bytes", self.max_bytes - budget + len(value), self.max_bytes, True)
                 budget -= len(value.encode("utf-8"))
             elif isinstance(value, dict):
                 for key, item in value.items():
@@ -95,19 +217,23 @@ class Evidence:
                 for item in value:
                     bounded(item, depth + 1)
             elif value is not None and not isinstance(value, (bool, int, float)):
-                raise ValueError("Unsupported evidence value")
+                refuse("unsupported_data")
 
         try:
             selected = {k: message[k] for k in ("role", "content", "tool_calls", "tool_call_id") if k in message}
             bounded(selected)
             safe = TrajectoryLogger._safe(selected)
             size = len(packed(safe).encode()) + 1
-            if len(self.messages) >= self.max_messages or size + self.byte_count > self.max_bytes:
-                raise ValueError("Evidence capacity exceeded")
+            if len(self.messages) >= self.max_messages:
+                refuse("message_count", len(self.messages) + 1, self.max_messages)
+            if size + self.byte_count > self.max_bytes:
+                refuse("serialized_bytes", size + self.byte_count, self.max_bytes)
             self.messages.append(safe)
             self.byte_count += size
         except (ValueError, TypeError, RecursionError):
             self.overflow = True
+            if not self.refusal[0]:
+                self.refusal = ("unsupported_data", None, None, False)
 
     def finish(self, completed=True, finish_reason="stop"):
         status = "READY"
@@ -126,7 +252,9 @@ class Evidence:
               or not str(self.messages[-1].get("content") or "").strip()
               or "<tool_call" in str(self.messages[-1].get("content") or "")):
             status = "INCOMPLETE"
-        return EvidenceResult(status, self.session_id, self.task_id, packed(self.messages) if status == "READY" else "")
+        refusal = ("incomplete_completion", len(self.messages), 2, False) if status == "INCOMPLETE" else self.refusal
+        return EvidenceResult(status, self.session_id, self.task_id,
+                              packed(self.messages) if status == "READY" else "", *refusal)
 
 
 @dataclass(frozen=True)
@@ -207,13 +335,16 @@ class DiscoveryRoster(Roster):
                                 raise ValueError("Duplicate profile directory identity")
                             identities.add(identity)
                             admitted.append(entry)
-                            self.errors.pop(child.name, None)
+                            self.errors.pop(diagnostic_id(child.name, child=True), None)
                         except (OSError, ValueError) as exc:
-                            self.errors[child.name] = str(exc)
+                            remember_diagnostic(self.errors, diagnostic_id(child.name, child=True),
+                                                "historical " + error_detail("discovery.child", exc, profile_id=child.name)
+                                                + "; child skipped; check profile directory identity and permissions.")
             self.root.validate(required=False)
             self.errors.pop("root", None)
         except (OSError, ValueError) as exc:
-            self.errors["root"] = str(exc)
+            remember_diagnostic(self.errors, "root", "historical " + error_detail("discovery.root", exc)
+                                + "; discovery unavailable; check root identity and permissions; restart after resolving replacement.")
             admitted = []
         object.__setattr__(self, "profiles", tuple(sorted(admitted, key=lambda p: p.profile_id)))
         return self.profiles
@@ -537,28 +668,36 @@ class Owner:
 
     def enqueue(self, evidence):
         if self.closed or not self.enabled:
-            return Admission("DISABLED")
+            return Admission("DISABLED", "stage=admission.authorization; " + REJECTED)
         if evidence.status != "READY":
-            return Admission(evidence.status, "Task evidence was not accepted")
+            status = evidence.status if evidence.status in ("OVERFLOW", "INCOMPLETE", "DISABLED", "FAILED") else "FAILED"
+            return Admission(status, evidence.diagnostic() + "; " + REJECTED)
+        stage = "admission.lock"
+        timing = dict(coordination_timeout_s=BUSY_SECONDS)
         try:
             with gate(self.entry, BUSY_SECONDS):
+                stage, timing = "admission.authorization", {}
                 auth = read_auth(self.roster, self.entry)
                 if not self._authorized(auth):
-                    return Admission("DISABLED")
+                    return Admission("DISABLED", "stage=admission.authorization; " + REJECTED)
+                stage = "admission.serialized"
                 size = len(evidence.messages_json.encode())
                 if size > 16 * 1024:
-                    return Admission("OVERFLOW", "Task evidence exceeds 16 KiB")
+                    return Admission("OVERFLOW", f"stage={stage} reason=serialized_bytes observed_bytes={size} limit_bytes=16384; " + REJECTED)
+                stage, timing = "admission.sqlite", dict(sqlite_busy_timeout_s=BUSY_SECONDS)
                 with closing(connect(self.entry)) as conn, conn:
                     conn.execute("BEGIN IMMEDIATE")
                     count, used = conn.execute("SELECT count(*), coalesce(sum(bytes),0) FROM evidence").fetchone()
-                    if count >= self.max_records or used + size > MAX_QUEUE_BYTES:
-                        return Admission("OVERFLOW", "Private evidence queue is full; older tasks retained")
+                    if count >= self.max_records:
+                        return Admission("OVERFLOW", f"stage=admission.queue reason=queue_records observed_records={count + 1} limit_records={self.max_records} (including rejected task); " + REJECTED)
+                    if used + size > MAX_QUEUE_BYTES:
+                        return Admission("OVERFLOW", f"stage=admission.queue reason=queue_bytes observed_bytes={used + size} limit_bytes={MAX_QUEUE_BYTES} queued_bytes={used} incoming_bytes={size}; " + REJECTED)
                     conn.execute("INSERT INTO evidence(task_id,session_id,generation,messages_json,bytes,created) VALUES(?,?,?,?,?,?)",
                                  (evidence.task_id, evidence.session_id, auth["generation"], evidence.messages_json, size, time.time()))
             self._wake.set()
-            return Admission("ACCEPTED", "Durably committed to the private local queue")
+            return Admission("ACCEPTED", "stage=admission.commit; durably committed to the private local queue; admission only, publication pending review.")
         except (OSError, ValueError, sqlite3.Error, TimeoutError) as exc:
-            return Admission("FAILED", type(exc).__name__)
+            return Admission("FAILED", error_detail(stage, exc, **timing) + "; " + REJECTED)
 
     def _ack(self, conn, job, outcome):
         conn.execute("UPDATE jobs SET status=?,detail=?,evidence_json='',catalog_json='',host_json='',result_json='' WHERE job_id=? AND status='RESULT'",
@@ -567,32 +706,43 @@ class Owner:
         conn.execute("DELETE FROM jobs WHERE status NOT IN ('PREPARED','RUNNING','RESULT') AND seq NOT IN (SELECT seq FROM jobs ORDER BY seq DESC LIMIT ?)", (HISTORY_COUNT,))
 
     def pump(self):
+        if not self.enabled or self.closed:
+            return
         try:
             self._pump()
         except Exception as exc:
-            self.last_error = type(exc).__name__
+            if self.enabled and not self.closed:
+                self.last_error = "historical " + error_detail("owner.mailbox", exc, profile_id=self.entry.profile_id) + "; owner background attempt interrupted; pending work retained; check local storage/catalog."
 
     def _pump(self):
         if not self.enabled or self.closed:
             return
-        with gate(self.entry):
-            auth = read_auth(self.roster, self.entry)
+        with diagnostic_gate(self.entry, "owner.authorization"):
+            with diagnostic_stage("owner.authorization"):
+                auth = read_auth(self.roster, self.entry)
             if not self._authorized(auth):
                 return
-            with closing(connect(self.entry)) as conn, conn:
+            with diagnostic_stage("owner.mailbox", sqlite_busy_timeout_s=BUSY_SECONDS), closing(connect(self.entry)) as conn, conn:
                 for row in conn.execute("SELECT * FROM jobs WHERE status='RESULT' ORDER BY seq").fetchall():
                     job = dict(row)
-                    if not valid_job(auth, self.entry, job) or not hmac.compare_digest(job["result_id"], result_seal(auth, job)):
-                        continue
-                    result = json.loads(job["result_json"])
-                    from skill_catalog import Publication
-                    if result["status"] in ("INVALID", "FAILED"):
-                        outcome = Publication(result["status"], result["detail"])
-                    else:
-                        host = json.loads(job["host_json"])
-                        snapshot = CatalogSnapshot(host["store_id"], job["catalog_json"], tuple(ReviewTarget(**t) for t in host["targets"]))
-                        outcome = self.store.apply_review(result["proposal"], snapshot, job["result_id"])
-                    self._ack(conn, job, outcome)
+                    with diagnostic_stage("owner.delivery", job_id=job["job_id"]):
+                        if not valid_job(auth, self.entry, job) or not hmac.compare_digest(job["result_id"], result_seal(auth, job)):
+                            continue
+                        result = json.loads(job["result_json"])
+                        from skill_catalog import Publication
+                        if result["status"] in ("INVALID", "FAILED"):
+                            outcome = Publication(result["status"], result["detail"])
+                        else:
+                            host = json.loads(job["host_json"])
+                            snapshot = CatalogSnapshot(host["store_id"], job["catalog_json"], tuple(ReviewTarget(**t) for t in host["targets"]))
+                            with diagnostic_stage("owner.publication", job_id=job["job_id"]):
+                                outcome = self.store.apply_review(result["proposal"], snapshot, job["result_id"])
+                            if outcome.status in ("INVALID", "FAILED"):
+                                # Returned error text has no trustworthy exception class.
+                                outcome = Publication(outcome.status, "stage=owner.publication outcome=" + outcome.status
+                                                      + "; publication refused; check catalog eligibility and local storage; exception detail unavailable.")
+                    with diagnostic_stage("owner.acknowledgement", job_id=job["job_id"], sqlite_busy_timeout_s=BUSY_SECONDS):
+                        self._ack(conn, job, outcome)
                 if conn.execute("SELECT 1 FROM jobs WHERE status IN ('PREPARED','RUNNING','RESULT') LIMIT 1").fetchone():
                     return
                 selected, size = [], 0
@@ -605,16 +755,18 @@ class Owner:
         if not selected:
             return
         # Heavy catalog work is outside the foreground and carries immutable data.
-        snapshot = self.store.prepare_review()
-        evidence_json = packed([dict(session_id=r["session_id"], task_id=r["task_id"], messages=json.loads(r["messages_json"])) for r in selected])
-        host_json = packed(dict(store_id=snapshot.store_id, targets=[asdict(t) for t in snapshot.targets]))
-        with gate(self.entry):
-            auth = read_auth(self.roster, self.entry)
+        with diagnostic_stage("owner.preparation"):
+            snapshot = self.store.prepare_review()
+            evidence_json = packed([dict(session_id=r["session_id"], task_id=r["task_id"], messages=json.loads(r["messages_json"])) for r in selected])
+            host_json = packed(dict(store_id=snapshot.store_id, targets=[asdict(t) for t in snapshot.targets]))
+        with diagnostic_gate(self.entry, "owner.preparation_authorization"):
+            with diagnostic_stage("owner.preparation_authorization"):
+                auth = read_auth(self.roster, self.entry)
             if not self._authorized(auth) or auth["generation"] != generation:
                 return
             job = dict(job_id=uuid.uuid4().hex, profile_id=self.entry.profile_id, store_id=self.entry.store_id,
                        generation=generation, evidence_json=evidence_json, catalog_json=snapshot.public_json, host_json=host_json)
-            with closing(connect(self.entry)) as conn, conn:
+            with diagnostic_stage("owner.preparation_persistence", job_id=job["job_id"], sqlite_busy_timeout_s=BUSY_SECONDS), closing(connect(self.entry)) as conn, conn:
                 if conn.execute("SELECT 1 FROM jobs WHERE status IN ('PREPARED','RUNNING','RESULT') LIMIT 1").fetchone():
                     return
                 conn.execute("INSERT INTO jobs(job_id,profile_id,store_id,generation,evidence_json,catalog_json,host_json,input_seal,created,status) VALUES(?,?,?,?,?,?,?,?,?,'PREPARED')",
@@ -633,6 +785,7 @@ class Owner:
         if self.closed:
             return
         with gate(self.entry):
+            diagnostics_allowed = self.enabled
             self.closed = True
             self.enabled = False
             try:
@@ -641,7 +794,8 @@ class Owner:
                     auth["owner_id"] = None  # Disconnect preserves generation/results.
                     write_auth(self.roster, self.entry, auth)
             except (OSError, ValueError) as exc:
-                self.last_error = type(exc).__name__
+                if diagnostics_allowed:
+                    self.last_error = "historical " + error_detail("owner.disconnect", exc, profile_id=self.entry.profile_id) + "; disconnect metadata was not updated; check host coordination storage."
         self._stop.set()
         self._wake.set()
         if self._thread:
@@ -665,17 +819,34 @@ class ReviewService:
         self.discovery_interval = discovery_interval
         self._next_discovery = 0
         self._reported = {}
+        self._once = True
+        self._phase, self._phase_timing = "service.startup", {}
+
+    def _record(self, key, detail):
+        historical = "historical " + detail
+        remember_diagnostic(self.errors, key, historical)
+        if historical not in self._reported:
+            print("Skill review: " + historical, file=sys.stderr, flush=True)
+            remember_diagnostic(self._reported, historical, True)
+
+    def _failure(self, stage, entry, exc, job=None):
+        detail = error_detail(stage, exc, profile_id=entry.profile_id,
+                              job_id=job["job_id"] if job else None)
+        stage = exc.stage if isinstance(exc, DiagnosticFailure) else stage
+        if stage in ("pending.scan", "pending.recovery", "claim"):
+            detail += "; local attempt interrupted; admitted work retained; "
+            detail += ("once has no automatic future run; rerun once or start run after checking coordination/storage."
+                       if self._once else "automatic future run-loop retry while the service runs; check coordination/storage if repeated.")
+        else:
+            detail += "; RUNNING attempt interrupted; no active retry; resolve coordination/storage failure and restart the service to recover."
+        self._record(diagnostic_id(entry.profile_id), detail)
 
     def _refresh(self):
         if isinstance(self.roster, DiscoveryRoster) and time.monotonic() >= self._next_discovery:
             self.roster.refresh()
             self._next_discovery = time.monotonic() + self.discovery_interval
             for key, value in self.roster.errors.items():
-                self.errors["discovery:" + key] = value
-        for key, value in self.errors.items():
-            if self._reported.get(key) != value:
-                print(f"Skill review [{key}]: {value}", file=sys.stderr, flush=True)
-                self._reported[key] = value
+                self._record("discovery:" + diagnostic_id(key, child=True), value.removeprefix("historical "))
 
     def stop(self):
         self.stop_event.set()
@@ -684,61 +855,79 @@ class ReviewService:
         candidates = []
         for entry in self.roster.profiles:
             try:
-                with gate(entry, BUSY_SECONDS):
-                    auth = read_auth(self.roster, entry)
+                with diagnostic_gate(entry, "pending.scan", BUSY_SECONDS):
+                    with diagnostic_stage("pending.scan"):
+                        auth = read_auth(self.roster, entry)
                     if not auth or not auth["enabled"] or not Path(entry.mailbox).exists():
                         continue
-                    with closing(connect(entry, readonly=True)) as conn:
-                        interrupted = conn.execute("SELECT 1 FROM jobs WHERE status='RUNNING' AND generation=? AND (service_generation IS NULL OR service_generation != ?) LIMIT 1", (auth["generation"], self.generation)).fetchone()
+                    with diagnostic_stage("pending.scan", sqlite_busy_timeout_s=BUSY_SECONDS), closing(connect(entry, readonly=True)) as conn:
+                        interrupted = conn.execute("SELECT job_id FROM jobs WHERE status='RUNNING' AND generation=? AND (service_generation IS NULL OR service_generation != ?) LIMIT 1", (auth["generation"], self.generation)).fetchone()
                     if interrupted:
-                        with closing(connect(entry)) as conn, conn:
+                        with diagnostic_stage("pending.recovery", job_id=interrupted["job_id"], sqlite_busy_timeout_s=BUSY_SECONDS), closing(connect(entry)) as conn, conn:
                             # Only attempts from an exited singleton generation. A live
                             # rescan never resets any current service attempt.
                             conn.execute("UPDATE jobs SET status='PREPARED',service_generation=NULL,result_id=NULL,result_json=NULL WHERE status='RUNNING' AND generation=? AND (service_generation IS NULL OR service_generation != ?)", (auth["generation"], self.generation))
-                    with closing(connect(entry, readonly=True)) as conn:
+                    with diagnostic_stage("pending.scan", sqlite_busy_timeout_s=BUSY_SECONDS), closing(connect(entry, readonly=True)) as conn:
                         row = conn.execute("SELECT * FROM jobs WHERE status='PREPARED' AND generation=? ORDER BY seq LIMIT 1", (auth["generation"],)).fetchone()
-                        if row and valid_job(auth, entry, dict(row)):
-                            candidates.append((row["created"], entry.profile_id, entry, dict(row)))
-            except (OSError, ValueError, KeyError, sqlite3.Error, TimeoutError) as exc:
-                self.errors[entry.profile_id] = type(exc).__name__
+                        if row:
+                            with diagnostic_stage("pending.scan", job_id=row["job_id"]):
+                                if valid_job(auth, entry, dict(row)):
+                                    candidates.append((row["created"], entry.profile_id, entry, dict(row)))
+            except (OSError, ValueError, KeyError, sqlite3.Error, TimeoutError, DiagnosticFailure) as exc:
+                self._failure("pending.scan", entry, exc)
         return sorted(candidates, key=lambda v: v[:2])
 
     def _claim(self, entry, job):
-        with gate(entry):
-            auth = read_auth(self.roster, entry)
-            if self.stop_event.is_set() or not valid_job(auth, entry, job):
-                return False
-            with closing(connect(entry)) as conn, conn:
+        with diagnostic_gate(entry, "claim", job_id=job["job_id"]):
+            with diagnostic_stage("claim", job_id=job["job_id"]):
+                auth = read_auth(self.roster, entry)
+                if self.stop_event.is_set() or not valid_job(auth, entry, job):
+                    return False
+            with diagnostic_stage("claim", job_id=job["job_id"], sqlite_busy_timeout_s=BUSY_SECONDS), closing(connect(entry)) as conn, conn:
                 changed = conn.execute("UPDATE jobs SET status='RUNNING',service_generation=? WHERE job_id=? AND status='PREPARED' AND input_seal=?", (self.generation, job["job_id"], job["input_seal"])).rowcount
             job["service_generation"] = self.generation
             return bool(changed)
 
     def _infer(self, entry, job, provider):
         # Start authorization is rechecked in the worker, after scheduling.
-        with gate(entry):
-            auth = read_auth(self.roster, entry)
-            if self.stop_event.is_set() or not valid_job(auth, entry, job):
-                return None
+        with diagnostic_gate(entry, "worker.authorization", job_id=job["job_id"]):
+            with diagnostic_stage("worker.authorization", job_id=job["job_id"]):
+                auth = read_auth(self.roster, entry)
+                if self.stop_event.is_set() or not valid_job(auth, entry, job):
+                    return None
+        def failure(stage, status, exc):
+            detail = error_detail(stage, exc, profile_id=entry.profile_id, job_id=job["job_id"],
+                                  use_context=False,
+                                  **(dict(provider_timeout_s=self.timeout) if stage == "provider.inference" else {}))
+            return dict(status=status, detail=detail + f"; outcome={status}; no automatic provider retry; awaiting result persistence and owner acknowledgement.")
         try:
             proposal = provider(request_json(self.roster, job))
+        except ValueError as exc:
+            # The SDK adapter also validates output; preserve its INVALID contract.
+            return failure("provider.inference_validation", "INVALID", exc)
+        except Exception as exc:
+            return failure("provider.inference", "FAILED", exc)
+        try:
             validate_proposal(proposal)
             return dict(status="PROPOSAL", proposal=proposal)
         except ValueError as exc:
-            return dict(status="INVALID", detail=str(exc)[:256])
+            return failure("provider.validation", "INVALID", exc)
         except Exception as exc:
-            # Do not retain provider errors that may contain private headers/body.
-            return dict(status="FAILED", detail=type(exc).__name__)
+            return failure("provider.validation", "FAILED", exc)
 
     def _finish(self, entry, job, result):
         if result is None:
             return
-        with gate(entry):
-            auth = read_auth(self.roster, entry)
-            if self.stop_event.is_set() or not valid_job(auth, entry, job):
-                return
-            job["result_json"] = packed(result)
-            result_id = result_seal(auth, job)
-            with closing(connect(entry)) as conn, conn:
+        with diagnostic_gate(entry, "result.persistence", job_id=job["job_id"]):
+            with diagnostic_stage("result.persistence", job_id=job["job_id"]):
+                auth = read_auth(self.roster, entry)
+                if self.stop_event.is_set() or not valid_job(auth, entry, job):
+                    return
+                if result["status"] in ("FAILED", "INVALID"):
+                    self._record(diagnostic_id(entry.profile_id), result["detail"])
+                job["result_json"] = packed(result)
+                result_id = result_seal(auth, job)
+            with diagnostic_stage("result.persistence", job_id=job["job_id"], sqlite_busy_timeout_s=BUSY_SECONDS), closing(connect(entry)) as conn, conn:
                 conn.execute("UPDATE jobs SET status='RESULT',result_json=?,result_id=? WHERE job_id=? AND status='RUNNING' AND service_generation=? AND input_seal=?",
                              (job["result_json"], result_id, job["job_id"], self.generation, job["input_seal"]))
 
@@ -748,7 +937,10 @@ class ReviewService:
     def run(self, once=False):
         # Held through executor shutdown. No replacement while a local worker
         # still owns capacity, even if a remote request outlives its timeout.
+        self._once = once
+        self._phase, self._phase_timing = "service.startup.singleton", dict(coordination_timeout_s=0)
         with ProcessLock("hermes-skill-review-service", timeout=0):
+            self._phase, self._phase_timing = "service.startup.policy", {}
             self.generation = uuid.uuid4().hex
             if isinstance(self.roster, DiscoveryRoster):
                 self.roster.check_policy(create=True)
@@ -757,14 +949,16 @@ class ReviewService:
             initial = self._pending(recover=True)
             client = None
             if self.provider is None:
-                from openai import OpenAI
-                from skills import AutoSkillExtractor
-                client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY") or "local-no-key-required",
-                                base_url=self.roster.base_url, timeout=self.timeout, max_retries=0)
+                with diagnostic_stage("service.startup.provider"):
+                    from openai import OpenAI
+                    from skills import AutoSkillExtractor
+                    client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY") or "local-no-key-required",
+                                    base_url=self.roster.base_url, timeout=self.timeout, max_retries=0)
                 provider = lambda request: AutoSkillExtractor.generate_proposal(client, self.roster.model, request, timeout=self.timeout, output_tokens=self.output_tokens)
             else:
                 provider = self.provider
             processed, inflight = 0, {}
+            self._phase = "service.run"
             try:
                 with ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix="skill-inference") as pool:
                     while not self.stop_event.is_set():
@@ -775,11 +969,13 @@ class ReviewService:
                         for _, _, entry, job in pending:
                             if len(inflight) >= self.workers:
                                 break
+                            stage = "claim"
                             try:
                                 if self._claim(entry, job):
+                                    stage = "worker.dispatch"
                                     inflight[pool.submit(self._infer, entry, job, provider)] = (entry, job)
-                            except (OSError, ValueError, sqlite3.Error, TimeoutError) as exc:
-                                self.errors[entry.profile_id] = type(exc).__name__
+                            except Exception as exc:
+                                self._failure(stage, entry, exc, job)
                         if once:
                             claimed_ids = {job["job_id"] for _, job in inflight.values()}
                             initial = [item for item in initial if item[3]["job_id"] not in claimed_ids]
@@ -791,14 +987,18 @@ class ReviewService:
                         done, _ = wait(inflight, timeout=.05, return_when=FIRST_COMPLETED)
                         for future in done:
                             entry, job = inflight.pop(future)
+                            stage = "worker.authorization"
                             try:
-                                self._finish(entry, job, future.result())
+                                result = future.result()
+                                stage = "result.persistence"
+                                self._finish(entry, job, result)
                             except Exception as exc:
-                                self.errors[entry.profile_id] = type(exc).__name__
+                                self._failure(stage, entry, exc, job)
                             processed += 1
             finally:
                 if client:
-                    client.close()
+                    with diagnostic_stage("service.shutdown"):
+                        client.close()
             return processed
 
 
@@ -821,6 +1021,9 @@ def main(argv=None):
     entry_parser.add_argument("--profile", required=True)
     entry_parser.add_argument("--state-root", required=True)
     args = parser.parse_args(argv)
+    stage = "service.status" if args.command == "status" else "service.startup"
+    profile_id = None
+    service = None
     try:
         if args.command == "roster-entry":
             validate_profile_id(args.profile)
@@ -842,11 +1045,13 @@ def main(argv=None):
                 running = True
             profiles = []
             for entry in roster.profiles:
-                with gate(entry):
-                    auth = read_auth(roster, entry)
+                profile_id = entry.profile_id
+                with diagnostic_gate(entry, "service.status"):
+                    with diagnostic_stage("service.status"):
+                        auth = read_auth(roster, entry)
                     counts = {}
                     if Path(entry.mailbox).exists():
-                        with closing(connect(entry, readonly=True)) as conn:
+                        with diagnostic_stage("service.status", sqlite_busy_timeout_s=BUSY_SECONDS), closing(connect(entry, readonly=True)) as conn:
                             counts = dict(conn.execute("SELECT status,count(*) FROM jobs GROUP BY status"))
                     profiles.append(dict(profile_id=entry.profile_id, enabled=bool(auth and auth["enabled"]), jobs=counts))
             print(packed(dict(service_running=running, profiles=profiles, discovery_errors=getattr(roster, "errors", {}))))
@@ -858,8 +1063,12 @@ def main(argv=None):
         count = service.run(once=args.command == "once")
         print(packed(dict(processed=count, errors=service.errors)))
         return 0
-    except (OSError, ValueError, TimeoutError, sqlite3.Error) as exc:
-        print(f"Skill review service: {exc}")
+    except Exception as exc:
+        timing = {}
+        if service is not None:
+            stage, timing = service._phase, service._phase_timing
+        detail = error_detail(stage, exc, profile_id=profile_id, **timing)
+        print("Skill review service: " + detail + "; check launch settings, flag conflicts, profile identity/permissions and host coordination. If the singleton is busy, wait for the prior service to exit before restarting. No automatic retry from this command.")
         return 2
 
 

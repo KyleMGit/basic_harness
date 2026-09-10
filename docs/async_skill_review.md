@@ -199,6 +199,91 @@ tasks, or survival beyond normal local SQLite/filesystem durability guarantees.
 Only evidence included in an acknowledged batch is consumed. Terminal provider
 errors/invalid proposals consume their included batch with an explicit outcome.
 
+## Reading the diagnostics
+
+The agent prints admission and refusal diagnostics in the conversation. For example,
+these messages were produced with temporary evidence and the unchanged 16 KiB cap:
+
+```text
+[Skill Review] OVERFLOW: stage=capture.traversal reason=raw_bytes observed_bytes>=20015 limit_bytes=16384 (partial message traversal; lower bound, not a task total); NOT queued; no automatic retry; earlier queue work retained.
+[Skill Review] OVERFLOW: stage=capture.serialized reason=serialized_bytes observed_bytes=18031 limit_bytes=16384 (capacity accounting includes a reserved separator byte); NOT queued; no automatic retry; earlier queue work retained.
+```
+
+The first diagnostic stops at the original traversal boundary. Its byte count is
+a lower bound from the visited data, not a serialized task size. The second uses
+the existing serialized capacity counter, including its one reserved separator
+byte; JSON escaping can exceed this cap even when raw UTF-8 fits. Logging does not
+perform another serialization or traverse the rejected remainder.
+
+`capture.traversal` also distinguishes depth 13 against limit 12, node 513 against
+limit 512, and unsupported data. Depth/node observations describe the partial
+traversal. `capture.serialized` reports message count overflow separately from
+bytes. `capture.completion` reports incomplete evidence and its captured message
+count; two messages alone do not prove a complete task. These limits, the 64-message
+cap, and completion eligibility are unchanged.
+
+`admission.lock`, `admission.authorization`, and `admission.sqlite` distinguish
+local admission failures. Known acquisition and SQLite busy settings appear as
+`coordination_timeout_s=0.05` and `sqlite_busy_timeout_s=0.05`. `admission.queue`
+reports `queue_records` or `queue_bytes` with the observed count including the
+rejected task and the applicable limit (128 records or 1048576 bytes by default).
+Queue byte diagnostics also show the already queued and incoming byte counts.
+Every refusal says the task was **NOT queued**, has **no automatic retry**, and
+retains earlier queue work. `ACCEPTED` is durable admission only; it does not
+promise publication. Unavailable guidance points to the automatic launch settings
+above; a static roster is optional.
+
+The separate service emits errors immediately on stderr, including in `once`.
+These examples came from local fake-provider and lock-failure runs:
+
+```text
+Skill review: historical stage=provider.inference error=APITimeoutError profile=user-0 job=fa7e613b794e4287b5f8685fd257f894 provider_timeout_s=1.25; outcome=FAILED; no automatic provider retry; awaiting result persistence and owner acknowledgement.
+Skill review: historical stage=result.persistence error=TimeoutError profile=user-0 job=db6d37c0463d488eb07605c5a5eb7be6 coordination_timeout_s=5; RUNNING attempt interrupted; no active retry; resolve coordination/storage failure and restart the service to recover.
+```
+
+| Stage | Consequence and operator action |
+| --- | --- |
+| `pending.scan` / `pending.recovery` | Scanning or recovery was interrupted. Admitted work remains. `run` automatically tries again on a future loop; `once` promises no future run. Check local coordination/storage if repeated. |
+| `claim` | Claiming the prepared job was interrupted. The same future-loop guidance applies; a lock timeout is local coordination, not a model timeout. |
+| `worker.authorization` / `worker.dispatch` | A claimed RUNNING attempt was interrupted before inference. There is no active retry for that attempt. Resolve the local fault, stop the service, and restart it after its workers exit. |
+| `provider.inference` | The provider call failed, including SDK `APITimeoutError`. The configured provider timeout is shown. A persisted FAILED result is acknowledged by the owner and consumes that batch; it is not NONE. |
+| `provider.validation` / `provider.inference_validation` | Output was rejected. The latter covers an adapter that performs inference and validation together. The existing INVALID/FAILED outcomes remain; arbitrary validation exception text is omitted. |
+| `result.persistence` | The result could not be durably recorded. A RUNNING attempt may remain even after later scans succeed. Resolve the local fault and restart the service; those scans do not retry this attempt. |
+| `service.startup.*` / `service.status` / `service.shutdown` | The command reports a safe exception class and launch/storage guidance, without raw exception text. A busy singleton reports its zero-wait setting; let the prior service exit before restarting. |
+
+Timeout fields describe the configured operation whose failure was observed.
+Lock acquisition uses 5 seconds in claim, worker authorization and result
+persistence; SQLite uses 0.05 seconds. An exception raised outside a known timed
+operation does not acquire a guessed timeout. SDK timeouts remain transport
+settings, not an end-to-end deadline. No retry or recovery policy changes here.
+
+The final service JSON retains `processed` and `errors`. Each retained error value
+is explicitly **historical**: it records a failed attempt, not a claim about current
+health or recovery. A successful pending scan does not erase a persistence failure
+or announce recovery. Identical diagnostics for a stage/profile/job are suppressed
+while retained in a 128-entry in-memory suppression cache. The error map and
+discovery error map are also bounded to 128 entries; entries can be evicted, and an
+evicted diagnostic can be emitted again. These caches are process-local, not a
+complete audit history. Existing `status` fields remain; `status` does not load
+another process's error history or create a persisted diagnostic schema.
+
+Owner preparation, delivery, publication and acknowledgement exceptions are
+available on the live Python object's `agent.skill_review_owner.last_error` (or
+`owner.last_error` for an embedded owner). This single bounded string includes a
+historical label, local stage, safe exception class, profile and any available job
+ID. It is **not delivered to chat** and is not exposed by service `status`. When a
+publication method returns a failure without an exception object, terminal job
+metadata records the publication stage/outcome and says exception detail is
+unavailable. No class is reconstructed from arbitrary returned text. Successful
+CREATE/UPDATE/NONE chat notifications remain outside this implementation.
+
+Diagnostics omit evidence, provider bodies/headers, credentials, SQL, full paths
+and traceback bodies. Known exception classes are allowlisted; custom classes use
+a safe base class. Invalid or oversized profile/job identifiers become `<invalid>`;
+discovery child labels are bounded and restricted to safe ASCII. Diagnostic data
+uses the existing console, in-memory error and authorized terminal-job metadata
+paths. No file logger or post-revocation profile diagnostic writes are added.
+
 ## Authorization and publication
 
 Host coordination state lives **outside protected profiles**. Its generation and
@@ -318,5 +403,8 @@ means the service will not start/persist their work.
 The original evidence log is `C:/Users/Owner/AppData/Local/Temp/async-skills-clean-rebuild-evidence.md`.
 Automatic-discovery RED/GREEN and final verification are recorded in
 `C:/Users/Owner/AppData/Local/Temp/async-profile-discovery-evidence.md`.
+Logging TDD and verification are recorded in
+`C:/Users/Owner/AppData/Local/Temp/skill-review-logging-evidence.md`;
+the focused caller-visible cases are in `test_skill_review_diagnostics.py`.
 No production requests, live service installation, credentials or real profile
 catalogs are needed for the acceptance tests.

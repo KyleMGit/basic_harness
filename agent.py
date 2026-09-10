@@ -36,7 +36,8 @@ except ImportError:
 
 from tools import registry, terminal_session, skill_store
 from skill_review import (Evidence, Owner, DiscoveryRoster, load_roster, gate,
-                          check_authority, authority_origin, read_auth, revoke_existing)
+                          check_authority, authority_origin, read_auth, revoke_existing,
+                          error_detail, REJECTED)
 from profile_paths import (DEFAULT_PROFILES_DIR, ProfilePaths, absolute_path,
                            control_directory, default_model, default_base_url,
                            validate_profile_id)
@@ -561,16 +562,19 @@ Below is the catalog of learned project skills. When a task relates to any avail
         """Bounded local durable admission; inference is owned by the service."""
         if not self.auto_learn_skills or self.read_only or self.stateless:
             return
+        stage = "capture.completion"
         try:
             if self.skill_review_owner is None:
-                print("[Skill Review] Unavailable: configure a host-authorized review roster.")
+                print("[Skill Review] Unavailable: stage=admission.setup; launch the agent with --auto-skills and the service with matching --profiles-dir, --model and --base-url settings; " + REJECTED)
                 return
             if self._task_evidence is None:
                 return
-            self.last_skill_admission = self.skill_review_owner.enqueue(self._task_evidence.finish())
+            evidence = self._task_evidence.finish()
+            stage = "admission"
+            self.last_skill_admission = self.skill_review_owner.enqueue(evidence)
             print(f"[Skill Review] {self.last_skill_admission.status}: {self.last_skill_admission.detail}")
         except Exception as exc:
-            print(f"[Skill Review] FAILED: {type(exc).__name__}")
+            print("[Skill Review] FAILED: " + error_detail(stage, exc) + "; " + REJECTED)
         finally:
             self._task_evidence = None
 
