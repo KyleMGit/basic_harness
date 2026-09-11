@@ -535,7 +535,16 @@ retains earlier queue work. A legacy direct `ACCEPTED` or automatic `ELIGIBLE` i
 durable local state only; it does not promise publication. Unavailable guidance points to the automatic launch settings
 above; a static roster is optional.
 
-The separate service emits errors immediately on stderr, including in `once`.
+The separate service emits errors immediately on stderr, including in `once`. It also
+observes the owner-authenticated lifecycle outbox read-only and emits safe, flushed
+`REQUESTED`, `STARTED`, and final decision lines to its own stderr. The final line is
+shown only after the owner has committed and sealed the decision; proposal completion
+alone is not reported as `APPLIED`. This service-console stream is independent of the
+owner agent's quiet mode and terminal notice delivery. Final `once`/`status` JSON stays
+on stdout for machine readers. `run` keeps polling and can therefore show an owner-final
+decision that arrives after proposal persistence. `once` remains strictly finite: it
+shows only owner lifecycle rows already observable during its work and does not wait for
+later owner publication merely to display a final line.
 These examples came from local fake-provider and lock-failure runs:
 
 ```text

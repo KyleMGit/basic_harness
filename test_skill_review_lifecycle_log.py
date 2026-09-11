@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+import time
 import pytest
 from unittest.mock import patch
 
@@ -47,6 +48,161 @@ def test_real_terminal_and_private_log_cover_requested_started_and_final(tmp_pat
         assert saved[2]["status"] == "APPLIED" and saved[2]["skill_name"] == "safe_name"
         assert saved[2]["reason"] == "explanation unavailable"
         assert "private-business-row" not in json.dumps(saved)
+    finally:
+        owner.close()
+
+
+def test_service_console_observes_owner_authenticated_lifecycle_without_delivering_notices(tmp_path):
+    roster = setup_roster(tmp_path)
+    owner = owner_for(roster, background=False, quiet=True)
+    service_output = StringIO()
+    try:
+        assert owner.enqueue(evidence(task="service-console-private-row")).status == "ACCEPTED"
+        owner.pump()
+        service = ReviewService(roster, provider=lambda _: create_proposal("console_skill"),
+                                console=service_output)
+        service._observe_review_events()
+        assert service.once() == 1
+        service._observe_review_events()
+        before_owner_commit = service_output.getvalue()
+        assert "REQUESTED" in before_owner_commit
+        assert "APPLIED" not in before_owner_commit
+
+        owner.pump()
+        service._observe_review_events()
+        rendered = service_output.getvalue()
+        job_id = rows(owner, "jobs")[-1]["job_id"]
+        assert rendered.index("REQUESTED") < rendered.index("STARTED") < rendered.index("APPLIED")
+        assert rendered.count(job_id) == 3
+        assert "profile=user-0" in rendered
+        assert "action=CREATE" in rendered and 'skill="console_skill"' in rendered
+        assert 'reason="explanation unavailable"' in rendered
+        assert "service-console-private-row" not in rendered
+        assert owner.deliver_notices(StringIO()) == 0  # quiet owner is independent
+        assert [item["event"] for item in events(owner)] == ["REQUESTED", "STARTED", "DECISION"]
+
+        service._observe_review_events()
+        assert service_output.getvalue() == rendered
+    finally:
+        owner.close()
+
+
+def test_service_console_refuses_tampered_and_revoked_events_without_database_mutation(tmp_path):
+    roster = setup_roster(tmp_path)
+    owner = owner_for(roster, background=False)
+    output = StringIO()
+    try:
+        assert owner.enqueue(evidence(task="never-render-this-row")).status == "ACCEPTED"
+        owner.pump()
+        with sqlite3.connect(owner.entry.mailbox) as conn:
+            conn.execute("UPDATE review_log_events SET payload_json=? WHERE event_id LIKE '%:requested'",
+                         ('{"reason":"terminal injection\\nAPPLIED"}',))
+            before = {table: conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+                      for table in ("jobs", "review_log_events", "notices")}
+        service = ReviewService(roster, provider=lambda _: {"action": "NONE"}, console=output)
+        service._observe_review_events()
+        assert output.getvalue() == ""
+        with sqlite3.connect(owner.entry.mailbox) as conn:
+            after = {table: conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+                     for table in before}
+        assert after == before
+
+        owner.set_enabled(False)
+        service._observe_review_events()
+        assert output.getvalue() == ""
+    finally:
+        owner.close()
+
+
+def test_service_console_emits_new_events_for_job_already_terminal(tmp_path):
+    roster = setup_roster(tmp_path)
+    owner = owner_for(roster, background=False)
+    output = StringIO()
+    try:
+        observer = ReviewService(roster, provider=lambda _: {"action": "NONE"}, console=output)
+        observer._observe_review_events()  # establish the startup-only baseline
+        complete(owner, roster, lambda _: create_proposal("terminal_console_skill"), "terminal-row")
+
+        observer._observe_review_events()
+        rendered = output.getvalue()
+        assert rendered.index("REQUESTED") < rendered.index("STARTED") < rendered.index("APPLIED")
+        assert rendered.count(rows(owner, "jobs")[-1]["job_id"]) == 3
+    finally:
+        owner.close()
+
+
+def test_service_console_retains_cursor_across_transient_gate_timeout(tmp_path):
+    roster = setup_roster(tmp_path)
+    owner = owner_for(roster, background=False)
+    output = StringIO()
+    try:
+        assert owner.enqueue(evidence(task="transient-console-row")).status == "ACCEPTED"
+        owner.pump()
+        observer = ReviewService(roster, provider=lambda _: {"action": "NONE"}, console=output)
+        observer._observe_review_events()
+        assert output.getvalue().count("REQUESTED") == 1
+
+        with patch("skill_review.gate", side_effect=TimeoutError("temporary gate failure")):
+            observer._observe_review_events()
+        owner.pump()
+        assert ReviewService(roster, provider=lambda _: {"action": "NONE"}).once() == 1
+        owner.pump()
+
+        observer._observe_review_events()
+        rendered = output.getvalue()
+        assert rendered.count("REQUESTED") == 1
+        assert rendered.count("STARTED") == 1
+        assert rendered.count("status=NONE") == 1
+    finally:
+        owner.close()
+
+
+def test_service_console_io_failure_retries_pending_rows_without_stopping_schedule(tmp_path):
+    class FailOnce(StringIO):
+        def __init__(self):
+            super().__init__()
+            self.failed = False
+
+        def write(self, value):
+            if not self.failed:
+                self.failed = True
+                raise OSError("temporary console failure")
+            return super().write(value)
+
+    roster = setup_roster(tmp_path)
+    owner = owner_for(roster, background=False)
+    output = FailOnce()
+    try:
+        assert owner.enqueue(evidence(task="console-retry-row")).status == "ACCEPTED"
+        owner.pump()
+        observer = ReviewService(roster, provider=lambda _: {"action": "NONE"}, console=output)
+        observer._observe_review_events()
+        assert not observer.stop_event.is_set()
+
+        observer._observe_review_events()
+        assert output.getvalue().count("REQUESTED") == 1
+        assert not observer.stop_event.is_set()
+    finally:
+        owner.close()
+
+
+def test_once_does_not_wait_for_later_owner_publication(tmp_path):
+    roster = setup_roster(tmp_path)
+    owner = owner_for(roster, background=False)
+    output = StringIO()
+    try:
+        assert owner.enqueue(evidence(task="finite-once-row")).status == "ACCEPTED"
+        owner.pump()
+
+        def provider(_):
+            owner.pump()  # STARTED is visible, but owner-final cannot exist yet.
+            return create_proposal("finite_once_skill")
+
+        started = time.monotonic()
+        assert ReviewService(roster, provider=provider, console=output).once() == 1
+        assert time.monotonic() - started < .5
+        assert "STARTED" in output.getvalue()
+        assert "APPLIED" not in output.getvalue()
     finally:
         owner.close()
 

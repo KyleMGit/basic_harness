@@ -649,13 +649,18 @@ def test_revoked_provider_failure_does_not_write_diagnostics_to_profile(mailbox,
     prepared(owner)
     snapshot = []
     def provider(_):
+        before_revoke = capsys.readouterr().err
+        assert "status=REQUESTED" in before_revoke
+        assert_private(before_revoke)
         owner.set_enabled(False)
         snapshot.append(profile_bytes(owner))
         raise RuntimeError(PRIVATE)
     assert review.ReviewService(roster, provider=provider).once() == 1
     owner.pump()
     assert snapshot[0] == profile_bytes(owner)
-    assert not capsys.readouterr().err
+    after_revoke = capsys.readouterr().err
+    assert not after_revoke
+    assert_private(after_revoke)
 
 
 @pytest.mark.parametrize("point,stage,state", [("_claim", "claim", "PREPARED"), ("_infer", "worker.authorization", "RUNNING"), ("_finish", "result.persistence", "RUNNING")])

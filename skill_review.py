@@ -987,6 +987,47 @@ def review_log_seal(auth, event):
     return seal(auth, {key: event[key] for key in REVIEW_LOG_FIELDS})
 
 
+def valid_review_log_event(entry, auth, row):
+    """Validate one owner-authenticated lifecycle record for narrow read-only consumers."""
+    if ((row["profile_id"], row["store_id"], row["generation"])
+            != (entry.profile_id, entry.store_id, auth["generation"])
+            or not isinstance(row["event_seal"], str)
+            or not hmac.compare_digest(row["event_seal"], review_log_seal(auth, row))
+            or type(row["created"]) not in (int, float)
+            or not isinstance(row["payload_json"], str)
+            or len(row["payload_json"].encode()) > REVIEW_LOG_PAYLOAD_BYTES):
+        return False
+    try:
+        payload = json.loads(row["payload_json"])
+    except (TypeError, ValueError):
+        return False
+    expected = {"timestamp", "event_id", "review_id", "event", "action",
+                "skill_name", "status", "reason"}
+    if not isinstance(payload, dict) or set(payload) != expected:
+        return False
+    event, status, action = payload["event"], payload["status"], payload["action"]
+    allowed_status = {"REQUESTED", "STARTED"} | set(NOTICE_OUTCOMES)
+    allowed_action = {"", "CREATE", "UPDATE", "NONE", "FAILED", "INVALID",
+                      "STALE", "COLLISION", "CANCELLED", "BUDGET_REFUSED"}
+    return (re.fullmatch(r"[a-f0-9]{32}", row["job_id"] or "") is not None
+            and row["event_id"] == f"{row['job_id']}:{str(event).lower()}"
+            and payload["event_id"] == row["event_id"]
+            and payload["review_id"] == row["job_id"]
+            and event in ("REQUESTED", "STARTED", "DECISION")
+            and status in allowed_status and action in allowed_action
+            and isinstance(payload["timestamp"], str) and len(payload["timestamp"]) == 20
+            and isinstance(payload["skill_name"], str)
+            and len(payload["skill_name"]) <= REVIEW_LOG_NAME_CHARS
+            and isinstance(payload["reason"], str) and len(payload["reason"].encode()) <= 512
+            and ((event == "REQUESTED" and status == "REQUESTED" and action == ""
+                  and payload["skill_name"] == "" and payload["reason"] == REVIEW_LOG_REASONS["REQUESTED"])
+                 or (event == "STARTED" and status == "STARTED" and action == ""
+                     and payload["skill_name"] == "" and payload["reason"] == REVIEW_LOG_REASONS["STARTED"])
+                 or (event == "DECISION" and status in NOTICE_OUTCOMES
+                     and ((status in ("APPLIED", "DUPLICATE") and action in ("CREATE", "UPDATE"))
+                          or (status not in ("APPLIED", "DUPLICATE") and action == status)))))
+
+
 def valid_job(auth, entry, job):
     return (auth and auth["enabled"] and (job["profile_id"], job["store_id"], job["generation"]) ==
             (entry.profile_id, entry.store_id, auth["generation"])
@@ -1158,43 +1199,7 @@ class Owner:
         )
 
     def _valid_review_log_event(self, auth, row):
-        if ((row["profile_id"], row["store_id"], row["generation"])
-                != (self.entry.profile_id, self.entry.store_id, auth["generation"])
-                or not isinstance(row["event_seal"], str)
-                or not hmac.compare_digest(row["event_seal"], review_log_seal(auth, row))
-                or type(row["created"]) not in (int, float)
-                or not isinstance(row["payload_json"], str)
-                or len(row["payload_json"].encode()) > REVIEW_LOG_PAYLOAD_BYTES):
-            return False
-        try:
-            payload = json.loads(row["payload_json"])
-        except (TypeError, ValueError):
-            return False
-        expected = {"timestamp", "event_id", "review_id", "event", "action",
-                    "skill_name", "status", "reason"}
-        if not isinstance(payload, dict) or set(payload) != expected:
-            return False
-        event, status, action = payload["event"], payload["status"], payload["action"]
-        allowed_status = {"REQUESTED", "STARTED"} | set(NOTICE_OUTCOMES)
-        allowed_action = {"", "CREATE", "UPDATE", "NONE", "FAILED", "INVALID",
-                          "STALE", "COLLISION", "CANCELLED", "BUDGET_REFUSED"}
-        return (re.fullmatch(r"[a-f0-9]{32}", row["job_id"] or "") is not None
-                and row["event_id"] == f"{row['job_id']}:{str(event).lower()}"
-                and payload["event_id"] == row["event_id"]
-                and payload["review_id"] == row["job_id"]
-                and event in ("REQUESTED", "STARTED", "DECISION")
-                and status in allowed_status and action in allowed_action
-                and isinstance(payload["timestamp"], str) and len(payload["timestamp"]) == 20
-                and isinstance(payload["skill_name"], str)
-                and len(payload["skill_name"]) <= REVIEW_LOG_NAME_CHARS
-                and isinstance(payload["reason"], str) and len(payload["reason"].encode()) <= 512
-                and ((event == "REQUESTED" and status == "REQUESTED" and action == ""
-                      and payload["skill_name"] == "" and payload["reason"] == REVIEW_LOG_REASONS["REQUESTED"])
-                     or (event == "STARTED" and status == "STARTED" and action == ""
-                         and payload["skill_name"] == "" and payload["reason"] == REVIEW_LOG_REASONS["STARTED"])
-                     or (event == "DECISION" and status in NOTICE_OUTCOMES
-                         and ((status in ("APPLIED", "DUPLICATE") and action in ("CREATE", "UPDATE"))
-                              or (status not in ("APPLIED", "DUPLICATE") and action == status)))))
+        return valid_review_log_event(self.entry, auth, row)
 
     def _flush_review_log(self):
         """Reconcile the durable owner outbox with its private append-only JSONL."""
@@ -2549,7 +2554,7 @@ class ReviewService:
     def __init__(self, roster, *, provider=None, workers=1, timeout=30, output_tokens=4096,
                  discovery_interval=1, selected_view_bytes=DEFAULT_SELECTED_VIEW_BYTES,
                  prepared_input_bytes=DEFAULT_PREPARED_INPUT_BYTES,
-                 wire_body_bytes=DEFAULT_WIRE_BODY_BYTES):
+                 wire_body_bytes=DEFAULT_WIRE_BODY_BYTES, console=None):
         selected_view_bytes = validate_byte_limit("selected_view_bytes", selected_view_bytes)
         prepared_input_bytes = validate_byte_limit("prepared_input_bytes", prepared_input_bytes)
         wire_body_bytes = validate_byte_limit("wire_body_bytes", wire_body_bytes)
@@ -2571,6 +2576,82 @@ class ReviewService:
         self._reported = {}
         self._once = True
         self._phase, self._phase_timing = "service.startup", {}
+        self.console = sys.stderr if console is None else console
+        self._review_cursors = {}
+
+    def _emit_review_event(self, entry, payload):
+        if self.console is None:
+            return False
+        parts = ["Skill review lifecycle:", "profile=" + diagnostic_id(entry.profile_id),
+                 "review=" + diagnostic_id(payload["review_id"], job=True),
+                 "status=" + payload["status"]]
+        if payload["event"] == "DECISION":
+            parts.extend(("action=" + payload["action"],
+                          "skill=" + json.dumps(payload["skill_name"], ensure_ascii=True),
+                          "reason=" + json.dumps(payload["reason"] or EXPLANATION_UNAVAILABLE,
+                                                 ensure_ascii=True)))
+        try:
+            self.console.write(" ".join(parts) + "\n")
+            self.console.flush()
+            return True
+        except (OSError, ValueError, UnicodeError):
+            # A broken terminal must not affect mailbox scheduling or publication.
+            return False
+
+    def _observe_review_events(self):
+        """Read sealed owner lifecycle events without consuming owner notices or logs."""
+        rostered = {entry.profile_id for entry in self.roster.profiles}
+        for entry in self.roster.profiles:
+            try:
+                with gate(entry, BUSY_SECONDS):
+                    auth = read_auth(self.roster, entry)
+                    if not auth or not auth["enabled"] or not Path(entry.mailbox).exists():
+                        self._review_cursors = {
+                            key: value for key, value in self._review_cursors.items()
+                            if key[0] != entry.profile_id
+                        }
+                        continue
+                    key = (entry.profile_id, auth["generation"])
+                    self._review_cursors = {
+                        prior: value for prior, value in self._review_cursors.items()
+                        if prior[0] != entry.profile_id or prior == key
+                    }
+                    with closing(connect(entry, readonly=True)) as conn:
+                        if key not in self._review_cursors:
+                            first = conn.execute(
+                                "SELECT min(e.seq) FROM review_log_events e JOIN jobs j ON j.job_id=e.job_id "
+                                "WHERE e.generation=? AND j.generation=? AND j.status IN ('PREPARED','RUNNING','RESULT')",
+                                (auth["generation"], auth["generation"]),
+                            ).fetchone()[0]
+                            latest = conn.execute(
+                                "SELECT coalesce(max(seq),0) FROM review_log_events WHERE generation=?",
+                                (auth["generation"],),
+                            ).fetchone()[0]
+                            self._review_cursors[key] = (first - 1) if first is not None else latest
+                        cursor = self._review_cursors[key]
+                        pending = conn.execute(
+                            "SELECT * FROM review_log_events WHERE generation=? AND seq>? ORDER BY seq LIMIT ?",
+                            (auth["generation"], cursor, HISTORY_COUNT),
+                        ).fetchall()
+                    current = read_auth(self.roster, entry)
+                    if (not current or not current["enabled"]
+                            or current["generation"] != auth["generation"]
+                            or current["secret"] != auth["secret"]):
+                        self._review_cursors = {
+                            prior: value for prior, value in self._review_cursors.items()
+                            if prior[0] != entry.profile_id
+                        }
+                        continue
+                    for row in pending:
+                        if valid_review_log_event(entry, auth, row):
+                            payload = json.loads(row["payload_json"])
+                            if not self._emit_review_event(entry, payload):
+                                return
+                        self._review_cursors[key] = row["seq"]
+            except (OSError, ValueError, KeyError, sqlite3.Error, TimeoutError):
+                continue
+        self._review_cursors = {key: value for key, value in self._review_cursors.items()
+                                if key[0] in rostered}
 
     def _record(self, key, detail):
         historical = "historical " + detail
@@ -2869,6 +2950,7 @@ class ReviewService:
                 with ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix="skill-inference") as pool:
                     while not self.stop_event.is_set():
                         self._refresh()
+                        self._observe_review_events()
                         pending = []
                         if len(inflight) < self.workers:
                             pending = initial if once else self._pending()
@@ -2900,6 +2982,7 @@ class ReviewService:
                                 result = future.result()
                                 stage = "result.persistence"
                                 self._finish(entry, job, result)
+                                self._observe_review_events()
                             except Exception as exc:
                                 self._failure(stage, entry, exc, job)
                             processed += 1
@@ -2907,6 +2990,7 @@ class ReviewService:
                 if client:
                     with diagnostic_stage("service.shutdown"):
                         client.close()
+            self._observe_review_events()
             return processed
 
 

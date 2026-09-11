@@ -255,8 +255,12 @@ def test_real_owner_and_service_process_with_blocked_http_idle_apply_and_singlet
             owner.stdin.write("/ski")
             owner.stdin.flush()
             time.sleep(.15)
-            service = subprocess.Popen(command("skill_review.py", "once", "--roster", roster_path, "--timeout", "3"),
-                cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8")
+            service = subprocess.Popen(command("skill_review.py", "run", "--roster", roster_path, "--timeout", "3"),
+                cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8")
+            service_errors = []
+            service_error_reader = threading.Thread(
+                target=lambda: [service_errors.append(line) for line in service.stderr], daemon=True)
+            service_error_reader.start()
             assert entered.wait(5)
             # The service has recorded worker entry, but input() remains an
             # output-free boundary until the user submits the current line.
@@ -269,14 +273,24 @@ def test_real_owner_and_service_process_with_blocked_http_idle_apply_and_singlet
             combined = "".join(output)
             assert combined.index("[Skill Review] Review started.") < combined.index("No skills found")
             assert "[Skill Review] Created skill 'from_service'" not in combined
+            wait_for(lambda: "status=STARTED" in "".join(service_errors))
+            service_lifecycle = "".join(service_errors)
+            assert "status=REQUESTED" in service_lifecycle
+            assert "status=APPLIED" not in service_lifecycle
+            assert "profile=alice" in service_lifecycle
             assert not (profile / "skills" / "from_service.md").exists()
             duplicate = subprocess.run(command("skill_review.py", "once", "--roster", roster_path), cwd=ROOT,
                 env=env, capture_output=True, text=True, timeout=5)
             assert duplicate.returncode == 2 and "busy" in duplicate.stdout
             release.set()
-            service_out, _ = service.communicate(timeout=6)
-            assert service.returncode == 0 and '"processed":1' in service_out
             wait_for(lambda: (profile / "skills" / "from_service.md").exists())
+            wait_for(lambda: "status=APPLIED" in "".join(service_errors))
+            assert service.poll() is None  # `run` remains alive after owner-final publication.
+            service_lifecycle = "".join(service_errors)
+            assert service_lifecycle.index("status=REQUESTED") < service_lifecycle.index(
+                "status=STARTED") < service_lifecycle.index("status=APPLIED")
+            assert "action=CREATE" in service_lifecycle and 'skill="from_service"' in service_lifecycle
+            assert "private-value" not in service_lifecycle and "private-row" not in service_lifecycle
             review_request = requests[-1]
             assert review_request["model"] == "test-model" and review_request["max_tokens"] == 4096
             assert "private-value" not in json.dumps(review_request)
@@ -308,6 +322,10 @@ def test_real_owner_and_service_process_with_blocked_http_idle_apply_and_singlet
             owner.wait(timeout=5)
             reader.join(2)
             assert owner.returncode == 0
+            service.terminate()
+            service.wait(timeout=5)
+            service_error_reader.join(2)
+            service.stdout.read()
             smoke = subprocess.run(command("skill_review.py", "once", "--roster", roster_path), cwd=ROOT,
                 env=env, capture_output=True, text=True, timeout=5)
             assert smoke.returncode == 0 and '"processed":0' in smoke.stdout
@@ -317,7 +335,8 @@ def test_real_owner_and_service_process_with_blocked_http_idle_apply_and_singlet
                 if process and process.poll() is None:
                     process.terminate()
                     process.wait(timeout=5)
-            for handle in (owner.stdin, owner.stdout, service.stdout if service else None):
+            for handle in (owner.stdin, owner.stdout, service.stdout if service else None,
+                           service.stderr if service else None):
                 if handle:
                     handle.close()
 
