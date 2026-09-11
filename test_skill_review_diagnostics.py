@@ -4,15 +4,17 @@ from dataclasses import replace
 import json
 import sqlite3
 import threading
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from types import SimpleNamespace
 
 import httpx
-from openai import APITimeoutError
+from openai import APITimeoutError, OpenAI
 import pytest
 
 import agent
 import skill_review as review
+from review_diagnostics import ReviewDiagnosticError
+from skills import AutoSkillExtractor
 from test_async_skill_review import evidence, owner_for, profile_bytes, rows, setup_roster
 
 
@@ -157,9 +159,9 @@ def test_chat_admission_failure_class_and_stage_are_safe(mailbox, capsys, failur
     assert f"stage=admission.{ {'lock': 'lock', 'sqlite': 'sqlite', 'other': 'authorization'}[failure]}" in output
     assert f"error={type(error).__name__}" in output
     if failure == "lock":
-        assert "coordination_timeout_s=0.05" in output
+        assert "coordination_timeout_s=0.5" in output
     if failure == "sqlite":
-        assert "sqlite_busy_timeout_s=0.05" in output
+        assert "sqlite_busy_timeout_s=0.5" in output
     assert_refusal(output)
 
 
@@ -238,7 +240,7 @@ def test_service_pending_actual_contention_console_and_retry_guidance(mailbox, c
     output = capsys.readouterr().err
     assert output.count("stage=pending.scan") == 1
     assert "error=TimeoutError" in output and "profile=user-0" in output
-    assert "coordination_timeout_s=0.05" in output
+    assert "coordination_timeout_s=0.5" in output
     assert ("no automatic future run" if once else "automatic future run-loop retry") in output
     assert "provider_timeout" not in output
     assert rows(owner, "jobs")[0]["status"] == "PREPARED"
@@ -284,7 +286,7 @@ def test_service_recovery_failure_is_separate_from_pending_scan(mailbox, capsys)
         assert review.ReviewService(roster, provider=lambda _: {}).once() == 0
     output = capsys.readouterr().err
     assert "stage=pending.recovery" in output and "error=OperationalError" in output
-    assert "sqlite_busy_timeout_s=0.05" in output
+    assert "sqlite_busy_timeout_s=0.5" in output
     assert_private(output)
     assert rows(owner, "jobs")[0]["status"] == "RUNNING"
 
@@ -316,6 +318,238 @@ def test_provider_failures_are_visible_and_safe_in_console_and_metadata(mailbox,
     assert saved["status"] == status
     assert_private(output + json.dumps(saved) + json.dumps(service.errors))
     assert not rows(owner, "evidence")
+
+
+def fake_sdk_response(payload, reason="stop", usage=None):
+    return SimpleNamespace(
+        choices=[SimpleNamespace(finish_reason=reason, message=SimpleNamespace(content=payload))],
+        usage=usage,
+    )
+
+
+@pytest.mark.parametrize("payload,finish,reason", [
+    ('{"action":"NONE"}', "length", "non_stop_finish"),
+    ('{"action":', "stop", "malformed_json"),
+    ('{"action":"UPDATE","action":"NONE"}', "stop", "duplicate_fields"),
+    ('{"action":"CREATE","unexpected":true}', "stop", "invalid_action_or_fields"),
+])
+def test_builtin_adapter_reason_reaches_stderr_and_owner_persisted_detail(
+        mailbox, capsys, payload, finish, reason):
+    owner, roster = mailbox
+    job = prepared(owner)
+    client = MagicMock()
+    client.with_options.return_value = client
+    client.chat.completions.create.return_value = fake_sdk_response(
+        payload, finish,
+        SimpleNamespace(prompt_tokens=123, completion_tokens=17, total_tokens=140),
+    )
+    with patch("openai.OpenAI", return_value=client):
+        assert review.ReviewService(roster, timeout=1.25, output_tokens=512).once() == 1
+    assert client.chat.completions.create.call_count == 1
+    output = capsys.readouterr().err
+    for token in (
+        "stage=provider.inference_validation", "error=ValueError",
+        f"reason={reason}", "request_attempted=true",
+        "response_received=true", "output_tokens=512", "usage_prompt_tokens=123",
+        "usage_completion_tokens=17", "usage_total_tokens=140", "outcome=INVALID",
+    ):
+        assert token in output
+    owner.pump()
+    saved = rows(owner, "jobs")[0]
+    assert saved["status"] == "INVALID"
+    assert f"reason={reason}" in saved["detail"]
+    if finish == "length":
+        assert "finish_reason=length" in output
+    assert f"job={job['job_id']}" in saved["detail"]
+    assert not rows(owner, "evidence")
+    assert_private(output + json.dumps(saved))
+
+
+def test_builtin_adapter_api_timeout_stays_failed_with_attempt_facts(mailbox, capsys):
+    owner, roster = mailbox
+    prepared(owner)
+    client = MagicMock()
+    client.with_options.return_value = client
+    client.chat.completions.create.side_effect = APITimeoutError(
+        request=httpx.Request("POST", "http://127.0.0.1:1/private", headers={"Authorization": PRIVATE}))
+    with patch("openai.OpenAI", return_value=client):
+        assert review.ReviewService(roster, timeout=1.25).once() == 1
+    output = capsys.readouterr().err
+    assert client.chat.completions.create.call_count == 1
+    assert "stage=provider.inference" in output and "error=APITimeoutError" in output
+    assert "request_attempted=true" in output and "response_received=" not in output
+    assert "provider_timeout_s=1.25" in output and "outcome=FAILED" in output
+    owner.pump()
+    saved = rows(owner, "jobs")[0]
+    assert saved["status"] == "FAILED"
+    assert "request_attempted=true" in saved["detail"]
+    assert "response_received=" not in saved["detail"]
+    assert_private(output + json.dumps(saved))
+
+
+@pytest.mark.parametrize("phase", ["with_options", "create_lookup"])
+@pytest.mark.parametrize("error_type,status", [
+    (ValueError, "INVALID"),
+    (RuntimeError, "FAILED"),
+])
+def test_builtin_adapter_setup_failure_has_zero_attempts_and_safe_persisted_detail(
+        mailbox, capsys, phase, error_type, status):
+    owner, roster = mailbox
+    prepared(owner)
+    error = error_type(PRIVATE)
+    create_calls = 0
+
+    class Completions:
+        @property
+        def create(self):
+            if phase == "create_lookup":
+                raise error
+            def invoke(**_kwargs):
+                nonlocal create_calls
+                create_calls += 1
+            return invoke
+
+    class Client:
+        def with_options(self, **_kwargs):
+            if phase == "with_options":
+                raise error
+            return SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+
+        def close(self):
+            pass
+
+    with patch("openai.OpenAI", return_value=Client()):
+        assert review.ReviewService(roster, timeout=1.25).once() == 1
+    output = capsys.readouterr().err
+    assert create_calls == 0
+    assert f"error={error_type.__name__}" in output and f"outcome={status}" in output
+    assert "request_attempted=false" in output and "response_received=false" in output
+    owner.pump()
+    saved = rows(owner, "jobs")[0]
+    assert saved["status"] == status
+    assert "request_attempted=false" in saved["detail"]
+    assert "response_received=false" in saved["detail"]
+    assert_private(output + json.dumps(saved))
+
+
+@pytest.mark.parametrize("status,error_name", [
+    (401, "AuthenticationError"),
+    (429, "RateLimitError"),
+    (500, "InternalServerError"),
+])
+def test_builtin_adapter_real_sdk_status_response_is_known_and_not_retried(
+        mailbox, capsys, status, error_name):
+    owner, roster = mailbox
+    prepared(owner)
+    requests = 0
+
+    def respond(request):
+        nonlocal requests
+        requests += 1
+        return httpx.Response(
+            status, request=request,
+            json={"error": {"message": PRIVATE, "type": "poison", "code": "poison"}},
+        )
+
+    http_client = httpx.Client(transport=httpx.MockTransport(respond))
+    client = OpenAI(api_key="test-key", base_url=roster.base_url,
+                    http_client=http_client, max_retries=0)
+    try:
+        with patch("openai.OpenAI", return_value=client):
+            assert review.ReviewService(roster, timeout=1.25).once() == 1
+    finally:
+        client.close()
+    output = capsys.readouterr().err
+    assert requests == 1
+    assert f"error={error_name}" in output and "outcome=FAILED" in output
+    assert "request_attempted=true" in output and "response_received=true" in output
+    owner.pump()
+    saved = rows(owner, "jobs")[0]
+    assert saved["status"] == "FAILED"
+    assert f"error={error_name}" in saved["detail"]
+    assert "request_attempted=true" in saved["detail"]
+    assert "response_received=true" in saved["detail"]
+    assert_private(output + json.dumps(saved))
+
+
+def test_builtin_adapter_create_value_error_has_unknown_response_and_safe_detail(mailbox, capsys):
+    owner, roster = mailbox
+    prepared(owner)
+    client = MagicMock()
+    client.with_options.return_value = client
+    client.chat.completions.create.side_effect = ValueError(PRIVATE)
+    with patch("openai.OpenAI", return_value=client):
+        assert review.ReviewService(roster, timeout=1.25).once() == 1
+    output = capsys.readouterr().err
+    assert client.chat.completions.create.call_count == 1
+    assert "error=ValueError" in output and "outcome=INVALID" in output
+    assert "request_attempted=true" in output and "response_received=" not in output
+    owner.pump()
+    saved = rows(owner, "jobs")[0]
+    assert saved["status"] == "INVALID"
+    assert "request_attempted=true" in saved["detail"]
+    assert "response_received=" not in saved["detail"]
+    assert_private(output + json.dumps(saved))
+
+
+def test_custom_adapter_cannot_forge_host_reason_metadata(mailbox, capsys):
+    owner, roster = mailbox
+    prepared(owner)
+    client = MagicMock()
+    client.with_options.return_value = client
+    client.chat.completions.create.return_value = fake_sdk_response('{"action":')
+    with pytest.raises(ValueError) as caught:
+        AutoSkillExtractor.generate_proposal(
+            client, "current-model", '{"catalog":{},"tasks":[]}', timeout=1)
+    forged = caught.value
+    forged.reason = PRIVATE
+    forged.metadata = {
+        "finish_reason": PRIVATE, "request_attempted": PRIVATE,
+        "response_received": True, "observed_bytes": PRIVATE,
+    }
+    service = review.ReviewService(
+        roster, provider=lambda _: (_ for _ in ()).throw(forged))
+    assert service.once() == 1
+    output = capsys.readouterr().err
+    assert "stage=provider.inference_validation" in output and "error=ValueError" in output
+    assert "reason=" not in output and "request_attempted=" not in output
+    assert "response_received=" not in output and "finish_reason=" not in output
+    assert_private(output + json.dumps(rows(owner, "jobs")))
+
+
+def test_review_metadata_is_revalidated_at_serialization():
+    error = ReviewDiagnosticError("malformed_json", response_received=True)
+    error.reason = PRIVATE
+    error.metadata = {
+        "request_attempted": PRIVATE,
+        "response_received": True,
+        "finish_reason": PRIVATE,
+        "output_tokens": -1,
+        "observed_bytes": 10 ** 20,
+        PRIVATE: PRIVATE,
+    }
+    detail = review.error_detail(
+        "provider.inference_validation", error, use_context=False,
+        use_review_context=True)
+    assert "reason=<invalid>" in detail
+    assert "response_received=true" in detail
+    assert "finish_reason=<invalid>" in detail
+    assert "request_attempted=" not in detail and "output_tokens=" not in detail
+    assert "observed_bytes=" not in detail
+    assert_private(detail)
+
+
+def test_service_validation_reason_is_specific_for_custom_adapter_result(mailbox, capsys):
+    owner, roster = mailbox
+    prepared(owner)
+    assert review.ReviewService(roster, provider=lambda _: {"action": PRIVATE}).once() == 1
+    output = capsys.readouterr().err
+    assert "stage=provider.validation" in output
+    assert "reason=invalid_action_or_fields" in output and "outcome=INVALID" in output
+    assert "request_attempted=" not in output and "response_received=" not in output
+    owner.pump()
+    assert rows(owner, "jobs")[0]["status"] == "INVALID"
+    assert_private(output + json.dumps(rows(owner, "jobs")))
 
 
 def test_distinct_stages_are_deduped_and_persistence_history_is_not_false_recovery(mailbox, capsys):
@@ -453,7 +687,7 @@ def test_result_sqlite_fault_is_visible_without_being_a_provider_timeout(mailbox
     with patch.object(service, "_finish", side_effect=blocked):
         service.once()
     output = capsys.readouterr().err
-    assert "stage=result.persistence" in output and "sqlite_busy_timeout_s=0.05" in output
+    assert "stage=result.persistence" in output and "sqlite_busy_timeout_s=0.5" in output
     assert "provider_timeout" not in output and "restart the service" in output
     assert rows(owner, "jobs")[0]["status"] == "RUNNING"
     assert_private(output)
@@ -496,7 +730,7 @@ def test_status_mailbox_failure_has_profile_and_sqlite_context(mailbox, tmp_path
         assert review.main(["status", "--roster", str(tmp_path / "roster.json")]) == 2
     output = capsys.readouterr().out
     assert "stage=service.status" in output and "profile=user-0" in output
-    assert "sqlite_busy_timeout_s=0.05" in output
+    assert "sqlite_busy_timeout_s=0.5" in output
     assert_private(output)
 
 

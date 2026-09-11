@@ -202,31 +202,83 @@ return NONE. Describe reusable procedures, never persist secrets or personal dat
     @staticmethod
     def generate_proposal(client, model, prepared_json, *, timeout=30, output_tokens=4096):
         from skill_catalog import validate_proposal, MAX_OUTPUT_BYTES
-        if not isinstance(prepared_json, str) or len(prepared_json.encode()) > 128 * 1024:
-            raise ValueError("Prepared snapshot exceeds input limit")
-        json.loads(prepared_json)
+        from review_diagnostics import (ReviewDiagnosticError, finish_reason,
+                                        mark_transport_failure, usage_metadata)
+        base = dict(request_attempted=False, response_received=False,
+                    output_tokens=output_tokens)
+        if not isinstance(prepared_json, str):
+            raise ReviewDiagnosticError("prepared_input_invalid", **base)
+        try:
+            prepared_bytes = len(prepared_json.encode())
+        except UnicodeEncodeError:
+            raise ReviewDiagnosticError("prepared_input_invalid", **base) from None
+        if prepared_bytes > 128 * 1024:
+            raise ReviewDiagnosticError(
+                "prepared_input_oversized", observed_bytes=prepared_bytes,
+                limit_bytes=128 * 1024, **base)
+        try:
+            json.loads(prepared_json)
+        except json.JSONDecodeError:
+            raise ReviewDiagnosticError("prepared_input_invalid", **base) from None
         # httpx/OpenAI encode JSON with UTF-8, ensure_ascii=False and compact
         # separators. Measure that complete body, including nested escaping,
         # before allowing the SDK to open a transport request.
         wire_bytes = AutoSkillExtractor.sdk_wire_bytes(model, prepared_json, output_tokens)
         if wire_bytes > 256 * 1024:
-            raise ValueError("Complete SDK wire body exceeds 256 KiB limit")
-        response = client.with_options(timeout=timeout, max_retries=0).chat.completions.create(
-            model=model,
-            messages=[{"role": "system", "content": AutoSkillExtractor.REFLECTION_PROMPT},
-                      {"role": "user", "content": prepared_json}],
-            temperature=0.1, max_tokens=output_tokens,
-        )
-        if not response.choices or response.choices[0].finish_reason != "stop":
-            raise ValueError("Provider did not finish a complete proposal")
-        raw = response.choices[0].message.content
-        if not isinstance(raw, str) or len(raw.encode()) > MAX_OUTPUT_BYTES:
-            raise ValueError("Proposal output exceeds limit or is empty")
+            raise ReviewDiagnosticError(
+                "wire_body_oversized", observed_bytes=wire_bytes,
+                limit_bytes=256 * 1024, **base)
+        try:
+            configured_client = client.with_options(timeout=timeout, max_retries=0)
+            completion_create = configured_client.chat.completions.create
+        except Exception as exc:
+            mark_transport_failure(exc, output_tokens, request_attempted=False)
+            raise
+        try:
+            response = completion_create(
+                model=model,
+                messages=[{"role": "system", "content": AutoSkillExtractor.REFLECTION_PROMPT},
+                          {"role": "user", "content": prepared_json}],
+                temperature=0.1, max_tokens=output_tokens,
+            )
+        except Exception as exc:
+            mark_transport_failure(exc, output_tokens)
+            raise
+        response_context = dict(request_attempted=True, response_received=True,
+                                output_tokens=output_tokens, **usage_metadata(response))
+        if not response.choices:
+            raise ReviewDiagnosticError("no_choices", **response_context)
+        actual_finish = getattr(response.choices[0], "finish_reason", None)
+        if actual_finish != "stop":
+            raise ReviewDiagnosticError(
+                "non_stop_finish", finish_reason=finish_reason(actual_finish), **response_context)
+        message = getattr(response.choices[0], "message", None)
+        raw = getattr(message, "content", None)
+        if not isinstance(raw, str):
+            raise ReviewDiagnosticError("missing_or_nontext_output", **response_context)
+        try:
+            output_bytes = len(raw.encode())
+        except UnicodeEncodeError:
+            raise ReviewDiagnosticError("output_invalid_encoding", **response_context) from None
+        if output_bytes > MAX_OUTPUT_BYTES:
+            raise ReviewDiagnosticError(
+                "output_oversized", observed_bytes=output_bytes,
+                limit_bytes=MAX_OUTPUT_BYTES, **response_context)
         def unique_fields(pairs):
             value = {}
             for key, item in pairs:
                 if key in value:
-                    raise ValueError("Duplicate proposal field")
+                    raise ReviewDiagnosticError("duplicate_fields", **response_context)
                 value[key] = item
             return value
-        return validate_proposal(json.loads(raw, object_pairs_hook=unique_fields))
+        try:
+            proposal = json.loads(raw, object_pairs_hook=unique_fields)
+        except ReviewDiagnosticError:
+            raise
+        except json.JSONDecodeError:
+            raise ReviewDiagnosticError("malformed_json", **response_context) from None
+        try:
+            return validate_proposal(proposal)
+        except ReviewDiagnosticError as exc:
+            exc.metadata = response_context | (exc.metadata if type(exc.metadata) is dict else {})
+            raise

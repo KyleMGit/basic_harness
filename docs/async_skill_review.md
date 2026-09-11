@@ -181,9 +181,10 @@ The current session's system prompt stays frozen; later constructed prompts can
 see published skills. Pre-turn skill retrieval is unchanged.
 
 Caller-start invalidation and completion admission necessarily include local I/O
-latency. SQLite busy timeout and coordination acquisition each use 50 ms bounds;
-these are contention limits, not
-a guarantee about OS/filesystem latency. No catalog scan, catalog hash, provider
+latency. SQLite busy timeout and short coordination acquisition each use 500 ms
+bounds; these are per-contention limits, not a guarantee about total operation-chain
+or OS/filesystem latency. The existing 5-second service coordination waits are
+unchanged. No catalog scan, catalog hash, provider
 request or result delivery occurs in foreground capture. Catalog snapshot preparation
 and publication run in the owner thread, with no inference in that thread. Evidence
 assembly, whole-exchange selection and final request composition run in the shared
@@ -343,7 +344,7 @@ uses the same node/depth counters, and message 257 is refused.
 
 `admission.lock`, `admission.authorization`, and `admission.sqlite` distinguish
 local admission failures. Known acquisition and SQLite busy settings appear as
-`coordination_timeout_s=0.05` and `sqlite_busy_timeout_s=0.05`. `admission.queue`
+`coordination_timeout_s=0.5` and `sqlite_busy_timeout_s=0.5`. `admission.queue`
 reports `queue_records` or `queue_bytes` with the observed count including the
 rejected unit and the applicable limit (128 units or 7864320 admission bytes after
 the 512-KiB preparation/result reservation).
@@ -358,6 +359,7 @@ These examples came from local fake-provider and lock-failure runs:
 
 ```text
 Skill review: historical stage=provider.inference error=APITimeoutError profile=user-0 job=fa7e613b794e4287b5f8685fd257f894 provider_timeout_s=1.25; outcome=FAILED; no automatic provider retry; awaiting result persistence and owner acknowledgement.
+Skill review: historical stage=provider.inference_validation error=ValueError profile=user-0 job=85f04ad2b89e43bcb63c4caf1c9da8c3 reason=non_stop_finish request_attempted=true response_received=true finish_reason=length output_tokens=4096; outcome=INVALID; no automatic provider retry; awaiting result persistence and owner acknowledgement.
 Skill review: historical stage=result.persistence error=TimeoutError profile=user-0 job=db6d37c0463d488eb07605c5a5eb7be6 coordination_timeout_s=5; RUNNING attempt interrupted; no active retry; resolve coordination/storage failure and restart the service to recover.
 ```
 
@@ -366,16 +368,35 @@ Skill review: historical stage=result.persistence error=TimeoutError profile=use
 | `pending.scan` / `pending.recovery` | Scanning or recovery was interrupted. Admitted work remains. `run` automatically tries again on a future loop; `once` promises no future run. Check local coordination/storage if repeated. |
 | `claim` | Claiming the prepared job was interrupted. The same future-loop guidance applies; a lock timeout is local coordination, not a model timeout. |
 | `worker.authorization` / `worker.dispatch` | A claimed RUNNING attempt was interrupted before inference. There is no active retry for that attempt. Resolve the local fault, stop the service, and restart it after its workers exit. |
-| `provider.inference` | The provider call failed, including SDK `APITimeoutError`. The configured provider timeout is shown. A persisted FAILED result is acknowledged by the owner and consumes that batch; it is not NONE. |
-| `provider.validation` / `provider.inference_validation` | Output was rejected. The latter covers an adapter that performs inference and validation together. The existing INVALID/FAILED outcomes remain; arbitrary validation exception text is omitted. |
+| `provider.inference` | The provider call failed, including SDK `APITimeoutError` and HTTP status errors. The configured provider timeout is shown. The host SDK adapter reports only its known request/response observations; a persisted FAILED result is acknowledged by the owner and consumes that batch, and is not NONE. |
+| `provider.validation` / `provider.inference_validation` | Output was rejected. The latter covers the host adapter that performs inference and validation together. Fixed reasons distinguish `prepared_input_invalid`, `prepared_input_oversized`, `wire_body_oversized`, `no_choices`, `non_stop_finish`, `missing_or_nontext_output`, `output_invalid_encoding`, `output_oversized`, `malformed_json`, `duplicate_fields`, `proposal_not_object`, `invalid_action_or_fields`, `incomplete_complete_flag`, `empty_fields`, `invalid_name`, `invalid_description`, `incomplete_instructions`, and `safety_rejection`. The existing INVALID/FAILED outcomes remain. |
 | `result.persistence` | The result could not be durably recorded. A RUNNING attempt may remain even after later scans succeed. Resolve the local fault and restart the service; those scans do not retry this attempt. |
 | `service.startup.*` / `service.status` / `service.shutdown` | The command reports a safe exception class and launch/storage guidance, without raw exception text. A busy singleton reports its zero-wait setting; let the prior service exit before restarting. |
 
 Timeout fields describe the configured operation whose failure was observed.
 Lock acquisition uses 5 seconds in claim, worker authorization and result
-persistence; SQLite uses 0.05 seconds. An exception raised outside a known timed
+persistence; short foreground/scan coordination and SQLite busy waits use 0.5
+seconds. An exception raised outside a known timed
 operation does not acquire a guessed timeout. SDK timeouts remain transport
 settings, not an end-to-end deadline. No retry or recovery policy changes here.
+
+Host adapter diagnostics can include `request_attempted`, `response_received`, the
+configured `output_tokens`, measured byte counts and limits, bounded provider usage
+counts, and an allowlisted `finish_reason`. `request_attempted=true` means only that
+invocation of the resolved SDK `create` callable was attempted, not that remote
+execution occurred. Preflight and SDK setup failures report
+`request_attempted=false response_received=false` because they occur before that
+invocation. `response_received=true` is limited to a known SDK response: either a
+successful response or a trusted SDK HTTP status exception. Omission of
+`response_received` means the observation is unknown, not false; create-time parsing
+errors and timeouts therefore do not assert that no response arrived. Output checks
+report a known received SDK response. Unknown finish reasons use an invalid sentinel, and
+unavailable or invalid counts are omitted. Opaque/custom adapter `ValueError`
+instances retain the safe generic fallback: their text and claimed metadata are not
+serialized. No response text, request content, provider bodies/headers, paths, SQL,
+tracebacks, or arbitrary exception text is included. The same sanitized detail is
+written to the terminal job after owner acknowledgement; a diagnostic INVALID still
+consumes the batch and is not retried automatically.
 
 The final service JSON retains `processed` and `errors`. Each retained error value
 is explicitly **historical**: it records a failed attempt, not a claim about current

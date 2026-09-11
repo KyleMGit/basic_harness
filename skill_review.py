@@ -30,9 +30,10 @@ from profile_paths import (DEFAULT_PROFILES_DIR, PinnedDirectory, ProfilePaths,
                            control_directory, default_model, default_base_url,
                            plain_stat, validate_profile_id)
 from skill_lock import path_identity
+from review_diagnostics import safe_review_context
 
 
-BUSY_SECONDS = .05
+BUSY_SECONDS = .5
 MAX_RECORDS = 128
 TURN_BYTES = 256 * 1024
 TURN_MESSAGES = 256
@@ -115,7 +116,8 @@ def diagnostic_gate(entry, stage, timeout=5, *, job_id=None):
         yield
 
 
-def error_detail(stage, exc, *, profile_id=None, job_id=None, use_context=True, **timing):
+def error_detail(stage, exc, *, profile_id=None, job_id=None, use_context=True,
+                 use_review_context=False, **timing):
     error = exception_name(exc)
     if (use_context and type(exc) is DiagnosticFailure and type(exc.stage) is str
             and exc.stage in DIAGNOSTIC_STAGES and type(exc.error) is str
@@ -128,6 +130,8 @@ def error_detail(stage, exc, *, profile_id=None, job_id=None, use_context=True, 
         parts.append("profile=" + diagnostic_id(profile_id))
     if job_id is not None:
         parts.append("job=" + diagnostic_id(job_id, job=True))
+    if use_review_context:
+        parts.extend(safe_review_context(exc))
     for key in ("coordination_timeout_s", "sqlite_busy_timeout_s", "provider_timeout_s"):
         value = timing.get(key)
         if type(value) in (int, float) and 0 <= value <= 120:
@@ -1797,16 +1801,17 @@ class ReviewService:
             raise BudgetRefusal("prepared_bytes", prepared_bytes, 128 * 1024)
         return request
 
-    def _infer(self, entry, job, provider):
+    def _infer(self, entry, job, provider, trusted_provider=False):
         # Start authorization is rechecked in the worker, after scheduling.
         with diagnostic_gate(entry, "worker.authorization", job_id=job["job_id"]):
             with diagnostic_stage("worker.authorization", job_id=job["job_id"]):
                 auth = read_auth(self.roster, entry)
                 if self.stop_event.is_set() or not valid_job(auth, entry, job):
                     return None
-        def failure(stage, status, exc):
+        def failure(stage, status, exc, *, trusted_review_context=False):
             detail = error_detail(stage, exc, profile_id=entry.profile_id, job_id=job["job_id"],
                                   use_context=False,
+                                  use_review_context=trusted_review_context,
                                   **(dict(provider_timeout_s=self.timeout) if stage == "provider.inference" else {}))
             return dict(status=status, detail=detail + f"; outcome={status}; no automatic provider retry; awaiting result persistence and owner acknowledgement.")
         try:
@@ -1824,14 +1829,17 @@ class ReviewService:
             proposal = provider(request)
         except ValueError as exc:
             # The SDK adapter also validates output; preserve its INVALID contract.
-            return failure("provider.inference_validation", "INVALID", exc)
+            return failure("provider.inference_validation", "INVALID", exc,
+                           trusted_review_context=trusted_provider)
         except Exception as exc:
-            return failure("provider.inference", "FAILED", exc)
+            return failure("provider.inference", "FAILED", exc,
+                           trusted_review_context=trusted_provider)
         try:
             validate_proposal(proposal)
             return dict(status="PROPOSAL", proposal=proposal)
         except ValueError as exc:
-            return failure("provider.validation", "INVALID", exc)
+            return failure("provider.validation", "INVALID", exc,
+                           trusted_review_context=True)
         except Exception as exc:
             return failure("provider.validation", "FAILED", exc)
 
@@ -1893,7 +1901,9 @@ class ReviewService:
                             try:
                                 if self._claim(entry, job):
                                     stage = "worker.dispatch"
-                                    inflight[pool.submit(self._infer, entry, job, provider)] = (entry, job)
+                                    inflight[pool.submit(
+                                        self._infer, entry, job, provider,
+                                        self.provider is None)] = (entry, job)
                             except Exception as exc:
                                 self._failure(stage, entry, exc, job)
                         if once:

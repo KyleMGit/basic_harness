@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import pytest
 
+import skill_review as review
 from skill_review import Evidence, Owner, Roster, ReviewService, load_roster
 from skills import SkillStore
 
@@ -115,8 +116,39 @@ def test_foreground_enqueue_does_not_scan_catalog_and_has_busy_refusal(tmp_path)
             blocker.execute("BEGIN EXCLUSIVE")
             started = time.monotonic()
             assert owner.enqueue(evidence(task="busy")).status == "FAILED"
-            assert time.monotonic() - started < .5
+            assert time.monotonic() - started < 1.5
     finally:
+        owner.close()
+
+
+def test_sqlite_busy_timeout_and_real_contention_use_approved_half_second(tmp_path):
+    roster = setup_roster(tmp_path)
+    owner = owner_for(roster, background=False)
+    blocker = sqlite3.connect(owner.entry.mailbox, check_same_thread=False)
+    try:
+        assert review.BUSY_SECONDS == .5
+        with review.connect(owner.entry) as conn:
+            assert conn.execute("PRAGMA busy_timeout").fetchone()[0] == 500
+
+        blocker.execute("BEGIN EXCLUSIVE")
+        released = threading.Event()
+        def release_old_limit_contention():
+            time.sleep(.15)  # Longer than the former 50 ms bound, within 500 ms.
+            blocker.rollback()
+            released.set()
+        thread = threading.Thread(target=release_old_limit_contention)
+        thread.start()
+        assert owner.enqueue(evidence(task="released-within-new-bound")).status == "ACCEPTED"
+        thread.join(2)
+        assert released.is_set()
+
+        blocker.execute("BEGIN EXCLUSIVE")
+        started = time.monotonic()
+        assert owner.enqueue(evidence(task="held-beyond-new-bound")).status == "FAILED"
+        assert time.monotonic() - started < 1.5
+    finally:
+        blocker.rollback()
+        blocker.close()
         owner.close()
 
 

@@ -9,6 +9,7 @@ import tempfile
 import uuid
 
 from safety import screen_prompt_content
+from review_diagnostics import ReviewDiagnosticError
 from skill_lock import CatalogLock, path_identity
 
 
@@ -40,29 +41,33 @@ class Publication:
 def validate_proposal(value):
     """A strict data contract; routing/revision/receipt authority is never model input."""
     if not isinstance(value, dict):
-        raise ValueError("Proposal must be an object")
+        raise ReviewDiagnosticError("proposal_not_object")
     action = value.get("action")
     if action == "NONE" and set(value) == {"action"}:
         return value
     fields = {"action", "description", "instructions", "complete"}
     fields.add("name" if action == "CREATE" else "target_id")
-    if action not in ("CREATE", "UPDATE") or set(value) != fields or value["complete"] is not True:
-        raise ValueError("Invalid or incomplete proposal fields")
+    if action not in ("CREATE", "UPDATE") or set(value) != fields:
+        raise ReviewDiagnosticError("invalid_action_or_fields")
+    if value["complete"] is not True:
+        raise ReviewDiagnosticError("incomplete_complete_flag")
     for key in fields - {"complete"}:
         if not isinstance(value[key], str) or not value[key].strip():
-            raise ValueError("Empty proposal field")
-    if len(json.dumps(value).encode()) > MAX_OUTPUT_BYTES:
-        raise ValueError("Proposal exceeds output byte limit")
+            raise ReviewDiagnosticError("empty_fields")
+    normalized_bytes = len(json.dumps(value).encode())
+    if normalized_bytes > MAX_OUTPUT_BYTES:
+        raise ReviewDiagnosticError(
+            "output_oversized", observed_bytes=normalized_bytes, limit_bytes=MAX_OUTPUT_BYTES)
     if action == "CREATE" and (len(value["name"]) > 128 or re.search(r"[/\\:\n\r]", value["name"])):
-        raise ValueError("Skill names cannot select paths")
+        raise ReviewDiagnosticError("invalid_name")
     if re.search(r"[\r\n]", value["description"]) or len(value["description"]) > 1024:
-        raise ValueError("Invalid description")
+        raise ReviewDiagnosticError("invalid_description")
     instructions = value["instructions"]
     if (instructions.count("```") % 2 or instructions.count("~~~") % 2
             or re.search(r"\[(?:TRUNCATED|INCOMPLETE)\]|<rest omitted>|TODO|\.\.\.\s*$", instructions, re.I)):
-        raise ValueError("Incomplete replacement instructions")
+        raise ReviewDiagnosticError("incomplete_instructions")
     if not screen_prompt_content("\n".join(value[k] for k in fields - {"complete"}))[0]:
-        raise ValueError("Rejected/quarantined: unsafe proposal")
+        raise ReviewDiagnosticError("safety_rejection")
     return value
 
 
