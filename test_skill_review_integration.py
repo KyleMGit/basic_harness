@@ -11,7 +11,7 @@ import pytest
 
 import agent as agent_module
 from skills import AutoSkillExtractor
-from skill_review import ReviewService
+from skill_review import Evidence, ReviewService
 from test_async_skill_review import setup_roster, wait_for, rows, create_proposal, profile_bytes
 
 
@@ -77,6 +77,19 @@ def sql_tool_message(sql, call_id="verified-sql"):
     return message
 
 
+def read_file_tool_message(path, call_id="schema-read"):
+    call = SimpleNamespace(id=call_id, function=SimpleNamespace(
+        name="read_file", arguments=json.dumps({"file_path": path})))
+    message = MagicMock(content="", tool_calls=[call])
+    message.model_dump.return_value = {
+        "role": "assistant", "content": "", "tool_calls": [{
+            "id": call_id, "type": "function",
+            "function": {"name": "read_file", "arguments": json.dumps({"file_path": path})},
+        }],
+    }
+    return message
+
+
 def verified_result():
     return json.dumps({"database": "warehouse", "columns": ["amount"],
                        "rows": [["private-result"]], "row_count": 1, "truncated": False})
@@ -88,6 +101,122 @@ def run_verified_correction(instance, task="No, that procedure is wrong; use the
     with patch.object(instance, "step", side_effect=replies), patch.object(instance, "manage_context"), \
          patch.object(agent_module.registry, "execute", return_value=verified_result()):
         return instance.run(task)
+
+
+def test_completed_schema_first_nonroutine_sql_dispatches_at_normal_boundary(tmp_path):
+    instance, roster = make_agent(tmp_path)
+    requests = []
+    replies = [
+        read_file_tool_message("C:/schemas/sales.sql"),
+        sql_tool_message(
+            "SELECT c.customer_id, SUM(s.amount) OVER (PARTITION BY c.customer_id) "
+            "FROM customers c JOIN sales s ON s.customer_id = c.customer_id",
+        ),
+        answer_message("Completed from the supplied schema."),
+    ]
+    try:
+        with patch.object(instance, "step", side_effect=replies), patch.object(instance, "manage_context"), \
+             patch.object(agent_module.registry, "execute", side_effect=[
+                 "CREATE TABLE sales (customer_id INTEGER, amount DECIMAL);",
+                 verified_result(),
+             ]):
+            assert instance.run("Use the supplied schema to calculate customer sales totals") == \
+                "Completed from the supplied schema."
+
+        assert instance.last_skill_admission.status == "ELIGIBLE"
+        source = rows(instance.skill_review_owner, "episode_sources")[0]
+        events = json.loads(source["event_json"])
+        assert events["correction"] is False
+        assert [event["outcome"] for event in events["events"]] == [
+            "verification_success", "business_success",
+        ]
+        assert not any(event.get("metadata") or event["outcome"] == "failure"
+                       for event in events["events"])
+        assert "private-result" not in source["messages_json"]
+        assert "business_result_omitted" in source["messages_json"]
+
+        instance.skill_review_owner.flush_session(instance.session_id)
+        instance.skill_review_owner.pump()
+        service = ReviewService(
+            roster, provider=lambda request: requests.append(request) or {"action": "NONE"})
+        assert service.once() == 1
+        assert len(requests) == 1
+        assert "private-result" not in requests[0]
+        assert "business_result_omitted" in requests[0]
+    finally:
+        instance.shutdown_skill_reviews()
+
+
+def test_completed_schema_free_nonroutine_sql_is_eligible(tmp_path):
+    instance, _ = make_agent(tmp_path)
+    replies = [
+        sql_tool_message(
+            "SELECT customer_id, SUM(amount) OVER (PARTITION BY customer_id) FROM sales"),
+        answer_message("Completed without a schema read."),
+    ]
+    try:
+        with patch.object(instance, "step", side_effect=replies), patch.object(instance, "manage_context"), \
+             patch.object(agent_module.registry, "execute", return_value=verified_result()):
+            assert instance.run("Calculate customer sales totals") == "Completed without a schema read."
+        assert instance.last_skill_admission.status == "ELIGIBLE"
+        source = rows(instance.skill_review_owner, "episode_sources")[0]
+        assert [event["outcome"] for event in json.loads(source["event_json"])["events"]] == [
+            "business_success",
+        ]
+    finally:
+        instance.shutdown_skill_reviews()
+
+
+@pytest.mark.parametrize("shape", ["plain-count", "schema-only", "metadata-only", "failed-only"])
+def test_completed_noneligible_shapes_make_no_review_request(tmp_path, shape):
+    instance, roster = make_agent(tmp_path)
+    requests = []
+    if shape == "plain-count":
+        replies = [sql_tool_message("SELECT COUNT(*) FROM sales"), answer_message()]
+        result = verified_result()
+    elif shape == "schema-only":
+        replies = [read_file_tool_message("C:/schemas/sales.sql"), answer_message()]
+        result = "CREATE TABLE sales (amount DECIMAL);"
+    elif shape == "metadata-only":
+        replies = [
+            sql_tool_message("SELECT column_name FROM information_schema.columns"),
+            answer_message(),
+        ]
+        result = verified_result()
+    else:
+        replies = [
+            sql_tool_message("SELECT * FROM customers JOIN sales USING (customer_id)"),
+            answer_message(),
+        ]
+        result = "Teradata query failed: synthetic syntax error"
+    try:
+        with patch.object(instance, "step", side_effect=replies), patch.object(instance, "manage_context"), \
+             patch.object(agent_module.registry, "execute", return_value=result):
+            assert instance.run(f"Exercise the {shape} control") == "The task answer."
+        assert instance.last_skill_admission.status == "SKIPPED"
+        instance.skill_review_owner.flush_session(instance.session_id)
+        instance.skill_review_owner.pump()
+        assert ReviewService(
+            roster, provider=lambda request: requests.append(request) or {"action": "NONE"}).once() == 0
+        assert requests == []
+    finally:
+        instance.shutdown_skill_reviews()
+
+
+def test_unfinished_sql_exchange_is_rejected_before_episode_admission(tmp_path):
+    instance, _ = make_agent(tmp_path)
+    try:
+        item = Evidence(instance.session_id, "unfinished-sql")
+        item.add({"role": "user", "content": "Join customers to sales"})
+        item.add(sql_tool_message(
+            "SELECT * FROM customers JOIN sales USING (customer_id)").model_dump())
+        unfinished = item.finish()
+        assert unfinished.status == "INCOMPLETE"
+        assert instance.skill_review_owner.capture_turn(unfinished).status == "INCOMPLETE"
+        assert rows(instance.skill_review_owner, "episodes") == []
+        assert rows(instance.skill_review_owner, "episode_sources") == []
+    finally:
+        instance.shutdown_skill_reviews()
 
 
 def test_actual_run_returns_with_provider_blocked_answer_prompt_and_persistence_preserved(tmp_path):

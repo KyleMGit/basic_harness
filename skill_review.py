@@ -219,7 +219,12 @@ class MailboxCapacityError(ValueError):
 
 class Evidence:
     """Incremental per-task capture; refusal rather than silently losing old data."""
-    SQL_TOOLS = frozenset(("query_teradata", "query_impala"))
+    QUERY_SQL_TOOLS = frozenset(("query_teradata", "query_impala"))
+    EXPORT_SQL_TOOLS = {
+        "export_teradata_csv": "Teradata",
+        "export_impala_csv": "Impala",
+    }
+    SQL_TOOLS = QUERY_SQL_TOOLS | frozenset(EXPORT_SQL_TOOLS)
     VERIFICATION_TOOLS = frozenset(("read_file", "run_terminal_command"))
     _XML_CALL = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.I | re.S)
     _XML_RESULT = re.compile(r"<tool_response>\s*(.*?)\s*</tool_response>", re.I | re.S)
@@ -301,13 +306,35 @@ class Evidence:
         info = {"call_id": call_id[:128], "tool": name[:128]}
         if name in self.SQL_TOOLS:
             sql = args.get("sql") if isinstance(args.get("sql"), str) else ""
-            info.update(sql=True, backend=name, metadata=self._metadata_sql(sql),
+            info.update(sql=bool(sql) if name in self.EXPORT_SQL_TOOLS else True,
+                        backend=name, metadata=self._metadata_sql(sql),
                         signature=self._sql_shape(sql), resources=self._resources(sql),
                         nonroutine=self._nonroutine(sql))
+            if name in self.EXPORT_SQL_TOOLS:
+                info.update(export=True,
+                            _export_backend=self.EXPORT_SQL_TOOLS[name],
+                            _sql_sha256=hashlib.sha256(sql.encode("utf-8")).hexdigest())
         elif name in self.VERIFICATION_TOOLS:
             info.update(verification=True, nonroutine=True)
         self._calls[call_id] = info
         self._open_calls.add(call_id)
+
+    @staticmethod
+    def _bounded_columns(values):
+        columns, column_bytes, truncated = [], 2, False
+        for value in values[:256]:
+            if not isinstance(value, str):
+                truncated = True
+                continue
+            value = value[:256]
+            added = len(json.dumps(value, ensure_ascii=False).encode("utf-8")) + 1
+            if column_bytes + added > 4096:
+                truncated = True
+                break
+            columns.append(value)
+            column_bytes += added
+        truncated |= len(values) > len(columns)
+        return columns, truncated
 
     def _result_projection(self, call_id, content):
         info = self._calls.get(call_id, {})
@@ -328,24 +355,53 @@ class Evidence:
                     and isinstance(parsed.get("columns"), list) and isinstance(parsed.get("rows"), list)
                     and type(parsed.get("row_count")) is int and isinstance(parsed.get("truncated"), bool))
         event = dict(info)
-        if envelope:
+        expected_backend = event.pop("_export_backend", None)
+        expected_digest = event.pop("_sql_sha256", None)
+        export_keys = {
+            "backend", "batch_size", "byte_size", "columns", "completed",
+            "database", "file_path", "row_count", "sql_sha256",
+        }
+        export_envelope = (
+            info.get("export") and isinstance(parsed, dict) and set(parsed) == export_keys
+            and parsed.get("backend") == expected_backend
+            and type(parsed.get("batch_size")) is int and 1 <= parsed["batch_size"] <= 10000
+            and type(parsed.get("byte_size")) is int and parsed["byte_size"] >= 0
+            and isinstance(parsed.get("columns"), list) and len(parsed["columns"]) <= 256
+            and all(isinstance(value, str) and len(value) <= 512 for value in parsed["columns"])
+            and len(json.dumps(parsed["columns"], separators=(",", ":"))) <= 4096
+            and parsed.get("completed") is True
+            and isinstance(parsed.get("database"), str) and len(parsed["database"]) <= 512
+            and isinstance(parsed.get("file_path"), str)
+            and type(parsed.get("row_count")) is int and parsed["row_count"] >= 0
+            and isinstance(parsed.get("sql_sha256"), str)
+            and parsed["sql_sha256"] == expected_digest
+        )
+        if export_envelope:
+            event.update(outcome="metadata_success" if info.get("metadata") else "business_success")
+            columns, columns_truncated = self._bounded_columns(parsed["columns"])
+            columns_truncated |= any(len(value) > 256 for value in parsed["columns"])
+            database = parsed["database"][:256]
+            file_path = parsed["file_path"][:1024]
+            receipt = dict(exported_result_omitted=True, call_id=info["call_id"],
+                           backend=parsed["backend"], batch_size=parsed["batch_size"],
+                           byte_size=parsed["byte_size"], columns=columns, completed=True,
+                           database=database, file_path=file_path,
+                           row_count=parsed["row_count"], sql_sha256=parsed["sql_sha256"])
+            if columns_truncated:
+                receipt["columns_truncated"] = True
+            if len(parsed["database"]) > len(database):
+                receipt["database_truncated"] = True
+            if len(parsed["file_path"]) > len(file_path):
+                receipt["file_path_truncated"] = True
+            projected = packed(receipt)
+            if not info.get("metadata"):
+                self._saw_business_result = True
+        elif envelope and not info.get("export"):
             event.update(outcome="metadata_success" if info.get("metadata") else "business_success")
             if info.get("metadata"):
                 projected = content
             else:
-                columns, column_bytes, columns_truncated = [], 2, False
-                for value in parsed["columns"][:256]:
-                    if not isinstance(value, str):
-                        columns_truncated = True
-                        continue
-                    value = value[:256]
-                    added = len(json.dumps(value, ensure_ascii=False).encode("utf-8")) + 1
-                    if column_bytes + added > 4096:
-                        columns_truncated = True
-                        break
-                    columns.append(value)
-                    column_bytes += added
-                columns_truncated |= len(parsed["columns"]) > len(columns)
+                columns, columns_truncated = self._bounded_columns(parsed["columns"])
                 receipt = dict(business_result_omitted=True, call_id=call_id,
                                database=parsed["database"][:256], columns=columns,
                                row_count=parsed["row_count"], truncated=parsed["truncated"])
@@ -1018,7 +1074,6 @@ class Owner:
 
     @classmethod
     def _episode_signal(cls, event_values):
-        failures, metadata, successes = [], [], []
         correction_pending = False
         eligible = correction_verified = False
         for raw in event_values:
@@ -1038,25 +1093,9 @@ class Owner:
                     continue
                 if event.get("tool") not in Evidence.SQL_TOOLS:
                     continue
-                if outcome == "failure":
-                    failures.append(event)
-                elif outcome == "metadata_success":
-                    metadata.append(event)
-                elif outcome == "business_success":
-                    successes.append(event)
-                    related_failure = any(
-                        prior.get("backend") == event.get("backend")
-                        and prior.get("signature") != event.get("signature")
-                        and (not prior.get("resources") or not event.get("resources")
-                             or set(prior.get("resources", ())) & set(event.get("resources", ())))
-                        for prior in failures
-                    )
-                    investigated = (bool(event.get("nonroutine"))
-                                    and any(prior.get("backend") == event.get("backend") for prior in metadata))
-                    corrected = correction_pending and bool(event.get("nonroutine"))
-                    if bool(event.get("nonroutine")) and related_failure or investigated or corrected:
-                        eligible = True
-                    if corrected:
+                if outcome == "business_success" and bool(event.get("nonroutine")):
+                    eligible = True
+                    if correction_pending:
                         correction_verified = True
                         correction_pending = False
         if correction_pending:

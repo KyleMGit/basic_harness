@@ -274,7 +274,7 @@ def test_verified_correction_after_ack_is_ready_immediately_but_routine_followup
             {"action": "CREATE", "name": "window_totals"}
         ]
 
-        run_sql(instance, "Now limit that to 20 rows", "SELECT * FROM sales QUALIFY ROW_NUMBER() OVER (PARTITION BY customer_id ORDER BY sale_date DESC)=1 LIMIT 20", sql_result())
+        run_sql(instance, "Now show the total row count", "SELECT COUNT(*) FROM sales", sql_result())
         instance.skill_review_owner.flush_session(instance.session_id)
         instance.skill_review_owner.pump()
         assert correction_service.once() == 0
@@ -416,7 +416,7 @@ def test_parameter_correction_wording_does_not_create_second_request(tmp_path):
         instance.skill_review_owner.pump()
         assert service.once() == 1
         instance.skill_review_owner.pump()
-        run_sql(instance, "No, give me two months instead.", "SELECT SUM(amount) OVER () FROM sales WHERE sale_date >= DATE '2026-07-01'", sql_result())
+        run_sql(instance, "No, give me two months instead.", "SELECT COUNT(*) FROM sales WHERE sale_date >= DATE '2026-07-01'", sql_result())
         instance.skill_review_owner.flush_session(instance.session_id)
         instance.skill_review_owner.pump()
         service.once()

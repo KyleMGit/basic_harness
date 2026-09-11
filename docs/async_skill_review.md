@@ -190,12 +190,29 @@ assembly, whole-exchange selection and final request composition run in the shar
 service after claim and outside the owner/foreground coordination lock.
 
 A completed turn is only a capture boundary. Deterministic host observations make
-an episode eligible after a resolved non-routine SQL/procedural failure, a supported
-substantive correction, or an investigated reusable procedure that was actually
-verified. Dates, filters, sorting, limits, formatting, routine grouping,
-clarifications, acknowledgements and repetitions do not independently qualify.
-There is no eligibility/summarizer model request. Conservative signatures can miss
-learning or admit a duplicate; the existing reviewer still makes CREATE/UPDATE/NONE.
+an episode eligible when a successfully completed business SQL event is marked
+non-routine, without requiring preceding database metadata, a failure/recovery, or
+a correction. Structural completion still applies, and failed-only, schema-only,
+metadata-only, plain lookup/count, unfinished, clarification, acknowledgement and
+repetition shapes do not independently qualify. Substantive challenges still
+invalidate prior conclusions until a later supporting execution verifies the
+correction.
+
+Successful `export_impala_csv` and `export_teradata_csv` calls participate in the
+same SQL classification only when the result is the exporter's exact completed
+manifest, its backend matches the originating tool, and its SQL digest matches the
+exact originating SQL. Capture retains bounded manifest metadata in an
+`exported_result_omitted` receipt; it does not read the CSV or treat a complete
+export as a truncated query preview. Failed, incomplete, malformed, mismatched and
+unmatched export results do not establish successful SQL evidence. Routine and
+metadata-only exports remain non-eligible under the unchanged policy.
+
+The non-routine marker remains a lightweight SQL-shape heuristic (for example,
+`JOIN`, `WITH`, windows, and `CAST`), not a parser or a claim of semantic novelty.
+There is no eligibility/summarizer model request. This threshold can increase review
+volume and cost, and genuine `NONE` results are expected; the existing reviewer
+still makes CREATE/UPDATE/NONE decisions. Conservative signatures can miss learning
+or admit a duplicate.
 
 Related turns stay in one bounded episode. Eligible work dispatches after 120 seconds
 idle, a topic/session boundary, normal exit, or at the next completed-turn boundary
