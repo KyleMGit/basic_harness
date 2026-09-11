@@ -242,6 +242,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
         progress_mode: str = "concise",
         review_roster=None,
         review_profile: Optional[str] = None,
+        quiet_skill_reviews: bool = False,
     ):
         self.model = model or "Qwen-32b"
         self.compaction_model = compaction_model or self.model
@@ -257,6 +258,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
         self.auto_learn_memory = configured_auto_memory and not self.read_only
         self.use_hermes_xml_protocol = use_hermes_xml_protocol
         self.progress_mode = progress_mode
+        self.quiet_skill_reviews = quiet_skill_reviews
         self._sql_troubleshooting_backend: Optional[str] = None
         self._sql_diagnostic_kind: Optional[str] = None
         self._zero_result_sql: Optional[str] = None
@@ -302,7 +304,8 @@ Below is the catalog of learned project skills. When a task relates to any avail
         ]
         if review_roster is not None:
             self.skill_review_owner = Owner(review_roster, review_profile, self.skill_store,
-                                            enabled=self.auto_learn_skills)
+                                            enabled=self.auto_learn_skills,
+                                            quiet=self.quiet_skill_reviews)
 
     def _build_system_prompt(self) -> str:
         """Build system prompt embedding live skills, USER.md, and MEMORY.md."""
@@ -576,7 +579,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
         stage = "capture.completion"
         try:
             if self.skill_review_owner is None:
-                print("[Skill Review] Unavailable: stage=admission.setup; launch the agent with --auto-skills and the service with matching --profiles-dir, --model and --base-url settings; " + REJECTED)
+                self._print_skill_review("Unavailable: stage=admission.setup; launch the agent with --auto-skills and the service with matching --profiles-dir, --model and --base-url settings; " + REJECTED)
                 return
             if self._task_evidence is None:
                 return
@@ -584,15 +587,19 @@ Below is the catalog of learned project skills. When a task relates to any avail
             stage = "episode.admission"
             self.last_skill_admission = self.skill_review_owner.capture_turn(evidence)
             if self.last_skill_admission.status not in ("SKIPPED", "ELIGIBLE"):
-                print(f"[Skill Review] {self.last_skill_admission.status}: {self.last_skill_admission.detail}")
+                self._print_skill_review(f"{self.last_skill_admission.status}: {self.last_skill_admission.detail}")
         except Exception as exc:
-            print("[Skill Review] FAILED: " + error_detail(stage, exc) + "; " + REJECTED)
+            self._print_skill_review("FAILED: " + error_detail(stage, exc) + "; " + REJECTED)
         finally:
             self._task_evidence = None
 
     def _capture_skill_evidence(self, message):
         if self._task_evidence is not None:
             self._task_evidence.add(message)
+
+    def _print_skill_review(self, message):
+        if not getattr(self, "quiet_skill_reviews", False):
+            print("[Skill Review] " + message)
 
     def shutdown_skill_reviews(self):
         """Disconnect without revoking retained results; no provider join."""
@@ -792,7 +799,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
         if self._task_evidence is not None:
             challenge = self.skill_review_owner.begin_turn(self.session_id, user_task)
             if challenge.status == "FAILED":
-                print(f"[Skill Review] FAILED: {challenge.detail}")
+                self._print_skill_review(f"FAILED: {challenge.detail}")
 
         # 1. Pre-Turn Skill Matching (if enabled)
         if self.enable_skills:
@@ -1194,6 +1201,11 @@ def parse_args():
         help="Opt in to bounded durable skill-review enqueue for --profile; one supervised service discovers the shared --profiles-dir."
     )
     parser.add_argument(
+        "--quiet-skill-reviews",
+        action="store_true",
+        help="Acknowledge skill review notices without displaying them; does not enable --auto-skills."
+    )
+    parser.add_argument(
         "--auto-memory",
         action="store_true",
         help="Opt in to one visible post-task provider call for memory reflection (costs time/tokens)."
@@ -1391,6 +1403,7 @@ def main():
         progress_mode=args.progress,
         review_roster=review_roster,
         review_profile=args.profile,
+        quiet_skill_reviews=args.quiet_skill_reviews,
     )
 
     atexit.register(agent.shutdown_skill_reviews)

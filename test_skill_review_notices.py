@@ -820,7 +820,10 @@ def test_actual_no_call_budget_refusal_has_specific_durable_diagnostic(tmp_path,
         assert owner.capture_turn(oversized).status == "ELIGIBLE"
         owner.flush_session(oversized.session_id)
         owner.pump()
-        assert ReviewService(roster, provider=lambda request: calls.append(request) or {"action": "NONE"}).once() == 1
+        assert ReviewService(
+            roster, provider=lambda request: calls.append(request) or {"action": "NONE"},
+            selected_view_bytes=64 * 1024,
+        ).once() == 1
         service_stderr = capsys.readouterr().err
         result_job = rows(owner, "jobs")[-1]
         result = json.loads(result_job["result_json"])

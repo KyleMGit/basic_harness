@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 from safety import screen_prompt_content
 from skill_catalog import CanonicalCatalog
+from review_limits import (DEFAULT_PREPARED_INPUT_BYTES, DEFAULT_WIRE_BODY_BYTES,
+                           validate_byte_limit)
 
 
 class SkillStore(CanonicalCatalog):
@@ -200,10 +202,14 @@ return NONE. Describe reusable procedures, never persist secrets or personal dat
                               ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
 
     @staticmethod
-    def generate_proposal(client, model, prepared_json, *, timeout=30, output_tokens=4096):
+    def generate_proposal(client, model, prepared_json, *, timeout=30, output_tokens=4096,
+                          prepared_input_bytes=DEFAULT_PREPARED_INPUT_BYTES,
+                          wire_body_bytes=DEFAULT_WIRE_BODY_BYTES):
         from skill_catalog import validate_proposal, MAX_OUTPUT_BYTES
         from review_diagnostics import (ReviewDiagnosticError, finish_reason,
                                         mark_transport_failure, usage_metadata)
+        validate_byte_limit("prepared_input_bytes", prepared_input_bytes)
+        validate_byte_limit("wire_body_bytes", wire_body_bytes)
         base = dict(request_attempted=False, response_received=False,
                     output_tokens=output_tokens)
         if not isinstance(prepared_json, str):
@@ -212,10 +218,10 @@ return NONE. Describe reusable procedures, never persist secrets or personal dat
             prepared_bytes = len(prepared_json.encode())
         except UnicodeEncodeError:
             raise ReviewDiagnosticError("prepared_input_invalid", **base) from None
-        if prepared_bytes > 128 * 1024:
+        if prepared_bytes > prepared_input_bytes:
             raise ReviewDiagnosticError(
                 "prepared_input_oversized", observed_bytes=prepared_bytes,
-                limit_bytes=128 * 1024, **base)
+                limit_bytes=prepared_input_bytes, **base)
         try:
             json.loads(prepared_json)
         except json.JSONDecodeError:
@@ -224,10 +230,10 @@ return NONE. Describe reusable procedures, never persist secrets or personal dat
         # separators. Measure that complete body, including nested escaping,
         # before allowing the SDK to open a transport request.
         wire_bytes = AutoSkillExtractor.sdk_wire_bytes(model, prepared_json, output_tokens)
-        if wire_bytes > 256 * 1024:
+        if wire_bytes > wire_body_bytes:
             raise ReviewDiagnosticError(
                 "wire_body_oversized", observed_bytes=wire_bytes,
-                limit_bytes=256 * 1024, **base)
+                limit_bytes=wire_body_bytes, **base)
         try:
             configured_client = client.with_options(timeout=timeout, max_retries=0)
             completion_create = configured_client.chat.completions.create

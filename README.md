@@ -180,17 +180,31 @@ disabled launches, safe mode switching, service supervision and admission outcom
 Review lifecycle events appear later as host-generated `[Skill Review]` notices.
 `Review started.` records the first authorized service-worker entry for that job,
 before local preparation; it is not emitted for capture, queueing, claim alone,
-or dispatch alone and does not prove a provider request was transmitted. The
-background owner never prints: the CLI drains the private durable outbox only
-after typed input, completed foreground responses, permission decisions, startup,
-or orderly shutdown. A late drain can therefore show the recorded start directly
-before its final result. CREATE/UPDATE final notices mean canonical publication
-committed; NONE, recovered receipt, and compact allowlisted failure notices are
-distinct. Pending events survive same-generation reconnect and are never inserted
-into the model conversation. Detailed disconnected history is bounded and older
-starts and finals become an explicit lifecycle-event-count/time-span summary
-rather than being silently dropped. See the linked review document for delay,
-crash-repeat, recovery, capacity, and source-attribution semantics.
+or dispatch alone and does not prove a provider request was transmitted. By
+default the background owner never prints: the CLI drains the private durable
+outbox only after typed input, completed foreground responses, permission
+decisions, startup, or orderly shutdown. A late drain can therefore show the
+recorded start directly before its final result.
+
+`--quiet-skill-reviews` suppresses those durable notices and the agent's immediate
+skill-review setup/admission/error messages without enabling `--auto-skills` or
+changing capture, review, publication, retrieval, memory, diagnostics, or service
+status output. When automatic reviews are enabled, the owner validates and
+intentionally dismisses pending notices during its startup, idle/busy background
+pumps, and orderly shutdown: valid rows receive the normal positive delivered
+timestamp without a terminal write or flush, while invalid/tampered rows retain
+the existing invalid marker. Thus a later unmuted same-generation launch does not
+replay notices already dismissed. A crash before acknowledgement can leave the
+claimed notice retryable; once the owner has shut down it cannot acknowledge
+future arrivals.
+
+CREATE/UPDATE final notices mean canonical publication committed; NONE, recovered
+receipt, and compact allowlisted failure notices are distinct. Pending events
+survive same-generation reconnect and are never inserted into the model
+conversation. Detailed disconnected history is bounded and older starts and
+finals become an explicit lifecycle-event-count/time-span summary rather than
+being silently dropped. See the linked review document for delay, crash-repeat,
+recovery, capacity, and source-attribution semantics.
 
 ---
 
@@ -254,6 +268,7 @@ are not on the recognized read-only allowlist:
 | **`--no-skills`** | | `False` | Completely disables skill catalog and skill retrieval. |
 | **`--no-memory`** | | `False` | Completely disables USER.md and MEMORY.md injection. |
 | **`--auto-skills`** | | `False` | Opts in to bounded durable local enqueue. Requires `--profile` and one supervised host service using the same profile root, model and endpoint; returns without waiting for review inference. |
+| **`--quiet-skill-reviews`** | | `False` | Suppresses agent skill-review messages and intentionally acknowledges valid durable notices without displaying them. Does not enable or disable reviews. |
 | **`--skill-review-roster <path>`** | | `None` | Selects the backward-compatible static allowlist mode. The profile must be listed and agent model/endpoint must match the roster. Omit for automatic discovery. |
 | **`--auto-memory`** | | `False` | Opts in to a visible synchronous post-task memory reflection provider call; its latency/tokens and completion delay remain unchanged. |
 | **`--no-auto-skills`**| | `False` | Compatibility alias that disables `--auto-skills`. |

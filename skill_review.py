@@ -32,6 +32,8 @@ from profile_paths import (DEFAULT_PROFILES_DIR, PinnedDirectory, ProfilePaths,
                            plain_stat, validate_profile_id)
 from skill_lock import path_identity
 from review_diagnostics import safe_review_context
+from review_limits import (DEFAULT_PREPARED_INPUT_BYTES, DEFAULT_SELECTED_VIEW_BYTES,
+                           DEFAULT_WIRE_BODY_BYTES, validate_byte_limit)
 
 
 BUSY_SECONDS = .5
@@ -990,7 +992,7 @@ def request_json(roster, job):
 class Owner:
     """Lightweight preparation/delivery worker. It owns no inference or SDK client."""
     def __init__(self, roster, profile_id, store, *, enabled=True, background=True,
-                 max_records=MAX_RECORDS, batch_count=BATCH_COUNT):
+                 max_records=MAX_RECORDS, batch_count=BATCH_COUNT, quiet=False):
         self.roster, self.entry = roster, roster.entry(profile_id)
         self.store = store.bind()
         if self.store.store_id != self.entry.store_id:
@@ -999,6 +1001,7 @@ class Owner:
             raise ValueError("Queue limits exceed host bounds")
         self.max_records, self.batch_count = max_records, batch_count
         self.owner_id = uuid.uuid4().hex
+        self.quiet = quiet
         self.enabled = False
         self.closed = False
         self.last_error = ""
@@ -2070,7 +2073,6 @@ class Owner:
 
     def deliver_notices(self, stream=None):
         """Print pending notices only at a caller-selected terminal-safe boundary."""
-        stream = sys.stdout if stream is None else stream
         with self._delivery_lock:
             if not self.enabled or self.closed:
                 return 0
@@ -2105,11 +2107,13 @@ class Owner:
                         )
             if not valid:
                 return 0
-            rendered = "".join(self._render_notice(row) + "\n" for row in valid)
             acknowledged = False
             try:
-                stream.write(rendered)
-                stream.flush()
+                if not self.quiet:
+                    stream = sys.stdout if stream is None else stream
+                    rendered = "".join(self._render_notice(row) + "\n" for row in valid)
+                    stream.write(rendered)
+                    stream.flush()
                 acknowledged = self._ack_delivered(auth, delivery_id, valid)
                 return len(valid) if acknowledged else 0
             finally:
@@ -2121,6 +2125,10 @@ class Owner:
             return
         try:
             self._pump()
+            if self.quiet:
+                # _pump has released the profile gate before acquiring the
+                # delivery lock, preserving the visible path's lock order.
+                self.deliver_notices()
         except Exception as exc:
             if self.enabled and not self.closed:
                 self.last_error = "historical " + error_detail("owner.mailbox", exc, profile_id=self.entry.profile_id) + "; owner background attempt interrupted; pending work retained; check local storage/catalog."
@@ -2277,13 +2285,22 @@ class Owner:
 
 class ReviewService:
     """Singleton scheduler with a fixed bounded pool, never a catalog writer."""
-    def __init__(self, roster, *, provider=None, workers=1, timeout=30, output_tokens=4096, discovery_interval=1):
-        if not 1 <= workers <= 8 or not 0 < timeout <= 120 or not 256 <= output_tokens <= 8192:
+    def __init__(self, roster, *, provider=None, workers=1, timeout=30, output_tokens=4096,
+                 discovery_interval=1, selected_view_bytes=DEFAULT_SELECTED_VIEW_BYTES,
+                 prepared_input_bytes=DEFAULT_PREPARED_INPUT_BYTES,
+                 wire_body_bytes=DEFAULT_WIRE_BODY_BYTES):
+        selected_view_bytes = validate_byte_limit("selected_view_bytes", selected_view_bytes)
+        prepared_input_bytes = validate_byte_limit("prepared_input_bytes", prepared_input_bytes)
+        wire_body_bytes = validate_byte_limit("wire_body_bytes", wire_body_bytes)
+        if not 1 <= workers <= 8 or not 0 < timeout <= 120 or not 256 <= output_tokens <= 32768:
             raise ValueError("Invalid fixed service limits")
         if not .05 <= discovery_interval <= 60:
             raise ValueError("Discovery interval must be between 0.05 and 60 seconds")
         self.roster, self.workers = roster, workers
         self.timeout, self.output_tokens = timeout, output_tokens
+        self.selected_view_bytes = selected_view_bytes
+        self.prepared_input_bytes = prepared_input_bytes
+        self.wire_body_bytes = wire_body_bytes
         self.provider = provider
         self.stop_event = threading.Event()
         self.errors = {}
@@ -2436,19 +2453,16 @@ class ReviewService:
         task, view_bytes, message_count = task_for(chosen)
         if message_count > BATCH_MESSAGES:
             raise BudgetRefusal("selected_messages", message_count, BATCH_MESSAGES)
-        if view_bytes > BATCH_BYTES:
-            raise BudgetRefusal("selected_view_bytes", view_bytes, BATCH_BYTES)
+        if view_bytes > self.selected_view_bytes:
+            raise BudgetRefusal("selected_view_bytes", view_bytes, self.selected_view_bytes)
         for index in range(len(ordered)):
             if index in chosen:
                 continue
             candidate = chosen | {index}
             next_task, next_bytes, next_messages = task_for(candidate)
-            if next_bytes <= BATCH_BYTES and next_messages <= BATCH_MESSAGES:
+            if next_bytes <= self.selected_view_bytes and next_messages <= BATCH_MESSAGES:
                 chosen, task, view_bytes, message_count = candidate, next_task, next_bytes, next_messages
         request = packed(dict(catalog=json.loads(job["catalog_json"]), tasks=[task]))
-        prepared_bytes = len(request.encode())
-        if prepared_bytes > 128 * 1024:
-            raise BudgetRefusal("prepared_bytes", prepared_bytes, 128 * 1024)
         return request
 
     def _record_review_start(self, entry, job, auth):
@@ -2504,6 +2518,12 @@ class ReviewService:
         try:
             host = json.loads(job["host_json"])
             request = self._episode_request(entry, job) if host.get("kind") == "episode" else request_json(self.roster, job)
+            if request is not None:
+                prepared_bytes = len(request.encode())
+                if prepared_bytes > self.prepared_input_bytes:
+                    raise BudgetRefusal(
+                        "prepared_bytes", prepared_bytes, self.prepared_input_bytes,
+                    )
         except BudgetRefusal as exc:
             result = dict(status="BUDGET_REFUSED",
                           detail=exc.detail(profile_id=entry.profile_id, job_id=job["job_id"]))
@@ -2574,7 +2594,12 @@ class ReviewService:
                     from skills import AutoSkillExtractor
                     client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY") or "local-no-key-required",
                                     base_url=self.roster.base_url, timeout=self.timeout, max_retries=0)
-                provider = lambda request: AutoSkillExtractor.generate_proposal(client, self.roster.model, request, timeout=self.timeout, output_tokens=self.output_tokens)
+                provider = lambda request: AutoSkillExtractor.generate_proposal(
+                    client, self.roster.model, request, timeout=self.timeout,
+                    output_tokens=self.output_tokens,
+                    prepared_input_bytes=self.prepared_input_bytes,
+                    wire_body_bytes=self.wire_body_bytes,
+                )
             else:
                 provider = self.provider
             processed, inflight = 0, {}
@@ -2639,6 +2664,18 @@ def main(argv=None):
             child.add_argument("--workers", type=int, default=1)
             child.add_argument("--timeout", type=float, default=30)
             child.add_argument("--output-tokens", type=int, default=4096)
+            child.add_argument(
+                "--selected-view-bytes", type=int, default=DEFAULT_SELECTED_VIEW_BYTES,
+                help=f"Selected review evidence byte limit (default: {DEFAULT_SELECTED_VIEW_BYTES})",
+            )
+            child.add_argument(
+                "--prepared-input-bytes", type=int, default=DEFAULT_PREPARED_INPUT_BYTES,
+                help=f"Prepared evidence plus catalog byte limit (default: {DEFAULT_PREPARED_INPUT_BYTES})",
+            )
+            child.add_argument(
+                "--wire-body-bytes", type=int, default=DEFAULT_WIRE_BODY_BYTES,
+                help=f"Complete serialized SDK request byte limit (default: {DEFAULT_WIRE_BODY_BYTES})",
+            )
     entry_parser = sub.add_parser("roster-entry", help="Print a roster entry without creating profile state")
     entry_parser.add_argument("--profile", required=True)
     entry_parser.add_argument("--state-root", required=True)
@@ -2678,8 +2715,14 @@ def main(argv=None):
                     profiles.append(dict(profile_id=entry.profile_id, enabled=bool(auth and auth["enabled"]), jobs=counts))
             print(packed(dict(service_running=running, profiles=profiles, discovery_errors=getattr(roster, "errors", {}))))
             return 0
-        service = ReviewService(roster, workers=args.workers, timeout=args.timeout, output_tokens=args.output_tokens,
-                                discovery_interval=args.discovery_interval if args.discovery_interval is not None else 1)
+        service = ReviewService(
+            roster, workers=args.workers, timeout=args.timeout,
+            output_tokens=args.output_tokens,
+            discovery_interval=args.discovery_interval if args.discovery_interval is not None else 1,
+            selected_view_bytes=args.selected_view_bytes,
+            prepared_input_bytes=args.prepared_input_bytes,
+            wire_body_bytes=args.wire_body_bytes,
+        )
         for sig in (signal.SIGINT, signal.SIGTERM):
             signal.signal(sig, lambda *_: service.stop())
         count = service.run(once=args.command == "once")

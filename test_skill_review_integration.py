@@ -20,7 +20,8 @@ def response(payload, reason="stop"):
 
 
 def adapter_error(*, prepared='{"catalog":{},"tasks":[]}', payload='{"action":"NONE"}',
-                  reason="stop", choices=None, usage=None, output_tokens=4096):
+                  reason="stop", choices=None, usage=None, output_tokens=4096,
+                  prepared_input_bytes=512 * 1024, wire_body_bytes=1024 * 1024):
     client = MagicMock()
     client.with_options.return_value = client
     reply = response(payload, reason) if choices is None else SimpleNamespace(choices=choices)
@@ -28,7 +29,8 @@ def adapter_error(*, prepared='{"catalog":{},"tasks":[]}', payload='{"action":"N
     client.chat.completions.create.return_value = reply
     with pytest.raises(ValueError) as caught:
         AutoSkillExtractor.generate_proposal(
-            client, "current-model", prepared, timeout=1, output_tokens=output_tokens)
+            client, "current-model", prepared, timeout=1, output_tokens=output_tokens,
+            prepared_input_bytes=prepared_input_bytes, wire_body_bytes=wire_body_bytes)
     return caught.value, client.chat.completions.create.call_count
 
 
@@ -60,8 +62,10 @@ def test_adapter_rejections_have_fixed_safe_reasons_at_real_boundary(case, expec
         kwargs["prepared"] = ""
     elif case == "prepared_oversized":
         kwargs["prepared"] = json.dumps("x" * (128 * 1024))
+        kwargs["prepared_input_bytes"] = 128 * 1024
     elif case == "wire_oversized":
         kwargs["prepared"] = json.dumps("\\" * 65500)
+        kwargs["wire_body_bytes"] = 256 * 1024
     elif case == "no_choices":
         kwargs["choices"] = []
     elif case == "length":

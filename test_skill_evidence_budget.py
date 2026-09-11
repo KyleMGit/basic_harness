@@ -319,7 +319,10 @@ def test_zero_request_budget_refusal_does_not_suppress_new_fitting_episode(tmp_p
     roster = setup_roster(tmp_path)
     owner = owner_for(roster, background=False)
     requests = []
-    service = ReviewService(roster, provider=lambda request: requests.append(request) or {"action": "NONE"})
+    service = ReviewService(
+        roster, provider=lambda request: requests.append(request) or {"action": "NONE"},
+        selected_view_bytes=BATCH_BYTES,
+    )
     try:
         oversized = eligible_evidence("refused-before-review", padding="x" * (200 * 1024))
         assert owner.capture_turn(oversized).status == "ELIGIBLE"
@@ -644,7 +647,10 @@ def test_unfit_oldest_episode_is_terminally_refused_without_provider_and_later_w
         assert owner.capture_turn(second).status == "ELIGIBLE"
         owner.flush_session(second.session_id)
 
-        service = ReviewService(roster, provider=lambda request: calls.append(request) or {"action": "NONE"})
+        service = ReviewService(
+            roster, provider=lambda request: calls.append(request) or {"action": "NONE"},
+            selected_view_bytes=BATCH_BYTES,
+        )
         assert service.once() == 1
         owner.pump()
         assert rows(owner, "jobs")[0]["status"] == "BUDGET_REFUSED"
@@ -727,7 +733,10 @@ def test_complete_sdk_wire_over_256_kib_is_refused_before_http_request():
         assert len(prepared.encode()) < 128 * 1024
         try:
             with pytest.raises(ValueError, match="wire"):
-                AutoSkillExtractor.generate_proposal(client, "test-model", prepared, timeout=2)
+                AutoSkillExtractor.generate_proposal(
+                    client, "test-model", prepared, timeout=2,
+                    wire_body_bytes=256 * 1024,
+                )
             assert requests == []
         finally:
             client.close()
@@ -773,10 +782,15 @@ def test_actual_sdk_serialization_matches_wire_accounting_at_limit_plus_minus_on
     http = httpx.Client(transport=httpx.MockTransport(respond))
     client = OpenAI(api_key="synthetic", base_url="http://127.0.0.1:1/v1", http_client=http, max_retries=0)
     try:
-        assert AutoSkillExtractor.generate_proposal(client, "test-model", exact) == {"action": "NONE"}
+        assert AutoSkillExtractor.generate_proposal(
+            client, "test-model", exact, wire_body_bytes=target,
+        ) == {"action": "NONE"}
         assert observed == [target]
         with pytest.raises(ValueError, match="wire"):
-            AutoSkillExtractor.generate_proposal(client, "test-model", prepared(65000, suffix + 1))
+            AutoSkillExtractor.generate_proposal(
+                client, "test-model", prepared(65000, suffix + 1),
+                wire_body_bytes=target,
+            )
         assert observed == [target]
     finally:
         client.close()
@@ -818,7 +832,11 @@ def test_prepared_json_limit_is_exact_at_128_kib():
     client.with_options.return_value = client
     client.chat.completions.create.return_value = SimpleNamespace(
         choices=[SimpleNamespace(finish_reason="stop", message=SimpleNamespace(content='{\"action\":\"NONE\"}'))])
-    assert AutoSkillExtractor.generate_proposal(client, "test-model", exact) == {"action": "NONE"}
+    assert AutoSkillExtractor.generate_proposal(
+        client, "test-model", exact, prepared_input_bytes=128 * 1024,
+    ) == {"action": "NONE"}
     with pytest.raises(ValueError, match="Prepared"):
-        AutoSkillExtractor.generate_proposal(client, "test-model", exact + " ")
+        AutoSkillExtractor.generate_proposal(
+            client, "test-model", exact + " ", prepared_input_bytes=128 * 1024,
+        )
     assert client.chat.completions.create.call_count == 1
