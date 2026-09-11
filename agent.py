@@ -22,6 +22,7 @@ import atexit
 import json
 import os
 import re
+import sqlite3
 import sys
 import uuid
 from dataclasses import dataclass
@@ -334,10 +335,18 @@ Below is the catalog of learned project skills. When a task relates to any avail
         )
 
     def set_testing_mode(self, mode: str):
+        mode_clean = mode.lower().strip()
+        if mode_clean not in ("normal", "read-only", "readonly", "freeze", "stateless", "benchmark", "isolated", "no-skills"):
+            print(f"Unknown mode '{mode}'. Options: normal | read-only | stateless | no-skills")
+            return
+        # Do not hold the catalog lock while a terminal delivery already in
+        # progress finishes. Revocation still precedes the mode acknowledgement.
+        if self.skill_review_owner:
+            self.skill_review_owner.set_enabled(False)
         with self.skill_store.lock():
-            self._set_testing_mode(mode)
+            self._set_testing_mode(mode, owner_revoked=True)
 
-    def _set_testing_mode(self, mode: str):
+    def _set_testing_mode(self, mode: str, *, owner_revoked=False):
         """Configure agent testing/learning modes dynamically."""
         mode_clean = mode.lower().strip()
         if mode_clean not in ("normal", "read-only", "readonly", "freeze", "stateless", "benchmark", "isolated", "no-skills"):
@@ -345,7 +354,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
             return
         # Revocation synchronizes with all background profile mutations before
         # acknowledging the mode. It never waits for model inference.
-        if self.skill_review_owner:
+        if self.skill_review_owner and not owner_revoked:
             self.skill_review_owner.set_enabled(False)
         self._task_evidence = None
         if mode_clean == "normal":
@@ -473,6 +482,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
         except (KeyboardInterrupt, EOFError):
             print("\n[!] Command aborted.")
             return False, command, "User interrupted command execution."
+        self.deliver_skill_review_notices()
 
         if user_input.lower() in ("", "y", "yes"):
             return True, command, None
@@ -482,6 +492,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
         elif user_input.lower() in ("e", "edit"):
             print(f"Current command: {command}")
             new_cmd = input(">> Enter new command: ").strip()
+            self.deliver_skill_review_notices()
             if not new_cmd:
                 print("[-] Empty command. Cancelled.")
                 return False, command, "Execution cancelled (empty edit)."
@@ -590,6 +601,18 @@ Below is the catalog of learned project skills. When a task relates to any avail
             if self.auto_learn_skills and not (self.read_only or self.stateless):
                 self.skill_review_owner.flush_session(self.session_id, retire=True)
             self.skill_review_owner.close()
+
+    def deliver_skill_review_notices(self, stream=None):
+        """Drain the private host outbox at a foreground terminal-safe boundary."""
+        if (not self.skill_review_owner or not self.auto_learn_skills
+                or self.read_only or self.stateless or not self.enable_skills):
+            return 0
+        try:
+            return self.skill_review_owner.deliver_notices(stream)
+        except (OSError, UnicodeError, sqlite3.Error, TimeoutError, ValueError):
+            # Printing and durable acknowledgement are deliberately coupled:
+            # any failure leaves pending rows for a later safe boundary.
+            return 0
 
     def _reset_sql_diagnostic_state(self) -> None:
         self._sql_troubleshooting_backend = None
@@ -1377,9 +1400,15 @@ def main():
         if not resumed:
             print(f"[!] Warning: Could not find session '{args.resume}' to resume. Starting new session.")
 
+    agent.deliver_skill_review_notices()
     while True:
         try:
+            # The background owner never writes to the terminal. Results that
+            # arrived since the prior turn are emitted immediately before the
+            # next prompt; arrivals during input wait until input returns.
+            agent.deliver_skill_review_notices()
             prompt = input("\nUser > ").strip()
+            agent.deliver_skill_review_notices()
             if not prompt:
                 continue
             if prompt.lower() in ("exit", "quit"):
@@ -1473,11 +1502,13 @@ def main():
                 continue
 
             agent.run(prompt)
+            agent.deliver_skill_review_notices()
 
         except (KeyboardInterrupt, EOFError):
             print("\nShutting down.")
             break
 
+    agent.deliver_skill_review_notices()
     agent.shutdown_skill_reviews()
     atexit.unregister(agent.shutdown_skill_reviews)
 

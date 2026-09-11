@@ -177,6 +177,21 @@ remains synchronous and can still delay completion. See
 [asynchronous skill review setup and recovery](docs/async_skill_review.md) for
 disabled launches, safe mode switching, service supervision and admission outcomes.
 
+Review lifecycle events appear later as host-generated `[Skill Review]` notices.
+`Review started.` records the first authorized service-worker entry for that job,
+before local preparation; it is not emitted for capture, queueing, claim alone,
+or dispatch alone and does not prove a provider request was transmitted. The
+background owner never prints: the CLI drains the private durable outbox only
+after typed input, completed foreground responses, permission decisions, startup,
+or orderly shutdown. A late drain can therefore show the recorded start directly
+before its final result. CREATE/UPDATE final notices mean canonical publication
+committed; NONE, recovered receipt, and compact allowlisted failure notices are
+distinct. Pending events survive same-generation reconnect and are never inserted
+into the model conversation. Detailed disconnected history is bounded and older
+starts and finals become an explicit lifecycle-event-count/time-span summary
+rather than being silently dropped. See the linked review document for delay,
+crash-repeat, recovery, capacity, and source-attribution semantics.
+
 ---
 
 ## 💬 1. In-Session Chat Commands (Typed at `User >`)

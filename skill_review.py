@@ -21,6 +21,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import uuid
 
 from skill_catalog import CatalogSnapshot, ReviewTarget, validate_proposal, MAX_OUTPUT_BYTES
@@ -54,13 +55,17 @@ IDLE_SECONDS = 120
 ELIGIBLE_AGE_SECONDS = 900
 MAILBOX_BYTES = 16 * 1024 * 1024
 HISTORY_COUNT = 32
+NOTICE_DETAIL_COUNT = 24
+NOTICE_HISTORY_COUNT = 32
+NOTICE_ID_COUNT = 8
+NOTICE_SUMMARY_COUNT_LIMIT = 1_000_000
 ACTIVE = ("PREPARED", "RUNNING", "RESULT")
 MAX_DIAGNOSTICS = 128
 REJECTED = "NOT queued; no automatic retry; earlier queue work retained."
 DIAGNOSTIC_STAGES = frozenset((
     "owner.authorization", "owner.mailbox", "owner.delivery", "owner.publication", "owner.acknowledgement",
     "owner.preparation", "owner.preparation_authorization", "owner.preparation_persistence",
-    "pending.scan", "pending.recovery", "claim", "worker.authorization", "result.persistence",
+    "pending.scan", "pending.recovery", "claim", "worker.authorization", "worker.start", "result.persistence",
     "service.preparation", "service.startup.provider", "service.shutdown", "service.status",
 ))
 EXCEPTION_NAMES = {
@@ -205,15 +210,59 @@ class Admission:
     detail: str = ""
 
 
+BUDGET_DIAGNOSTIC_UNITS = {
+    "episode_sources": "sources",
+    "carry_anchor_bytes": "bytes",
+    "missing_context": "bytes",
+    "selected_messages": "messages",
+    "selected_view_bytes": "bytes",
+    "prepared_bytes": "bytes",
+}
+BUDGET_DIAGNOSTIC_VALUE_MAX = 1000000
+
+
+def valid_budget_diagnostic(value):
+    expected = {"reason", "unit", "observed", "limit", "provider_requests"}
+    if not isinstance(value, dict) or set(value) != expected:
+        return False
+    reason = value.get("reason")
+    if type(reason) is not str:
+        return False
+    unit = BUDGET_DIAGNOSTIC_UNITS.get(reason)
+    return (unit is not None and value.get("unit") == unit
+            and type(value.get("observed")) is int and type(value.get("limit")) is int
+            and 0 <= value["limit"] < value["observed"] <= BUDGET_DIAGNOSTIC_VALUE_MAX
+            and type(value.get("provider_requests")) is int and value["provider_requests"] == 0)
+
+
 class BudgetRefusal(ValueError):
     def __init__(self, reason, observed, limit):
         super().__init__("Review candidate exceeds a terminal budget")
         self.reason, self.observed, self.limit = reason, observed, limit
 
-    def detail(self):
-        unit = "messages" if self.reason == "selected_messages" else "bytes"
-        return (f"stage=service.preparation reason={self.reason} observed_{unit}={self.observed} "
-                f"limit_{unit}={self.limit}; outcome=BUDGET_REFUSED; zero provider requests; "
+    def diagnostic(self):
+        if type(self.reason) is not str:
+            return None
+        value = dict(reason=self.reason, unit=BUDGET_DIAGNOSTIC_UNITS.get(self.reason),
+                     observed=self.observed, limit=self.limit, provider_requests=0)
+        return value if valid_budget_diagnostic(value) else None
+
+    def detail(self, *, profile_id=None, job_id=None):
+        diagnostic = self.diagnostic()
+        parts = ["stage=service.preparation"]
+        if diagnostic is None:
+            parts.append("reason=budget_limit")
+        else:
+            parts.append("reason=" + diagnostic["reason"])
+        if profile_id is not None:
+            parts.append("profile=" + diagnostic_id(profile_id))
+        if job_id is not None:
+            parts.append("job=" + diagnostic_id(job_id, job=True))
+        if diagnostic is not None:
+            unit = diagnostic["unit"]
+            parts.extend((f"observed_{unit}={diagnostic['observed']}",
+                          f"limit_{unit}={diagnostic['limit']}"))
+        return (" ".join(parts) + "; outcome=BUDGET_REFUSED; zero provider requests; "
                 "accepted source references await owner acknowledgement.")
 
 
@@ -881,6 +930,20 @@ def connect(entry, readonly=False, *, create=False):
 
 
 JOB_FIELDS = ("job_id", "profile_id", "store_id", "generation", "evidence_json", "catalog_json", "host_json")
+NOTICE_FIELDS = ("notice_id", "profile_id", "store_id", "generation", "job_id", "kind",
+                 "payload_json", "created")
+START_FIELDS = ("job_id", "profile_id", "store_id", "generation", "input_seal",
+                "review_started", "review_start_generation")
+NOTICE_OUTCOMES = frozenset(("APPLIED", "NONE", "DUPLICATE", "BUDGET_REFUSED", "INVALID",
+                             "FAILED", "STALE", "COLLISION", "CANCELLED"))
+NOTICE_REASONS = {
+    "BUDGET_REFUSED": "the bounded review request was refused before a provider call",
+    "INVALID": "the review result or publication request was invalid",
+    "FAILED": "the review or publication attempt failed",
+    "STALE": "the selected skill changed before publication",
+    "COLLISION": "the proposed skill name already exists",
+    "CANCELLED": "profile writes were disabled before publication",
+}
 
 
 def seal(auth, value):
@@ -896,10 +959,28 @@ def result_seal(auth, job):
                            result_json=job["result_json"]))
 
 
+def review_start_seal(auth, job):
+    return seal(auth, {key: job[key] for key in START_FIELDS})
+
+
+def notice_seal(auth, notice):
+    return seal(auth, {key: notice[key] for key in NOTICE_FIELDS})
+
+
 def valid_job(auth, entry, job):
     return (auth and auth["enabled"] and (job["profile_id"], job["store_id"], job["generation"]) ==
             (entry.profile_id, entry.store_id, auth["generation"])
             and hmac.compare_digest(job["input_seal"], job_seal(auth, job)))
+
+
+def valid_review_start(auth, entry, job):
+    return (valid_job(auth, entry, job)
+            and type(job.get("review_started")) in (int, float)
+            and 0 <= job["review_started"] <= 4102444800
+            and type(job.get("review_start_generation")) is str
+            and re.fullmatch(r"[a-f0-9]{32}", job["review_start_generation"]) is not None
+            and isinstance(job.get("review_start_seal"), str)
+            and hmac.compare_digest(job["review_start_seal"], review_start_seal(auth, job)))
 
 
 def request_json(roster, job):
@@ -921,6 +1002,7 @@ class Owner:
         self.enabled = False
         self.closed = False
         self.last_error = ""
+        self._delivery_lock = threading.RLock()
         self._wake, self._stop = threading.Event(), threading.Event()
         self._thread = None
         self.store.set_write_guard(lambda: self.enabled and not self.closed)
@@ -968,6 +1050,10 @@ class Owner:
                 CREATE TABLE IF NOT EXISTS review_fingerprints (
                     seq INTEGER PRIMARY KEY AUTOINCREMENT, fingerprint TEXT UNIQUE, bytes INTEGER,
                     created REAL);
+                CREATE TABLE IF NOT EXISTS notices (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT, notice_id TEXT UNIQUE, profile_id TEXT,
+                    store_id TEXT, generation TEXT, job_id TEXT, kind TEXT, payload_json TEXT,
+                    notice_seal TEXT, created REAL, delivered REAL, delivery_id TEXT);
             """)
             episode_columns = {row[1] for row in conn.execute("PRAGMA table_info(episodes)")}
             additions = {
@@ -983,6 +1069,18 @@ class Owner:
             for name, declaration in additions.items():
                 if name not in episode_columns:
                     conn.execute(f"ALTER TABLE episodes ADD COLUMN {name} {declaration}")
+            job_columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
+            job_additions = {
+                "review_started": "REAL",
+                "review_start_generation": "TEXT",
+                "review_start_seal": "TEXT",
+            }
+            for name, declaration in job_additions.items():
+                if name not in job_columns:
+                    conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {declaration}")
+            notice_columns = {row[1] for row in conn.execute("PRAGMA table_info(notices)")}
+            if "delivery_id" not in notice_columns:
+                conn.execute("ALTER TABLE notices ADD COLUMN delivery_id TEXT")
             page_size = conn.execute("PRAGMA page_size").fetchone()[0]
             page_count = conn.execute("PRAGMA page_count").fetchone()[0]
             page_limit = MAILBOX_BYTES // page_size
@@ -996,38 +1094,47 @@ class Owner:
             conn.execute("DELETE FROM jobs WHERE generation != ?", (auth["generation"],))
             conn.execute("DELETE FROM episode_sources WHERE generation != ?", (auth["generation"],))
             conn.execute("DELETE FROM episodes WHERE generation != ?", (auth["generation"],))
+            conn.execute("DELETE FROM notices WHERE generation != ?", (auth["generation"],))
+            # A process crash may leave an output attempt unacknowledged. No
+            # other owner can coexist, so reconnect safely makes it retryable.
+            conn.execute("UPDATE notices SET delivery_id=NULL WHERE generation=? AND delivered IS NULL",
+                         (auth["generation"],))
+            self._compact_pending_notices(conn, auth)
 
     def set_enabled(self, enabled):
-        with gate(self.entry):
-            if self.closed:
-                return
-            if not enabled:
-                self.enabled = False
-                revoke_existing(self.roster, self.entry, owner_id=self.owner_id)
-                self._wake.set()
-                return
-            authority = check_authority(self.roster, self.entry)
-            switching = authority and authority["origin"] != authority_origin(self.roster)
-            auth = None if switching else read_auth(self.roster, self.entry)
-            if enabled:
-                if self.entry.binding:
-                    self.entry.binding.validate()
-                    self.roster.check_policy(create=True)
-                if not auth or not auth["enabled"]:
-                    auth = dict(profile_id=self.entry.profile_id, store_id=self.entry.store_id,
-                                mailbox=self.entry.mailbox, enabled=True, generation=uuid.uuid4().hex,
-                                model=self.roster.model, base_url=self.roster.base_url,
-                                secret=secrets.token_hex(32))
-                if not authority or switching:
-                    authority = dict(origin=authority_origin(self.roster), generation=uuid.uuid4().hex)
-                auth["authority_generation"] = authority["generation"]
-                if self.entry.binding:
-                    auth["incarnation"] = self.entry.binding.identity
-                auth["owner_id"] = self.owner_id
-                write_auth(self.roster, self.entry, auth)
-                atomic_json(authority_path(self.entry), authority)
-                self._initialize(auth)
-                self.enabled = True
+        # Delivery I/O never holds the catalog/profile gate. This local lock only
+        # orders terminal output before a disable acknowledgement.
+        with self._delivery_lock:
+            with gate(self.entry):
+                if self.closed:
+                    return
+                if not enabled:
+                    self.enabled = False
+                    revoke_existing(self.roster, self.entry, owner_id=self.owner_id)
+                    self._wake.set()
+                    return
+                authority = check_authority(self.roster, self.entry)
+                switching = authority and authority["origin"] != authority_origin(self.roster)
+                auth = None if switching else read_auth(self.roster, self.entry)
+                if enabled:
+                    if self.entry.binding:
+                        self.entry.binding.validate()
+                        self.roster.check_policy(create=True)
+                    if not auth or not auth["enabled"]:
+                        auth = dict(profile_id=self.entry.profile_id, store_id=self.entry.store_id,
+                                    mailbox=self.entry.mailbox, enabled=True, generation=uuid.uuid4().hex,
+                                    model=self.roster.model, base_url=self.roster.base_url,
+                                    secret=secrets.token_hex(32))
+                    if not authority or switching:
+                        authority = dict(origin=authority_origin(self.roster), generation=uuid.uuid4().hex)
+                    auth["authority_generation"] = authority["generation"]
+                    if self.entry.binding:
+                        auth["incarnation"] = self.entry.binding.identity
+                    auth["owner_id"] = self.owner_id
+                    write_auth(self.roster, self.entry, auth)
+                    atomic_json(authority_path(self.entry), authority)
+                    self._initialize(auth)
+                    self.enabled = True
         self._wake.set()
 
     def enqueue(self, evidence):
@@ -1232,6 +1339,11 @@ class Owner:
                     if not current:
                         return Admission("SKIPPED", "")
                     if current["last_job_id"]:
+                        started_job = conn.execute(
+                            "SELECT * FROM jobs WHERE job_id=?", (current["last_job_id"],)
+                        ).fetchone()
+                        if started_job:
+                            self._store_start_notice(conn, auth, dict(started_job))
                         conn.execute(
                             "UPDATE jobs SET status='SUPERSEDED',detail='stage=owner.freshness reason=challenge_started',evidence_json='',catalog_json='',host_json='',result_json='' WHERE job_id=? AND status IN ('PREPARED','RUNNING','RESULT')",
                             (current["last_job_id"],))
@@ -1318,6 +1430,11 @@ class Owner:
                             signatures.update(json.loads(current["signatures_json"] or "[]"))
                         if (not deferred and self._event_data(evidence.event_json).get("correction") is True
                                 and current["last_job_id"]):
+                            started_job = conn.execute(
+                                "SELECT * FROM jobs WHERE job_id=?", (current["last_job_id"],)
+                            ).fetchone()
+                            if started_job:
+                                self._store_start_notice(conn, auth, dict(started_job))
                             conn.execute("UPDATE jobs SET status='SUPERSEDED',detail='stage=owner.freshness reason=correction_revision',evidence_json='',catalog_json='',host_json='',result_json='' WHERE job_id=? AND status IN ('PREPARED','RUNNING','RESULT')",
                                          (current["last_job_id"],))
                             conn.execute("UPDATE episode_sources SET job_id=NULL WHERE episode_id=? AND job_id=?",
@@ -1430,11 +1547,376 @@ class Owner:
                                 limit_bytes=CARRY_BYTES))
         return value, len(value.encode()), 1
 
-    def _ack(self, conn, job, outcome, result=None):
+    @staticmethod
+    def _notice_identifier(value):
+        if type(value) is str and re.fullmatch(r"[A-Za-z0-9_.:-]{1,128}", value):
+            return value
+        return "<invalid>"
+
+    @staticmethod
+    def _notice_name(value):
+        if type(value) is not str:
+            return ""
+        rendered = []
+        for character in value.strip():
+            if unicodedata.category(character).startswith("C"):
+                rendered.append("\\u%04x" % ord(character) if ord(character) <= 0xffff
+                                else "\\U%08x" % ord(character))
+            else:
+                rendered.append(character)
+            if sum(len(part) for part in rendered) >= 256:
+                rendered.append("…")
+                break
+        return "".join(rendered)
+
+    def _notice_source(self, conn, job, host):
+        if host.get("kind") == "episode":
+            episode = conn.execute(
+                "SELECT session_id,revision FROM episodes WHERE episode_id=?",
+                (host.get("episode_id"),),
+            ).fetchone()
+            source_rows = conn.execute(
+                "SELECT source_id,task_id,created FROM episode_sources WHERE job_id=? ORDER BY seq",
+                (job["job_id"],),
+            ).fetchall()
+            sessions = [episode["session_id"]] if episode else []
+            episode_id = self._notice_identifier(host.get("episode_id"))
+            revision = host.get("revision") if type(host.get("revision")) is int else 0
+            scope = "bound episode source set"
+        else:
+            source_rows = conn.execute(
+                "SELECT NULL AS source_id,task_id,session_id,created FROM evidence WHERE job_id=? ORDER BY seq",
+                (job["job_id"],),
+            ).fetchall()
+            sessions = [row["session_id"] for row in source_rows]
+            episode_id, revision = "", 0
+            scope = "selected legacy batch"
+        tasks = [row["task_id"] for row in source_rows]
+        source_ids = [row["source_id"] for row in source_rows if row["source_id"] is not None]
+
+        def identifiers(values):
+            unique = []
+            for value in values:
+                safe = self._notice_identifier(value)
+                if safe not in unique:
+                    unique.append(safe)
+            return unique[:NOTICE_ID_COUNT], len(unique) > NOTICE_ID_COUNT
+
+        session_ids, session_cut = identifiers(sessions)
+        task_ids, task_cut = identifiers(tasks)
+        bounded_sources, source_cut = identifiers(source_ids)
+        times = [float(row["created"]) for row in source_rows
+                 if type(row["created"]) in (int, float) and 0 <= row["created"] <= 4102444800]
+        return dict(
+            scope=scope,
+            source_count=len(source_rows),
+            session_count=len(set(session_ids)) if not session_cut else len(set(sessions)),
+            task_count=len(set(task_ids)) if not task_cut else len(set(tasks)),
+            session_ids=session_ids,
+            task_ids=task_ids,
+            source_ids=bounded_sources,
+            identifiers_truncated=bool(session_cut or task_cut or source_cut),
+            first_created=min(times) if times else float(job["created"]),
+            last_created=max(times) if times else float(job["created"]),
+            episode_id=episode_id,
+            revision=revision,
+        )
+
+    def _notice_payload(self, conn, job, outcome, result, host):
+        status = outcome.status
+        if status not in NOTICE_OUTCOMES:
+            return None
+        action, name, reason = "", "", ""
+        if status in ("APPLIED", "DUPLICATE", "NONE"):
+            if not isinstance(result, dict) or result.get("status") != "PROPOSAL":
+                return None
+            try:
+                proposal = validate_proposal(result.get("proposal"))
+            except (TypeError, ValueError):
+                return None
+            action = proposal["action"]
+            if status == "NONE":
+                if action != "NONE":
+                    return None
+            elif action == "CREATE":
+                name = self._notice_name(proposal["name"])
+            elif action == "UPDATE":
+                target = next((item for item in host.get("targets", ())
+                               if isinstance(item, dict) and item.get("target_id") == proposal["target_id"]), None)
+                if not target:
+                    return None
+                name = self._notice_name(target.get("name"))
+            else:
+                return None
+            if status != "NONE" and not name:
+                return None
+        else:
+            reason = NOTICE_REASONS.get(status, "")
+            if not reason:
+                return None
+        payload = dict(version=1, kind="DETAIL", outcome=status, action=action, name=name,
+                       reason=reason, source=self._notice_source(conn, job, host))
+        budget = result.get("budget") if isinstance(result, dict) else None
+        if status == "BUDGET_REFUSED" and valid_budget_diagnostic(budget):
+            payload["version"] = 2
+            payload["budget"] = dict(budget)
+        return payload
+
+    @staticmethod
+    def _valid_notice_source(source):
+        expected = {"scope", "source_count", "session_count", "task_count", "session_ids", "task_ids",
+                    "source_ids", "identifiers_truncated", "first_created", "last_created", "episode_id", "revision"}
+        if not isinstance(source, dict) or set(source) != expected:
+            return False
+        if source["scope"] not in ("selected legacy batch", "selected episode revision",
+                                   "bound episode source set"):
+            return False
+        for key in ("source_count", "session_count", "task_count", "revision"):
+            if type(source[key]) is not int or not 0 <= source[key] <= 1000000:
+                return False
+        for key in ("session_ids", "task_ids", "source_ids"):
+            if (not isinstance(source[key], list) or len(source[key]) > NOTICE_ID_COUNT
+                    or any(self_id == "" or self_id != Owner._notice_identifier(self_id) for self_id in source[key])):
+                return False
+        return (type(source["identifiers_truncated"]) is bool
+                and source["episode_id"] in ("", Owner._notice_identifier(source["episode_id"]))
+                and type(source["first_created"]) in (int, float)
+                and type(source["last_created"]) in (int, float)
+                and 0 <= source["first_created"] <= source["last_created"] <= 4102444800)
+
+    @staticmethod
+    def _valid_notice_payload(payload, kind):
+        if not isinstance(payload, dict) or payload.get("kind") != kind:
+            return False
+        if kind == "SUMMARY":
+            version = payload.get("version")
+            legacy = version == 1
+            expected = {"version", "kind", "count", "outcomes", "first_created",
+                        "last_created", "disclosure", "saturated"}
+            if not legacy:
+                expected.add("starts")
+            if version not in (1, 2) or set(payload) != expected:
+                return False
+            counts = payload.get("outcomes")
+            return (type(payload.get("count")) is int and 1 <= payload["count"] <= NOTICE_SUMMARY_COUNT_LIMIT
+                    and isinstance(counts, dict) and set(counts) <= NOTICE_OUTCOMES
+                    and all(type(value) is int and 1 <= value <= NOTICE_SUMMARY_COUNT_LIMIT for value in counts.values())
+                    and (legacy or (type(payload.get("starts")) is int
+                                    and 0 <= payload["starts"] <= NOTICE_SUMMARY_COUNT_LIMIT))
+                    and type(payload.get("saturated")) is bool
+                    and type(payload.get("first_created")) in (int, float)
+                    and type(payload.get("last_created")) in (int, float)
+                    and 0 <= payload["first_created"] <= payload["last_created"] <= 4102444800
+                    and payload.get("disclosure") == "older per-notice names and source identifiers were compacted")
+        version = payload.get("version")
+        if version not in (1, 2):
+            return False
+        if kind == "START":
+            return (version == 1
+                    and set(payload) == {"version", "kind", "started_at", "source"}
+                    and type(payload.get("started_at")) in (int, float)
+                    and 0 <= payload["started_at"] <= 4102444800
+                    and Owner._valid_notice_source(payload.get("source")))
+        expected = {"version", "kind", "outcome", "action", "name", "reason", "source"}
+        if version == 2:
+            expected.add("budget")
+        if set(payload) != expected:
+            return False
+        outcome, action = payload.get("outcome"), payload.get("action")
+        if version == 2 and (outcome != "BUDGET_REFUSED"
+                             or not valid_budget_diagnostic(payload.get("budget"))):
+            return False
+        if outcome not in NOTICE_OUTCOMES or action not in ("", "CREATE", "UPDATE", "NONE"):
+            return False
+        if type(payload.get("name")) is not str or type(payload.get("reason")) is not str:
+            return False
+        if any(unicodedata.category(char).startswith("C") for char in payload["name"] + payload["reason"]):
+            return False
+        if len(payload["name"]) > 257 or payload["reason"] not in ("", *NOTICE_REASONS.values()):
+            return False
+        if outcome in ("APPLIED", "DUPLICATE") and (action not in ("CREATE", "UPDATE") or not payload["name"]):
+            return False
+        if outcome == "NONE" and (action != "NONE" or payload["name"] or payload["reason"]):
+            return False
+        if outcome in NOTICE_REASONS and (action or payload["name"] or payload["reason"] != NOTICE_REASONS[outcome]):
+            return False
+        return Owner._valid_notice_source(payload.get("source"))
+
+    def _valid_notice(self, auth, row):
+        notice = dict(row)
+        if ((notice["profile_id"], notice["store_id"], notice["generation"])
+                != (self.entry.profile_id, self.entry.store_id, auth["generation"])
+                or self._notice_identifier(notice["notice_id"]) != notice["notice_id"]
+                or self._notice_identifier(notice["job_id"]) != notice["job_id"]
+                or notice["kind"] not in ("START", "DETAIL", "SUMMARY")
+                or type(notice["created"]) not in (int, float)
+                or not 0 <= notice["created"] <= 4102444800
+                or not isinstance(notice["payload_json"], str)
+                or len(notice["payload_json"].encode()) > 8192):
+            return False
+        try:
+            payload = json.loads(notice["payload_json"])
+        except (TypeError, ValueError):
+            return False
+        return (self._valid_notice_payload(payload, notice["kind"])
+                and (notice["kind"] != "START" or payload["started_at"] == notice["created"])
+                and isinstance(notice["notice_seal"], str)
+                and hmac.compare_digest(notice["notice_seal"], notice_seal(auth, notice)))
+
+    def _compact_pending_notices(self, conn, auth):
+        """Restore the pending cap without touching a console-inflight snapshot."""
+        pending = conn.execute(
+            "SELECT * FROM notices WHERE generation=? AND delivered IS NULL AND delivery_id IS NULL ORDER BY created,seq",
+            (auth["generation"],),
+        ).fetchall()
+        valid = []
+        for row in pending:
+            if self._valid_notice(auth, row):
+                valid.append(row)
+            else:
+                # Invalid/tampered rows are never rendered or coalesced.
+                conn.execute("UPDATE notices SET delivered=-1 WHERE seq=?", (row["seq"],))
+        details = [row for row in valid if row["kind"] in ("START", "DETAIL")]
+        summaries = [dict(row) for row in valid if row["kind"] == "SUMMARY"]
+        summary = summaries[0] if summaries else None
+        summary_payload = json.loads(summary["payload_json"]) if summary else None
+        changed = False
+
+        def ensure_event_summary():
+            nonlocal changed
+            if summary_payload["version"] == 1:
+                summary_payload["version"] = 2
+                summary_payload["starts"] = 0
+                changed = True
+
+        def add_total(count):
+            nonlocal changed
+            ensure_event_summary()
+            total = summary_payload["count"] + count
+            if total > NOTICE_SUMMARY_COUNT_LIMIT:
+                summary_payload["saturated"] = True
+            summary_payload["count"] = min(total, NOTICE_SUMMARY_COUNT_LIMIT)
+            changed = True
+
+        def add_count(outcome, count):
+            nonlocal changed
+            add_total(count)
+            previous = summary_payload["outcomes"].get(outcome, 0)
+            outcome_total = previous + count
+            if outcome_total > NOTICE_SUMMARY_COUNT_LIMIT:
+                summary_payload["saturated"] = True
+            summary_payload["outcomes"][outcome] = min(outcome_total, NOTICE_SUMMARY_COUNT_LIMIT)
+            changed = True
+
+        def add_starts(count):
+            add_total(count)
+            total = summary_payload["starts"] + count
+            if total > NOTICE_SUMMARY_COUNT_LIMIT:
+                summary_payload["saturated"] = True
+            summary_payload["starts"] = min(total, NOTICE_SUMMARY_COUNT_LIMIT)
+
+        # A failed output can release an old and a newly-created summary at the
+        # same time. They represent disjoint events and are merged losslessly
+        # (up to the documented explicit saturation bounds).
+        for extra in summaries[1:]:
+            extra_payload = json.loads(extra["payload_json"])
+            starts = extra_payload.get("starts", 0)
+            counted = starts + sum(extra_payload["outcomes"].values())
+            if starts:
+                add_starts(starts)
+            for outcome, count in extra_payload["outcomes"].items():
+                add_count(outcome, count)
+            if extra_payload["saturated"] or counted != extra_payload["count"]:
+                summary_payload["saturated"] = True
+                summary_payload["count"] = NOTICE_SUMMARY_COUNT_LIMIT
+            summary_payload["first_created"] = min(summary_payload["first_created"], extra_payload["first_created"])
+            summary_payload["last_created"] = max(summary_payload["last_created"], extra_payload["last_created"])
+            conn.execute("DELETE FROM notices WHERE seq=?", (extra["seq"],))
+
+        while len(details) > NOTICE_DETAIL_COUNT:
+            oldest = details.pop(0)
+            old_payload = json.loads(oldest["payload_json"])
+            if summary is None:
+                summary_payload = dict(
+                    version=2, kind="SUMMARY", count=1,
+                    starts=1 if oldest["kind"] == "START" else 0,
+                    outcomes={} if oldest["kind"] == "START" else {old_payload["outcome"]: 1},
+                    first_created=oldest["created"], last_created=oldest["created"],
+                    disclosure="older per-notice names and source identifiers were compacted",
+                    saturated=False,
+                )
+                summary_notice = dict(
+                    notice_id="summary-" + oldest["job_id"], profile_id=self.entry.profile_id,
+                    store_id=self.entry.store_id, generation=auth["generation"], job_id=oldest["job_id"],
+                    kind="SUMMARY", payload_json=packed(summary_payload), created=oldest["created"],
+                )
+                summary_notice["notice_seal"] = notice_seal(auth, summary_notice)
+                conn.execute(
+                    "INSERT INTO notices(notice_id,profile_id,store_id,generation,job_id,kind,payload_json,created,notice_seal) "
+                    "VALUES(?,?,?,?,?,?,?,?,?)",
+                    tuple(summary_notice[key] for key in NOTICE_FIELDS)
+                    + (summary_notice["notice_seal"],),
+                )
+                summary = summary_notice
+            else:
+                if oldest["kind"] == "START":
+                    add_starts(1)
+                else:
+                    add_count(old_payload["outcome"], 1)
+                summary_payload["first_created"] = min(summary_payload["first_created"], oldest["created"])
+                summary_payload["last_created"] = max(summary_payload["last_created"], oldest["created"])
+            conn.execute("DELETE FROM notices WHERE seq=?", (oldest["seq"],))
+        if summary is not None and changed:
+            summary["payload_json"] = packed(summary_payload)
+            summary["notice_seal"] = notice_seal(auth, summary)
+            conn.execute("UPDATE notices SET payload_json=?,notice_seal=? WHERE notice_id=?",
+                         (summary["payload_json"], summary["notice_seal"], summary["notice_id"]))
+
+    def _valid_review_start(self, auth, job):
+        return valid_review_start(auth, self.entry, job)
+
+    def _store_start_notice(self, conn, auth, job):
+        if not self._valid_review_start(auth, job):
+            return
+        notice_id = "start-" + job["job_id"]
+        if conn.execute("SELECT 1 FROM notices WHERE notice_id=?", (notice_id,)).fetchone():
+            return
+        try:
+            host = json.loads(job["host_json"])
+        except (TypeError, ValueError):
+            return
+        payload = dict(version=1, kind="START", started_at=job["review_started"],
+                       source=self._notice_source(conn, job, host))
+        notice = dict(notice_id=notice_id, profile_id=self.entry.profile_id,
+                      store_id=self.entry.store_id, generation=auth["generation"], job_id=job["job_id"],
+                      kind="START", payload_json=packed(payload), created=job["review_started"])
+        conn.execute(
+            "INSERT INTO notices(notice_id,profile_id,store_id,generation,job_id,kind,payload_json,created,notice_seal) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            tuple(notice[key] for key in NOTICE_FIELDS) + (notice_seal(auth, notice),),
+        )
+        self._compact_pending_notices(conn, auth)
+
+    def _store_notice(self, conn, auth, job, outcome, result, host):
+        payload = self._notice_payload(conn, job, outcome, result, host)
+        if payload is None or conn.execute("SELECT 1 FROM notices WHERE notice_id=?", (job["job_id"],)).fetchone():
+            return
+        notice = dict(notice_id=job["job_id"], profile_id=self.entry.profile_id,
+                      store_id=self.entry.store_id, generation=auth["generation"], job_id=job["job_id"],
+                      kind="DETAIL", payload_json=packed(payload), created=time.time())
+        conn.execute(
+            "INSERT INTO notices(notice_id,profile_id,store_id,generation,job_id,kind,payload_json,created,notice_seal) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            tuple(notice[key] for key in NOTICE_FIELDS) + (notice_seal(auth, notice),),
+        )
+        self._compact_pending_notices(conn, auth)
+
+    def _ack(self, conn, auth, job, outcome, result=None):
         try:
             host = json.loads(job["host_json"])
         except (TypeError, ValueError):
             host = {}
+        self._store_notice(conn, auth, job, outcome, result, host)
         conn.execute("UPDATE jobs SET status=?,detail=?,evidence_json='',catalog_json='',host_json='',result_json='' WHERE job_id=? AND status='RESULT'",
                      (outcome.status, outcome.detail, job["job_id"]))
         if host.get("kind") == "episode" and isinstance(host.get("episode_id"), str):
@@ -1476,6 +1958,164 @@ class Owner:
             conn.execute("DELETE FROM evidence WHERE job_id=?", (job["job_id"],))
         conn.execute("DELETE FROM jobs WHERE status NOT IN ('PREPARED','RUNNING','RESULT') AND seq NOT IN (SELECT seq FROM jobs ORDER BY seq DESC LIMIT ?)", (HISTORY_COUNT,))
 
+    @staticmethod
+    def _notice_time(value):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(value))
+
+    @classmethod
+    def _render_notice(cls, row):
+        payload = json.loads(row["payload_json"])
+        if row["kind"] == "SUMMARY":
+            if payload["version"] == 2:
+                event_counts = []
+                if payload["starts"]:
+                    event_counts.append(f"START{'>=' if payload['saturated'] else '='}{payload['starts']}")
+                event_counts.extend(
+                    f"{key}{'>=' if payload['saturated'] else '='}{payload['outcomes'][key]}"
+                    for key in sorted(payload["outcomes"])
+                )
+                counts = ", ".join(event_counts)
+                quantity = ("at least " if payload["saturated"] else "") + str(payload["count"])
+                return (f"[Skill Review] {quantity} older review events were compacted "
+                        f"({counts}; {cls._notice_time(payload['first_created'])} to "
+                        f"{cls._notice_time(payload['last_created'])}); older per-notice names and "
+                        "source identifiers were compacted. This counts lifecycle events, not distinct "
+                        "jobs or completed outcomes, and is not a named success notice.")
+            counts = ", ".join(f"{key}{'>=' if payload['saturated'] else '='}{payload['outcomes'][key]}"
+                               for key in sorted(payload["outcomes"]))
+            quantity = ("at least " if payload["saturated"] else "") + str(payload["count"])
+            return (f"[Skill Review] {quantity} older outcomes were compacted "
+                    f"({counts}; {cls._notice_time(payload['first_created'])} to "
+                    f"{cls._notice_time(payload['last_created'])}); older per-notice names and "
+                    "source identifiers were compacted. This is a summary, not a named success notice.")
+        if row["kind"] == "START":
+            result = (f"Review started. Recorded authorized local worker entry at "
+                      f"{cls._notice_time(payload['started_at'])}; this does not prove a provider request was transmitted.")
+        else:
+            outcome, action, name = payload["outcome"], payload["action"], payload["name"]
+            if outcome == "APPLIED":
+                result = ("Created" if action == "CREATE" else "Updated") + f" skill '{name}'."
+            elif outcome == "DUPLICATE":
+                result = ("Recovered the prior publication receipt for "
+                          + ("created" if action == "CREATE" else "updated") + f" skill '{name}'; no new publication was made.")
+            elif outcome == "NONE":
+                result = "Review completed with no skill change."
+            else:
+                result = f"No skill was published: {payload['reason']}."
+                if outcome == "BUDGET_REFUSED" and payload.get("version") == 2:
+                    budget = payload["budget"]
+                    result = (f"No skill was published: {payload['reason']} "
+                              f"(reason={budget['reason']}; observed={budget['observed']} {budget['unit']}; "
+                              f"limit={budget['limit']} {budget['unit']}; provider requests=0).")
+        source = payload["source"]
+        identifiers = []
+        if source["session_ids"]:
+            identifiers.append("sessions=" + ",".join(source["session_ids"]))
+        if source["task_ids"]:
+            identifiers.append("tasks=" + ",".join(source["task_ids"]))
+        if source["episode_id"]:
+            identifiers.append(f"episode={source['episode_id']} revision={source['revision']}")
+        if source["identifiers_truncated"]:
+            identifiers.append("identifier list truncated")
+        attribution = "; ".join(identifiers) or "no valid source labels"
+        episode_scope = source["scope"] in ("selected episode revision", "bound episode source set")
+        display_scope = "bound episode source set" if episode_scope else source["scope"]
+        count_label = "bound source record(s)" if episode_scope else "source turn(s)"
+        return (f"[Skill Review] {result} Source scope: {display_scope} "
+                f"({source['source_count']} {count_label}, {source['task_count']} task(s), "
+                f"{source['session_count']} session(s); {attribution}; "
+                f"{cls._notice_time(source['first_created'])} to {cls._notice_time(source['last_created'])}). "
+                f"Review job {row['job_id']}.")
+
+    def _ack_delivered(self, auth, delivery_id, delivered):
+        with gate(self.entry):
+            current = read_auth(self.roster, self.entry)
+            if (not self._authorized(current) or current["generation"] != auth["generation"]
+                    or current["secret"] != auth["secret"]):
+                return False
+            with closing(connect(self.entry)) as conn, conn:
+                claimed = conn.execute(
+                    "SELECT count(*) FROM notices WHERE generation=? AND delivered IS NULL AND delivery_id=?",
+                    (auth["generation"], delivery_id),
+                ).fetchone()[0]
+                if claimed != len(delivered):
+                    return False
+                now = time.time()
+                conn.execute(
+                    "UPDATE notices SET delivered=?,delivery_id=NULL "
+                    "WHERE generation=? AND delivered IS NULL AND delivery_id=?",
+                    (now, auth["generation"], delivery_id),
+                )
+                conn.execute(
+                    "DELETE FROM notices WHERE delivered IS NOT NULL AND seq NOT IN "
+                    "(SELECT seq FROM notices WHERE delivered IS NOT NULL ORDER BY seq DESC LIMIT ?)",
+                    (NOTICE_HISTORY_COUNT,),
+                )
+            return True
+
+    def _release_delivery(self, auth, delivery_id):
+        """Make a failed output attempt retryable without touching another generation."""
+        with gate(self.entry):
+            current = read_auth(self.roster, self.entry)
+            if (not self._authorized(current) or current["generation"] != auth["generation"]
+                    or current["secret"] != auth["secret"]):
+                return
+            with closing(connect(self.entry)) as conn, conn:
+                conn.execute(
+                    "UPDATE notices SET delivery_id=NULL "
+                    "WHERE generation=? AND delivered IS NULL AND delivery_id=?",
+                    (auth["generation"], delivery_id),
+                )
+                self._compact_pending_notices(conn, auth)
+
+    def deliver_notices(self, stream=None):
+        """Print pending notices only at a caller-selected terminal-safe boundary."""
+        stream = sys.stdout if stream is None else stream
+        with self._delivery_lock:
+            if not self.enabled or self.closed:
+                return 0
+            delivery_id = uuid.uuid4().hex
+            with gate(self.entry):
+                auth = read_auth(self.roster, self.entry)
+                if not self._authorized(auth):
+                    return 0
+                with closing(connect(self.entry)) as conn, conn:
+                    # Recover an interrupted attempt in this sole owner before
+                    # claiming the next bounded output snapshot.
+                    conn.execute(
+                        "UPDATE notices SET delivery_id=NULL WHERE generation=? AND delivered IS NULL",
+                        (auth["generation"],),
+                    )
+                    self._compact_pending_notices(conn, auth)
+                    pending = conn.execute(
+                        "SELECT * FROM notices WHERE generation=? AND delivered IS NULL ORDER BY created,seq",
+                        (auth["generation"],),
+                    ).fetchall()
+                    valid = []
+                    for row in pending:
+                        if self._valid_notice(auth, row):
+                            valid.append(dict(row))
+                        else:
+                            conn.execute("UPDATE notices SET delivered=-1 WHERE seq=?", (row["seq"],))
+                    for row in valid:
+                        conn.execute(
+                            "UPDATE notices SET delivery_id=? WHERE seq=? AND generation=? "
+                            "AND delivered IS NULL AND delivery_id IS NULL AND notice_seal=?",
+                            (delivery_id, row["seq"], auth["generation"], row["notice_seal"]),
+                        )
+            if not valid:
+                return 0
+            rendered = "".join(self._render_notice(row) + "\n" for row in valid)
+            acknowledged = False
+            try:
+                stream.write(rendered)
+                stream.flush()
+                acknowledged = self._ack_delivered(auth, delivery_id, valid)
+                return len(valid) if acknowledged else 0
+            finally:
+                if not acknowledged:
+                    self._release_delivery(auth, delivery_id)
+
     def pump(self):
         if not self.enabled or self.closed:
             return
@@ -1497,6 +2137,15 @@ class Owner:
                 now = time.time()
                 conn.execute("UPDATE episodes SET state='READY',ready_at=? WHERE generation=? AND state='ELIGIBLE' AND updated<=?",
                              (now, auth["generation"], now - IDLE_SECONDS))
+                # Convert only verified service-recorded starts. This precedes
+                # final handling so a fast RUNNING -> RESULT transition still
+                # yields the lifecycle events in chronological order.
+                for row in conn.execute(
+                        "SELECT * FROM jobs WHERE generation=? AND status IN ('RUNNING','RESULT') "
+                        "AND review_start_seal IS NOT NULL ORDER BY seq",
+                        (auth["generation"],)).fetchall():
+                    with diagnostic_stage("owner.delivery", job_id=row["job_id"]):
+                        self._store_start_notice(conn, auth, dict(row))
                 for row in conn.execute("SELECT * FROM jobs WHERE status='RESULT' ORDER BY seq").fetchall():
                     job = dict(row)
                     with diagnostic_stage("owner.delivery", job_id=job["job_id"]):
@@ -1534,7 +2183,7 @@ class Owner:
                                 outcome = Publication(outcome.status, "stage=owner.publication outcome=" + outcome.status
                                                       + "; publication refused; check catalog eligibility and local storage; exception detail unavailable.")
                     with diagnostic_stage("owner.acknowledgement", job_id=job["job_id"], sqlite_busy_timeout_s=BUSY_SECONDS):
-                        self._ack(conn, job, outcome, result)
+                        self._ack(conn, auth, job, outcome, result)
                 if conn.execute("SELECT 1 FROM jobs WHERE status IN ('PREPARED','RUNNING','RESULT') LIMIT 1").fetchone():
                     return
                 episode = conn.execute("SELECT * FROM episodes WHERE generation=? AND state='READY' ORDER BY coalesce(ready_at,created),seq LIMIT 1",
@@ -1598,31 +2247,32 @@ class Owner:
             self._wake.wait(.1)
 
     def close(self):
-        if self.closed:
-            return
-        if self.enabled:
-            try:
-                self.flush_session()
-                self.pump()
-            except (OSError, ValueError, sqlite3.Error, TimeoutError):
-                pass
-        with gate(self.entry):
-            diagnostics_allowed = self.enabled
-            self.closed = True
-            self.enabled = False
-            try:
-                auth = read_auth(self.roster, self.entry)
-                if auth and auth.get("owner_id") == self.owner_id:
-                    auth["owner_id"] = None  # Disconnect preserves generation/results.
-                    write_auth(self.roster, self.entry, auth)
-            except (OSError, ValueError) as exc:
-                if diagnostics_allowed:
-                    self.last_error = "historical " + error_detail("owner.disconnect", exc, profile_id=self.entry.profile_id) + "; disconnect metadata was not updated; check host coordination storage."
-        self._stop.set()
-        self._wake.set()
-        if self._thread:
-            self._thread.join(.25)
-        self._owner_lock.__exit__(None, None, None)
+        with self._delivery_lock:
+            if self.closed:
+                return
+            if self.enabled:
+                try:
+                    self.flush_session()
+                    self.pump()
+                except (OSError, ValueError, sqlite3.Error, TimeoutError):
+                    pass
+            with gate(self.entry):
+                diagnostics_allowed = self.enabled
+                self.closed = True
+                self.enabled = False
+                try:
+                    auth = read_auth(self.roster, self.entry)
+                    if auth and auth.get("owner_id") == self.owner_id:
+                        auth["owner_id"] = None  # Disconnect preserves generation/results.
+                        write_auth(self.roster, self.entry, auth)
+                except (OSError, ValueError) as exc:
+                    if diagnostics_allowed:
+                        self.last_error = "historical " + error_detail("owner.disconnect", exc, profile_id=self.entry.profile_id) + "; disconnect metadata was not updated; check host coordination storage."
+            self._stop.set()
+            self._wake.set()
+            if self._thread:
+                self._thread.join(.25)
+            self._owner_lock.__exit__(None, None, None)
 
 
 class ReviewService:
@@ -1801,6 +2451,41 @@ class ReviewService:
             raise BudgetRefusal("prepared_bytes", prepared_bytes, 128 * 1024)
         return request
 
+    def _record_review_start(self, entry, job, auth):
+        """Persist the first authorized worker entry when the owner added capability."""
+        with diagnostic_stage("worker.start", job_id=job["job_id"], sqlite_busy_timeout_s=BUSY_SECONDS), \
+                closing(connect(entry)) as conn, conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(jobs)")}
+            required = {"review_started", "review_start_generation", "review_start_seal"}
+            if not required <= columns:
+                # An older owner has not authorized this additive capability.
+                # Continue the established final-only mailbox protocol.
+                return True
+            current_row = conn.execute("SELECT * FROM jobs WHERE job_id=?", (job["job_id"],)).fetchone()
+            if not current_row:
+                return False
+            current = dict(current_row)
+            if (not valid_job(auth, entry, current) or current["status"] != "RUNNING"
+                    or current["service_generation"] != self.generation
+                    or current["input_seal"] != job["input_seal"]):
+                return False
+            if current["review_start_seal"] is not None:
+                return valid_review_start(auth, entry, current)
+            current["review_started"] = time.time()
+            current["review_start_generation"] = self.generation
+            current["review_start_seal"] = review_start_seal(auth, current)
+            changed = conn.execute(
+                "UPDATE jobs SET review_started=?,review_start_generation=?,review_start_seal=? "
+                "WHERE job_id=? AND status='RUNNING' AND service_generation=? AND input_seal=? "
+                "AND review_start_seal IS NULL",
+                (current["review_started"], current["review_start_generation"], current["review_start_seal"],
+                 job["job_id"], self.generation, job["input_seal"]),
+            ).rowcount
+            if changed:
+                return True
+            reread = conn.execute("SELECT * FROM jobs WHERE job_id=?", (job["job_id"],)).fetchone()
+            return bool(reread and valid_review_start(auth, entry, dict(reread)))
+
     def _infer(self, entry, job, provider, trusted_provider=False):
         # Start authorization is rechecked in the worker, after scheduling.
         with diagnostic_gate(entry, "worker.authorization", job_id=job["job_id"]):
@@ -1808,6 +2493,8 @@ class ReviewService:
                 auth = read_auth(self.roster, entry)
                 if self.stop_event.is_set() or not valid_job(auth, entry, job):
                     return None
+            if not self._record_review_start(entry, job, auth):
+                return None
         def failure(stage, status, exc, *, trusted_review_context=False):
             detail = error_detail(stage, exc, profile_id=entry.profile_id, job_id=job["job_id"],
                                   use_context=False,
@@ -1818,7 +2505,12 @@ class ReviewService:
             host = json.loads(job["host_json"])
             request = self._episode_request(entry, job) if host.get("kind") == "episode" else request_json(self.roster, job)
         except BudgetRefusal as exc:
-            return dict(status="BUDGET_REFUSED", detail=exc.detail())
+            result = dict(status="BUDGET_REFUSED",
+                          detail=exc.detail(profile_id=entry.profile_id, job_id=job["job_id"]))
+            diagnostic = exc.diagnostic()
+            if diagnostic is not None:
+                result["budget"] = diagnostic
+            return result
         except (OSError, sqlite3.Error, TimeoutError, MailboxCapacityError) as exc:
             raise DiagnosticFailure("service.preparation", exc, job["job_id"], sqlite_busy_timeout_s=BUSY_SECONDS) from None
         except ValueError as exc:
@@ -1851,7 +2543,7 @@ class ReviewService:
                 auth = read_auth(self.roster, entry)
                 if self.stop_event.is_set() or not valid_job(auth, entry, job):
                     return
-                if result["status"] in ("FAILED", "INVALID"):
+                if result["status"] in ("FAILED", "INVALID", "BUDGET_REFUSED"):
                     self._record(diagnostic_id(entry.profile_id), result["detail"])
                 job["result_json"] = packed(result)
                 result_id = result_seal(auth, job)

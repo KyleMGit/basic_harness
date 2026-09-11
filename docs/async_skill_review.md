@@ -104,6 +104,127 @@ them. An owner lifecycle should be opened/closed on its process's main thread.
 Live refresh recovers interrupted attempts from previous service generations,
 including late-discovered queues, without resetting current in-flight work.
 
+## Asynchronous review lifecycle notices
+
+The owner background thread never prints. An authorized service worker records
+the first actual worker entry on the existing mailbox job, after claim and a
+fresh profile/store/generation/input-seal authorization check and before local
+request preparation. Capture, eligibility, queue preparation, claim, and
+executor dispatch alone do not record a start. The signed marker contains only
+the job/profile/store/generation binding, first-start time, service generation,
+and input seal; the service never writes the owner's private `notices` table or
+publishes a skill. `[Skill Review] Review started.` therefore means authorized
+local review processing began. It does **not** prove that a provider request was
+transmitted, and local preparation or budget refusal can legitimately follow it.
+
+The authorized owner validates that marker and converts it to a sealed private
+outbox event while its bound source metadata is still available. It does this
+for both RUNNING and RESULT jobs, so a fast transition cannot hide the start and
+start is ordered before the final event. The marker is stable once per job:
+routine owner pumps, same-generation reconnects, and recovery under a later
+service generation do not create another start. Older jobs without a trustworthy
+marker receive no inferred historical start. An older owner schema without the
+marker columns continues its established final-only service protocol; only a
+writable authorized owner adds the columns.
+
+After the owner validates a sealed final result and, where applicable, the
+canonical Markdown publication commits, it adds a sealed host-generated final
+event in the same transaction that acknowledges the review job and consumes its
+bound sources. Lifecycle events contain only an allowlisted outcome, committed
+host name for CREATE/UPDATE, bounded opaque source labels/counts/times, start
+time, job/episode/revision metadata as applicable. They never retain SQL, task
+text, evidence, proposal instructions, arbitrary provider/exception detail, or
+a raw proposal body.
+
+The CLI main thread drains that outbox only at terminal-safe boundaries: startup
+and immediately before the next prompt; after `input()` returns and before a new
+response or command result; after a foreground response and synchronous memory
+reflection finish; and during orderly shutdown when practical. A lifecycle event
+arriving while the terminal is idle or partially typed therefore waits for
+submission. An event arriving during streaming, model work, tool output, or a
+terminal approval prompt waits for the corresponding safe boundary. There is no terminal
+repaint dependency. Notices are not model messages, instructions, evidence, or
+session history and cause no model call.
+
+Representative output is:
+
+```text
+[Skill Review] Review started. Recorded authorized local worker entry at 2026-09-10T12:02:00Z; this does not prove a provider request was transmitted. Source scope: selected legacy batch (...). Review job <opaque-job-id>.
+[Skill Review] Created skill 'learned_workflow'. Source scope: selected legacy batch (2 source turn(s), 2 task(s), 2 session(s); sessions=older-a,older-b; tasks=task-a,task-b; 2026-09-10T12:00:00Z to 2026-09-10T12:01:00Z). Review job <opaque-job-id>.
+[Skill Review] Updated skill 'existing'. Source scope: bound episode source set (2 bound source record(s), 2 task(s), 1 session(s); sessions=session-a; tasks=task-a,task-b; episode=<opaque-episode-id> revision=2; 2026-09-10T12:00:00Z to 2026-09-10T12:01:00Z). Review job <opaque-job-id>.
+[Skill Review] Review completed with no skill change. Source scope: selected legacy batch (...).
+[Skill Review] Recovered the prior publication receipt for created skill 'recovered'; no new publication was made. Source scope: selected legacy batch (...).
+[Skill Review] No skill was published: the review or publication attempt failed. Source scope: selected legacy batch (...).
+```
+
+CREATE/UPDATE success is emitted only for `APPLIED`; UPDATE names come from the
+host-held target rather than model text. A canonical Markdown commit followed by
+an optional cache failure is still `APPLIED`. `DUPLICATE` means an authoritative
+receipt proves an earlier publication (even if a later canonical update or
+deletion retained that receipt), so its wording says recovered rather than newly
+published. `NONE` is emitted only for a valid `{"action":"NONE"}` result.
+`BUDGET_REFUSED`, `INVALID`, `FAILED`, `STALE`, `COLLISION`, and `CANCELLED`
+use compact allowlisted failure wording and are never described as NONE or
+success. `SKIPPED`, `ELIGIBLE`, and admission `ACCEPTED` are not final outcomes.
+For a newly generated `BUDGET_REFUSED`, the service stderr diagnostic and durable
+owner notice also report an allowlisted reason, exact observed/limit integers,
+the correct `bytes`, `messages`, or `sources` unit, and zero provider requests.
+The only reason keys are `episode_sources`, `carry_anchor_bytes`, `missing_context`,
+`selected_messages`, `selected_view_bytes`, and `prepared_bytes`; notably,
+`episode_sources` is a source count, not a token or byte count. Unknown, malformed,
+legacy, or out-of-range diagnostic data is discarded and the existing generic
+failure wording remains deliverable. Raw result detail, task text, paths, SQL,
+business data, exception text, and model output are never copied into a notice.
+`SUPERSEDED` remains quiet as a final outcome because it is an internal revision
+replacement; an already-recorded start remains truthful and can appear without
+a fabricated completion, while the fresh revision can later produce its own
+start and final events. Disable/revoke may likewise leave a previously delivered
+start without a final, but revocation acknowledgement permits no later marker
+conversion, delivery, migration, or replay from the invalidated generation.
+
+Episode attribution counts the source records bound to the reviewed revision,
+not the smaller evidence subset the service may select to fit its review view.
+It therefore distinguishes the older/batched owner work without claiming every
+bound turn was included in the provider request.
+
+Output is written and flushed before its rows are durably marked delivered. A
+write/flush failure retains all selected rows. A crash after bytes are printed
+but before acknowledgement can repeat them; the acknowledgement proves only
+successful local output/flush, not that a human saw the bytes. Successful
+acknowledgement suppresses ordinary duplicates. Pending rows survive job-history
+pruning, source consumption, normal disconnect, and same-generation reconnect,
+including reconnect from a different session. A disable/revoke is ordered after
+any already-started foreground drain, and no later drain, migration, retention
+write, or acknowledgement occurs after the mode acknowledgement. Reenable uses a
+new generation and does not replay invalidated rows.
+
+Outside an active terminal-output claim, at most 24 detailed lifecycle events
+(starts plus finals) and one summary remain pending. On further disconnected
+work, the oldest details are atomically replaced by that durable summary
+containing only a start count, distinct allowlisted final-outcome counts, and a
+time span. The summary total is explicitly a count of review events, not final
+outcomes or distinct jobs; FAILED and NONE remain separate final counts. A drain
+claims one such bounded set before printing; work that finishes during output
+enters a separate independently capped pending set.
+The claimed and new sets can therefore coexist until successful acknowledgement,
+or until failure/crash recovery releases and recompacts the claim. The summary
+explicitly says older names and source identifiers were compacted, that it
+counts lifecycle events rather than jobs/completions, and that it is not a named
+success notice. After that summary is delivered, a later overflow creates a new
+summary cycle. The most
+recent 32 delivered/invalid rows are retained for bounded diagnostics. Thus full
+named per-event retention across unbounded disconnection is intentionally
+impossible, but eviction is never silent. Summary totals and per-outcome counters
+saturate at 1,000,000 and then render as explicit `at least`/`>=` lower bounds
+instead of overflowing or implying an exact count. The two bounded active sets,
+summaries, and history fit inside the existing 512-KiB mailbox headroom; the 8-MiB
+live evidence/result budget, review caps, and 16-MiB SQLite page ceiling are
+unchanged. Invalid identities, fields, bounds, payloads, marker seals, or notice
+seals are quarantined without rendering or coalescing. Existing episode and
+pre-episode mailboxes gain the outbox table and start-marker columns additively
+only while an authorized owner is writable; terminal history with already-cleared
+bodies is not backfilled.
+
 ## Static compatibility and switching configurations
 
 `python skill_review.py run --roster PATH` remains a static allowlist. It never
@@ -150,8 +271,9 @@ purges canceled queue generations; changing modes cannot revive old work/results
 Switching back also requires revocation of the currently selected authority.
 
 This release adds owner-created `episodes`, `episode_sources`, bounded
-fingerprint tables, and additive anchor/association/whole-unit-retirement columns on `episodes` without
-rewriting legacy `evidence`/`jobs`. Existing accepted
+fingerprint/outbox tables, additive anchor/association/whole-unit-retirement
+columns on `episodes`, and nullable signed first-start columns on `jobs` without
+rewriting legacy evidence or reconstructing starts. Existing accepted
 legacy jobs keep their processing and acknowledgement contract and are not
 retrospectively gated or re-captured from history. Schema initialization occurs
 only when an authorized writable owner enables learning; read-only/status/service
@@ -244,6 +366,18 @@ future anchor is omitted whole and replaced by a bounded `missing_context` recor
 If a later revision needs that absent original context, preparation ends with an
 explicit `BUDGET_REFUSED` and zero provider calls rather than sending a truncation.
 
+This example was generated by a synthetic local test execution against a temporary
+mailbox; it is **not the user's live job**. Opaque IDs and timestamps are omitted:
+
+```text
+Skill review: historical stage=service.preparation reason=selected_view_bytes profile=user-0 job=<synthetic-job-id> observed_bytes=205833 limit_bytes=65536; outcome=BUDGET_REFUSED; zero provider requests; accepted source references await owner acknowledgement.
+[Skill Review] No skill was published: the bounded review request was refused before a provider call (reason=selected_view_bytes; observed=205833 bytes; limit=65536 bytes; provider requests=0). Source scope: bound episode source set (...). Review job <synthetic-job-id>.
+```
+
+The synthetic provider-call counter was `0`. These diagnostics do not change any
+budget, token cap, timeout, eligibility/selection, retention, retry, or source
+acknowledgement behavior.
+
 When a DRAFT episode reaches its byte/message limit, the owner may retire oldest
 optional routine turns as complete units. It preserves the original turn, failures,
 metadata, corrections, verified non-routine support, and every job-bound source.
@@ -272,6 +406,8 @@ so same-generation reconnect keeps its challenge freshness fence and pending wor
 | Model result | At most 24 KiB and the configured token cap |
 | Private mailbox | 16-MiB SQLite page ceiling; DELETE rollback journal and per-connection journal-size limit |
 | Terminal job history | Last 32 metadata outcomes; task/catalog/result bodies cleared at acknowledgement |
+| Active review notices | One claimed and one pending set, each capped at 24 detailed lifecycle-event rows (starts plus finals) plus one explicit overflow summary; no evidence/proposal bodies |
+| Delivered notice history | Last 32 delivered/invalid rows; independent of terminal job pruning |
 
 Capture is incremental at task/message boundaries before context compaction, not
 a copy of the current session transcript at completion. It omits system prompts
@@ -367,7 +503,7 @@ Skill review: historical stage=result.persistence error=TimeoutError profile=use
 | --- | --- |
 | `pending.scan` / `pending.recovery` | Scanning or recovery was interrupted. Admitted work remains. `run` automatically tries again on a future loop; `once` promises no future run. Check local coordination/storage if repeated. |
 | `claim` | Claiming the prepared job was interrupted. The same future-loop guidance applies; a lock timeout is local coordination, not a model timeout. |
-| `worker.authorization` / `worker.dispatch` | A claimed RUNNING attempt was interrupted before inference. There is no active retry for that attempt. Resolve the local fault, stop the service, and restart it after its workers exit. |
+| `worker.authorization` / `worker.start` / `worker.dispatch` | A claimed RUNNING attempt was interrupted before inference. `worker.start` is the signed first-entry persistence seam before local preparation. There is no active retry for that attempt. Resolve the local fault, stop the service, and restart it after its workers exit. |
 | `provider.inference` | The provider call failed, including SDK `APITimeoutError` and HTTP status errors. The configured provider timeout is shown. The host SDK adapter reports only its known request/response observations; a persisted FAILED result is acknowledged by the owner and consumes that batch, and is not NONE. |
 | `provider.validation` / `provider.inference_validation` | Output was rejected. The latter covers the host adapter that performs inference and validation together. Fixed reasons distinguish `prepared_input_invalid`, `prepared_input_oversized`, `wire_body_oversized`, `no_choices`, `non_stop_finish`, `missing_or_nontext_output`, `output_invalid_encoding`, `output_oversized`, `malformed_json`, `duplicate_fields`, `proposal_not_object`, `invalid_action_or_fields`, `incomplete_complete_flag`, `empty_fields`, `invalid_name`, `invalid_description`, `incomplete_instructions`, and `safety_rejection`. The existing INVALID/FAILED outcomes remain. |
 | `result.persistence` | The result could not be durably recorded. A RUNNING attempt may remain even after later scans succeed. Resolve the local fault and restart the service; those scans do not retry this attempt. |
@@ -415,8 +551,7 @@ historical label, local stage, safe exception class, profile and any available j
 ID. It is **not delivered to chat** and is not exposed by service `status`. When a
 publication method returns a failure without an exception object, terminal job
 metadata records the publication stage/outcome and says exception detail is
-unavailable. No class is reconstructed from arbitrary returned text. Successful
-CREATE/UPDATE/NONE chat notifications remain outside this implementation.
+unavailable. No class is reconstructed from arbitrary returned text.
 
 Diagnostics omit evidence, provider bodies/headers, credentials, SQL, full paths
 and traceback bodies. Known exception classes are allowlisted; custom classes use
@@ -535,6 +670,7 @@ means the service will not start/persist their work.
 | One service, bounded pool, shutdown/restart | Singleton tests plus real public subprocess owner/service HTTP integration in `test_skill_review_process.py` |
 | Automatic discovery and live additions | `test_profile_discovery.py` and `test_profile_discovery_process.py`; real local HTTP and owner/service subprocesses, same PID across additions, empty/missing root, redaction, separate workspaces, blocked inference and revocation |
 | Host publication and crash recovery | `test_skill_publication.py`; collisions, eligible full targets, revisions, nested paths, imported JSON, cache interruption, tombstones/duplicate UPDATE |
+| Host lifecycle notices and safe terminal delivery | `test_skill_review_notices.py` and real subprocess cases in `test_skill_review_process.py`; authorized worker starts, final outcomes, source scope, seals, recovery/reconnect, print/ack crash windows, mode races, event overflow summaries, partial input, foreground responses and permission prompts |
 | Confinement | Actual Windows junction test; symlink creation test skips if the host lacks that privilege |
 | Scale scope | 100 private profiles scheduled using deterministic local callbacks; no claim of 100 real simultaneous model requests or production load benchmark |
 | Existing behavior | Prior safety/profile/workspace/compaction assertions retained; synchronous extractor tests ported to snapshot/owner contracts, old two-file rollback expectation replaced by before-commit preservation plus after-commit cache recovery |
