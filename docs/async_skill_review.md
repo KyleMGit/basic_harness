@@ -111,7 +111,9 @@ including late-discovered queues, without resetting current in-flight work.
 
 ## Asynchronous review lifecycle notices
 
-The owner background thread never prints. An authorized service worker records
+The owner background thread never prints. When the owner durably prepares each
+new job, it records a `REQUEST` terminal event and a private lifecycle-log event.
+This means requested/queued, not worker start or provider transmission. An authorized service worker records
 the first actual worker entry on the existing mailbox job, after claim and a
 fresh profile/store/generation/input-seal authorization check and before local
 request preparation. Capture, eligibility, queue preparation, claim, and
@@ -154,13 +156,48 @@ session history and cause no model call.
 Representative output is:
 
 ```text
-[Skill Review] Review started. Recorded authorized local worker entry at 2026-09-10T12:02:00Z; this does not prove a provider request was transmitted. Source scope: selected legacy batch (...). Review job <opaque-job-id>.
-[Skill Review] Created skill 'learned_workflow'. Source scope: selected legacy batch (2 source turn(s), 2 task(s), 2 session(s); sessions=older-a,older-b; tasks=task-a,task-b; 2026-09-10T12:00:00Z to 2026-09-10T12:01:00Z). Review job <opaque-job-id>.
-[Skill Review] Updated skill 'existing'. Source scope: bound episode source set (2 bound source record(s), 2 task(s), 1 session(s); sessions=session-a; tasks=task-a,task-b; episode=<opaque-episode-id> revision=2; 2026-09-10T12:00:00Z to 2026-09-10T12:01:00Z). Review job <opaque-job-id>.
-[Skill Review] Review completed with no skill change. Source scope: selected legacy batch (...).
+[Skill Review] Review requested. Review queued for an authorized local worker. Source scope: selected legacy batch (...). Review job <opaque-job-id>.
+[Skill Review] Review started. Recorded authorized local worker entry at 2026-09-10T12:02:00Z; this does not prove a provider request was transmitted. Reason: authorized local worker entered review; provider transmission is not proven. Source scope: selected legacy batch (...). Review job <opaque-job-id>.
+[Skill Review] Created skill 'learned_workflow'. Reason: explanation unavailable. Source scope: selected legacy batch (...). Review job <opaque-job-id>.
+[Skill Review] Updated skill 'existing'. Reason: explanation unavailable. Source scope: bound episode source set (2 bound source record(s), 2 task(s), 1 session(s); sessions=session-a; tasks=task-a,task-b; episode=<opaque-episode-id> revision=2; 2026-09-10T12:00:00Z to 2026-09-10T12:01:00Z). Review job <opaque-job-id>.
+[Skill Review] Review completed with no skill change. Reason: explanation unavailable. Source scope: selected legacy batch (...). Review job <opaque-job-id>.
 [Skill Review] Recovered the prior publication receipt for created skill 'recovered'; no new publication was made. Source scope: selected legacy batch (...).
 [Skill Review] No skill was published: the review or publication attempt failed. Source scope: selected legacy batch (...).
 ```
+
+The same unabridged per-review lifecycle is appended to
+`<owning-profile-root>/logs/skill_reviews.jsonl`, never to a workspace or shared
+root. Each UTF-8 JSON line has exactly `timestamp` (UTC ISO-8601), stable
+`event_id` (`<review-id>:requested|started|decision`), `review_id`, `event`
+(`REQUESTED`, `STARTED`, or `DECISION`), `action` (empty for lifecycle markers;
+otherwise `CREATE`, `UPDATE`, or the allowlisted non-publication decision),
+`skill_name` (empty unless applicable), `status`, and a concise host-allowlisted
+`reason`. CREATE, UPDATE, and NONE use
+`explanation unavailable` because the reviewer protocol supplies no decision
+explanation. The log never contains evidence, prompts, SQL, business rows,
+proposal instructions, provider bodies, exception bodies, or model reasoning.
+`--quiet-skill-reviews` suppresses terminal rendering only; JSONL appends continue.
+
+Pending JSONL events live durably in the owning profile mailbox and are flushed
+by the owner pump without requiring a foreground terminal drain. A write or
+flush failure leaves them pending, records a fixed `append_<safe exception class>` state and a
+safe `owner.review_log` diagnostic, and retries on a later pump or same-generation
+reconnect. Prolonged storage failures retain pending rows, subject to the unchanged
+finite mailbox/disk budget, and require operator repair. Reconciliation scans
+existing stable event IDs before appending, so
+ordinary retry/reconnect does not duplicate lines. The file is flushed and
+`fsync`ed before mailbox acknowledgement. A crash between that fsync and the
+mailbox update is reconciled only when the complete existing record exactly
+matches the signed pending record; an ID collision with different content and
+any malformed/partial existing line fail closed. Pending rows are bound to the
+profile, store, generation, and job and authenticated with the profile secret.
+Their exact bounded schema is checked before file I/O. Invalid or legacy-unsealed
+rows are quarantined with their payload erased and a fixed diagnostic; they are
+never copied to the log. Successfully appended receipts are pruned to the newest
+32 rows, independently of the append-only JSONL, while pending retries are never
+pruned. Thus a lost or externally damaged JSONL cannot be reconstructed from old
+receipts. No stronger cross-filesystem exactly-once claim is made. Terminal
+compaction never removes JSONL history, and historical jobs are not backfilled.
 
 CREATE/UPDATE success is emitted only for `APPLIED`; UPDATE names come from the
 host-held target rather than model text. A canonical Markdown commit followed by
@@ -204,9 +241,9 @@ write, or acknowledgement occurs after the mode acknowledgement. Reenable uses a
 new generation and does not replay invalidated rows.
 
 Outside an active terminal-output claim, at most 24 detailed lifecycle events
-(starts plus finals) and one summary remain pending. On further disconnected
+(requests, starts, and finals) and one summary remain pending. On further disconnected
 work, the oldest details are atomically replaced by that durable summary
-containing only a start count, distinct allowlisted final-outcome counts, and a
+containing only request/start counts, distinct allowlisted final-outcome counts, and a
 time span. The summary total is explicitly a count of review events, not final
 outcomes or distinct jobs; FAILED and NONE remain separate final counts. A drain
 claims one such bounded set before printing; work that finishes during output
@@ -360,6 +397,8 @@ post-dispatch turn containing a new failure, metadata finding, verified non-rout
 execution, or correction is retained unbound as a later revision. Acknowledgement
 consumes only sources bound to the frozen job, then promotes those deferred sources;
 stale/superseded bindings are cleared without publishing or reviving the old result.
+Superseded or authorization-revoked jobs can therefore stop at `REQUESTED` or
+`STARTED`; no final decision is invented for them.
 
 After acknowledgment, the owner retains only the original user request as a
 separately labelled `context_only` anchor (plus a bounded related-skill association),
@@ -564,7 +603,8 @@ and traceback bodies. Known exception classes are allowlisted; custom classes us
 a safe base class. Invalid or oversized profile/job identifiers become `<invalid>`;
 discovery child labels are bounded and restricted to safe ASCII. Diagnostic data
 uses the existing console, in-memory error and authorized terminal-job metadata
-paths. No file logger or post-revocation profile diagnostic writes are added.
+paths. The lifecycle JSONL described above is the sole added file log; no raw
+diagnostic file logger or post-revocation profile diagnostic writes are added.
 
 ## Authorization and publication
 

@@ -934,6 +934,8 @@ def connect(entry, readonly=False, *, create=False):
 JOB_FIELDS = ("job_id", "profile_id", "store_id", "generation", "evidence_json", "catalog_json", "host_json")
 NOTICE_FIELDS = ("notice_id", "profile_id", "store_id", "generation", "job_id", "kind",
                  "payload_json", "created")
+REVIEW_LOG_FIELDS = ("event_id", "profile_id", "store_id", "generation", "job_id",
+                     "payload_json", "created")
 START_FIELDS = ("job_id", "profile_id", "store_id", "generation", "input_seal",
                 "review_started", "review_start_generation")
 NOTICE_OUTCOMES = frozenset(("APPLIED", "NONE", "DUPLICATE", "BUDGET_REFUSED", "INVALID",
@@ -946,6 +948,18 @@ NOTICE_REASONS = {
     "COLLISION": "the proposed skill name already exists",
     "CANCELLED": "profile writes were disabled before publication",
 }
+REVIEW_LOG_REASONS = {
+    "REQUESTED": "review queued for an authorized local worker",
+    "STARTED": "authorized local worker entered review; provider transmission is not proven",
+    **NOTICE_REASONS,
+}
+EXPLANATION_UNAVAILABLE = "explanation unavailable"
+# _notice_name can emit 256 display columns plus one escaped control sequence
+# and the ellipsis already permitted by the terminal contract.
+REVIEW_LOG_NAME_CHARS = 266
+# packed() uses ensure_ascii JSON; 4 KiB covers that full rendered-name contract,
+# including a worst-case non-BMP escape expansion, plus the fixed event envelope.
+REVIEW_LOG_PAYLOAD_BYTES = 4 * 1024
 
 
 def seal(auth, value):
@@ -967,6 +981,10 @@ def review_start_seal(auth, job):
 
 def notice_seal(auth, notice):
     return seal(auth, {key: notice[key] for key in NOTICE_FIELDS})
+
+
+def review_log_seal(auth, event):
+    return seal(auth, {key: event[key] for key in REVIEW_LOG_FIELDS})
 
 
 def valid_job(auth, entry, job):
@@ -1057,6 +1075,11 @@ class Owner:
                     seq INTEGER PRIMARY KEY AUTOINCREMENT, notice_id TEXT UNIQUE, profile_id TEXT,
                     store_id TEXT, generation TEXT, job_id TEXT, kind TEXT, payload_json TEXT,
                     notice_seal TEXT, created REAL, delivered REAL, delivery_id TEXT);
+                CREATE TABLE IF NOT EXISTS review_log_events (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT UNIQUE, profile_id TEXT,
+                    store_id TEXT, generation TEXT, job_id TEXT, payload_json TEXT,
+                    event_seal TEXT, created REAL, appended REAL,
+                    attempts INTEGER NOT NULL DEFAULT 0, last_failure TEXT);
             """)
             episode_columns = {row[1] for row in conn.execute("PRAGMA table_info(episodes)")}
             additions = {
@@ -1084,6 +1107,10 @@ class Owner:
             notice_columns = {row[1] for row in conn.execute("PRAGMA table_info(notices)")}
             if "delivery_id" not in notice_columns:
                 conn.execute("ALTER TABLE notices ADD COLUMN delivery_id TEXT")
+            log_columns = {row[1] for row in conn.execute("PRAGMA table_info(review_log_events)")}
+            for name in ("profile_id", "store_id", "event_seal"):
+                if name not in log_columns:
+                    conn.execute(f"ALTER TABLE review_log_events ADD COLUMN {name} TEXT")
             page_size = conn.execute("PRAGMA page_size").fetchone()[0]
             page_count = conn.execute("PRAGMA page_count").fetchone()[0]
             page_limit = MAILBOX_BYTES // page_size
@@ -1098,11 +1125,173 @@ class Owner:
             conn.execute("DELETE FROM episode_sources WHERE generation != ?", (auth["generation"],))
             conn.execute("DELETE FROM episodes WHERE generation != ?", (auth["generation"],))
             conn.execute("DELETE FROM notices WHERE generation != ?", (auth["generation"],))
+            conn.execute("DELETE FROM review_log_events WHERE generation != ? AND appended IS NULL",
+                         (auth["generation"],))
             # A process crash may leave an output attempt unacknowledged. No
             # other owner can coexist, so reconnect safely makes it retryable.
             conn.execute("UPDATE notices SET delivery_id=NULL WHERE generation=? AND delivered IS NULL",
                          (auth["generation"],))
             self._compact_pending_notices(conn, auth)
+
+    @property
+    def review_log_path(self):
+        return Path(self.entry.mailbox).parent / "logs" / "skill_reviews.jsonl"
+
+    @staticmethod
+    def _review_log_payload(job_id, event, created, *, status, action="", skill_name="", reason=""):
+        return dict(timestamp=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(created)),
+                    event_id=f"{job_id}:{event.lower()}", review_id=job_id, event=event,
+                    action=action, skill_name=skill_name, status=status, reason=reason)
+
+    def _store_review_log_event(self, conn, auth, job_id, event, created, *, status,
+                                action="", skill_name="", reason=""):
+        payload = self._review_log_payload(job_id, event, created, status=status,
+                                           action=action, skill_name=skill_name, reason=reason)
+        stored = dict(event_id=payload["event_id"], profile_id=self.entry.profile_id,
+                      store_id=self.entry.store_id, generation=auth["generation"], job_id=job_id,
+                      payload_json=packed(payload), created=created)
+        conn.execute(
+            "INSERT OR IGNORE INTO review_log_events(event_id,profile_id,store_id,generation,job_id,"
+            "payload_json,event_seal,created) VALUES(?,?,?,?,?,?,?,?)",
+            tuple(stored[key] for key in REVIEW_LOG_FIELDS[:-1])
+            + (review_log_seal(auth, stored), stored["created"]),
+        )
+
+    def _valid_review_log_event(self, auth, row):
+        if ((row["profile_id"], row["store_id"], row["generation"])
+                != (self.entry.profile_id, self.entry.store_id, auth["generation"])
+                or not isinstance(row["event_seal"], str)
+                or not hmac.compare_digest(row["event_seal"], review_log_seal(auth, row))
+                or type(row["created"]) not in (int, float)
+                or not isinstance(row["payload_json"], str)
+                or len(row["payload_json"].encode()) > REVIEW_LOG_PAYLOAD_BYTES):
+            return False
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, ValueError):
+            return False
+        expected = {"timestamp", "event_id", "review_id", "event", "action",
+                    "skill_name", "status", "reason"}
+        if not isinstance(payload, dict) or set(payload) != expected:
+            return False
+        event, status, action = payload["event"], payload["status"], payload["action"]
+        allowed_status = {"REQUESTED", "STARTED"} | set(NOTICE_OUTCOMES)
+        allowed_action = {"", "CREATE", "UPDATE", "NONE", "FAILED", "INVALID",
+                          "STALE", "COLLISION", "CANCELLED", "BUDGET_REFUSED"}
+        return (re.fullmatch(r"[a-f0-9]{32}", row["job_id"] or "") is not None
+                and row["event_id"] == f"{row['job_id']}:{str(event).lower()}"
+                and payload["event_id"] == row["event_id"]
+                and payload["review_id"] == row["job_id"]
+                and event in ("REQUESTED", "STARTED", "DECISION")
+                and status in allowed_status and action in allowed_action
+                and isinstance(payload["timestamp"], str) and len(payload["timestamp"]) == 20
+                and isinstance(payload["skill_name"], str)
+                and len(payload["skill_name"]) <= REVIEW_LOG_NAME_CHARS
+                and isinstance(payload["reason"], str) and len(payload["reason"].encode()) <= 512
+                and ((event == "REQUESTED" and status == "REQUESTED" and action == ""
+                      and payload["skill_name"] == "" and payload["reason"] == REVIEW_LOG_REASONS["REQUESTED"])
+                     or (event == "STARTED" and status == "STARTED" and action == ""
+                         and payload["skill_name"] == "" and payload["reason"] == REVIEW_LOG_REASONS["STARTED"])
+                     or (event == "DECISION" and status in NOTICE_OUTCOMES
+                         and ((status in ("APPLIED", "DUPLICATE") and action in ("CREATE", "UPDATE"))
+                              or (status not in ("APPLIED", "DUPLICATE") and action == status)))))
+
+    def _flush_review_log(self):
+        """Reconcile the durable owner outbox with its private append-only JSONL."""
+        with gate(self.entry, BUSY_SECONDS):
+            auth = read_auth(self.roster, self.entry)
+            if not self._authorized(auth):
+                return 0
+            with closing(connect(self.entry)) as conn:
+                pending = conn.execute(
+                    "SELECT * FROM review_log_events WHERE generation=? AND appended IS NULL ORDER BY seq",
+                    (auth["generation"],),
+                ).fetchall()
+            if not pending:
+                return 0
+            valid = [row for row in pending if self._valid_review_log_event(auth, row)]
+            invalid = [row for row in pending if row not in valid]
+            if invalid:
+                with closing(connect(self.entry)) as conn, conn:
+                    conn.executemany(
+                        "UPDATE review_log_events SET appended=-1,payload_json='{}',event_seal='',"
+                        "attempts=attempts+1,last_failure='invalid_pending_event' WHERE seq=?",
+                        [(row["seq"],) for row in invalid])
+                self.last_error = ("historical stage=owner.review_log error=InvalidPendingEvent profile="
+                                   + diagnostic_id(self.entry.profile_id)
+                                   + "; invalid private lifecycle event quarantined; no payload was written.")
+            pending = valid
+            if not pending:
+                return 0
+            path = self.review_log_path
+            try:
+                if self.entry.binding:
+                    self.entry.binding.validate()
+                path.parent.mkdir(parents=True, exist_ok=True)
+                plain_stat(path.parent, directory=True)
+                try:
+                    os.chmod(path.parent, 0o700)
+                except OSError:
+                    pass
+                if os.path.lexists(path):
+                    plain_stat(path)
+                appended = self._append_review_log(path, pending)
+                plain_stat(path)
+                try:
+                    os.chmod(path, 0o600)
+                except OSError:
+                    pass
+            except (OSError, ValueError, TypeError) as exc:
+                failure = "append_" + exception_name(exc)
+                with closing(connect(self.entry)) as conn, conn:
+                    conn.executemany(
+                        "UPDATE review_log_events SET attempts=attempts+1,last_failure=? "
+                        "WHERE event_id=? AND appended IS NULL",
+                        [(failure, row["event_id"]) for row in pending])
+                self.last_error = ("historical stage=owner.review_log error=" + exception_name(exc) + " profile="
+                                   + diagnostic_id(self.entry.profile_id)
+                                   + "; private lifecycle events retained for retry; check local profile storage.")
+                return 0
+            with closing(connect(self.entry)) as conn, conn:
+                now = time.time()
+                conn.executemany(
+                    "UPDATE review_log_events SET appended=?,attempts=attempts+1,last_failure=NULL "
+                    "WHERE event_id=? AND appended IS NULL", [(now, event_id) for event_id in appended])
+                conn.execute(
+                    "DELETE FROM review_log_events WHERE appended IS NOT NULL AND appended >= 0 AND seq NOT IN "
+                    "(SELECT seq FROM review_log_events WHERE appended IS NOT NULL AND appended >= 0 "
+                    "ORDER BY seq DESC LIMIT ?)", (HISTORY_COUNT,))
+            return len(appended)
+
+    @staticmethod
+    def _append_review_log(path, pending):
+        existing = {}
+        if os.path.lexists(path):
+            plain_stat(path)
+            with path.open("r", encoding="utf-8") as handle:
+                for line in handle:
+                    if not line.endswith("\n"):
+                        raise ValueError("incomplete lifecycle log line")
+                    try:
+                        value = json.loads(line)
+                    except (TypeError, ValueError) as exc:
+                        raise ValueError("malformed lifecycle log") from exc
+                    event_id = value.get("event_id") if isinstance(value, dict) else None
+                    if not isinstance(event_id, str) or event_id in existing:
+                        raise ValueError("invalid lifecycle log record")
+                    existing[event_id] = packed(value)
+        appended = []
+        with path.open("a", encoding="utf-8", newline="\n") as handle:
+            for row in pending:
+                prior = existing.get(row["event_id"])
+                if prior is not None and prior != row["payload_json"]:
+                    raise ValueError("conflicting lifecycle log record")
+                if prior is None:
+                    handle.write(row["payload_json"] + "\n")
+                appended.append(row["event_id"])
+            handle.flush()
+            os.fsync(handle.fileno())
+        return appended
 
     def set_enabled(self, enabled):
         # Delivery I/O never holds the catalog/profile gate. This local lock only
@@ -1698,7 +1887,9 @@ class Owner:
                         "last_created", "disclosure", "saturated"}
             if not legacy:
                 expected.add("starts")
-            if version not in (1, 2) or set(payload) != expected:
+            if version == 3:
+                expected.add("requests")
+            if version not in (1, 2, 3) or set(payload) != expected:
                 return False
             counts = payload.get("outcomes")
             return (type(payload.get("count")) is int and 1 <= payload["count"] <= NOTICE_SUMMARY_COUNT_LIMIT
@@ -1706,6 +1897,8 @@ class Owner:
                     and all(type(value) is int and 1 <= value <= NOTICE_SUMMARY_COUNT_LIMIT for value in counts.values())
                     and (legacy or (type(payload.get("starts")) is int
                                     and 0 <= payload["starts"] <= NOTICE_SUMMARY_COUNT_LIMIT))
+                    and (version != 3 or (type(payload.get("requests")) is int
+                                         and 0 <= payload["requests"] <= NOTICE_SUMMARY_COUNT_LIMIT))
                     and type(payload.get("saturated")) is bool
                     and type(payload.get("first_created")) in (int, float)
                     and type(payload.get("last_created")) in (int, float)
@@ -1714,6 +1907,13 @@ class Owner:
         version = payload.get("version")
         if version not in (1, 2):
             return False
+        if kind == "REQUEST":
+            return (version == 1
+                    and set(payload) == {"version", "kind", "requested_at", "reason", "source"}
+                    and payload.get("reason") == REVIEW_LOG_REASONS["REQUESTED"]
+                    and type(payload.get("requested_at")) in (int, float)
+                    and 0 <= payload["requested_at"] <= 4102444800
+                    and Owner._valid_notice_source(payload.get("source")))
         if kind == "START":
             return (version == 1
                     and set(payload) == {"version", "kind", "started_at", "source"}
@@ -1751,7 +1951,7 @@ class Owner:
                 != (self.entry.profile_id, self.entry.store_id, auth["generation"])
                 or self._notice_identifier(notice["notice_id"]) != notice["notice_id"]
                 or self._notice_identifier(notice["job_id"]) != notice["job_id"]
-                or notice["kind"] not in ("START", "DETAIL", "SUMMARY")
+                or notice["kind"] not in ("REQUEST", "START", "DETAIL", "SUMMARY")
                 or type(notice["created"]) not in (int, float)
                 or not 0 <= notice["created"] <= 4102444800
                 or not isinstance(notice["payload_json"], str)
@@ -1779,7 +1979,7 @@ class Owner:
             else:
                 # Invalid/tampered rows are never rendered or coalesced.
                 conn.execute("UPDATE notices SET delivered=-1 WHERE seq=?", (row["seq"],))
-        details = [row for row in valid if row["kind"] in ("START", "DETAIL")]
+        details = [row for row in valid if row["kind"] in ("REQUEST", "START", "DETAIL")]
         summaries = [dict(row) for row in valid if row["kind"] == "SUMMARY"]
         summary = summaries[0] if summaries else None
         summary_payload = json.loads(summary["payload_json"]) if summary else None
@@ -1790,6 +1990,14 @@ class Owner:
             if summary_payload["version"] == 1:
                 summary_payload["version"] = 2
                 summary_payload["starts"] = 0
+                changed = True
+
+        def ensure_request_summary():
+            nonlocal changed
+            ensure_event_summary()
+            if summary_payload["version"] == 2:
+                summary_payload["version"] = 3
+                summary_payload["requests"] = 0
                 changed = True
 
         def add_total(count):
@@ -1818,13 +2026,24 @@ class Owner:
                 summary_payload["saturated"] = True
             summary_payload["starts"] = min(total, NOTICE_SUMMARY_COUNT_LIMIT)
 
+        def add_requests(count):
+            ensure_request_summary()
+            add_total(count)
+            total = summary_payload["requests"] + count
+            if total > NOTICE_SUMMARY_COUNT_LIMIT:
+                summary_payload["saturated"] = True
+            summary_payload["requests"] = min(total, NOTICE_SUMMARY_COUNT_LIMIT)
+
         # A failed output can release an old and a newly-created summary at the
         # same time. They represent disjoint events and are merged losslessly
         # (up to the documented explicit saturation bounds).
         for extra in summaries[1:]:
             extra_payload = json.loads(extra["payload_json"])
             starts = extra_payload.get("starts", 0)
-            counted = starts + sum(extra_payload["outcomes"].values())
+            requests = extra_payload.get("requests", 0)
+            counted = requests + starts + sum(extra_payload["outcomes"].values())
+            if requests:
+                add_requests(requests)
             if starts:
                 add_starts(starts)
             for outcome, count in extra_payload["outcomes"].items():
@@ -1841,9 +2060,10 @@ class Owner:
             old_payload = json.loads(oldest["payload_json"])
             if summary is None:
                 summary_payload = dict(
-                    version=2, kind="SUMMARY", count=1,
+                    version=3, kind="SUMMARY", count=1,
+                    requests=1 if oldest["kind"] == "REQUEST" else 0,
                     starts=1 if oldest["kind"] == "START" else 0,
-                    outcomes={} if oldest["kind"] == "START" else {old_payload["outcome"]: 1},
+                    outcomes={} if oldest["kind"] in ("REQUEST", "START") else {old_payload["outcome"]: 1},
                     first_created=oldest["created"], last_created=oldest["created"],
                     disclosure="older per-notice names and source identifiers were compacted",
                     saturated=False,
@@ -1862,7 +2082,9 @@ class Owner:
                 )
                 summary = summary_notice
             else:
-                if oldest["kind"] == "START":
+                if oldest["kind"] == "REQUEST":
+                    add_requests(1)
+                elif oldest["kind"] == "START":
                     add_starts(1)
                 else:
                     add_count(old_payload["outcome"], 1)
@@ -1877,6 +2099,29 @@ class Owner:
 
     def _valid_review_start(self, auth, job):
         return valid_review_start(auth, self.entry, job)
+
+    def _store_request_notice(self, conn, auth, job):
+        notice_id = "request-" + job["job_id"]
+        if conn.execute("SELECT 1 FROM notices WHERE notice_id=?", (notice_id,)).fetchone():
+            return
+        try:
+            host = json.loads(job["host_json"])
+        except (TypeError, ValueError):
+            return
+        payload = dict(version=1, kind="REQUEST", requested_at=job["created"],
+                       reason=REVIEW_LOG_REASONS["REQUESTED"],
+                       source=self._notice_source(conn, job, host))
+        notice = dict(notice_id=notice_id, profile_id=self.entry.profile_id,
+                      store_id=self.entry.store_id, generation=auth["generation"],
+                      job_id=job["job_id"], kind="REQUEST", payload_json=packed(payload),
+                      created=job["created"])
+        conn.execute(
+            "INSERT INTO notices(notice_id,profile_id,store_id,generation,job_id,kind,payload_json,created,notice_seal) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            tuple(notice[key] for key in NOTICE_FIELDS) + (notice_seal(auth, notice),))
+        self._store_review_log_event(conn, auth, job["job_id"], "REQUESTED", job["created"],
+                                     status="REQUESTED", reason=REVIEW_LOG_REASONS["REQUESTED"])
+        self._compact_pending_notices(conn, auth)
 
     def _store_start_notice(self, conn, auth, job):
         if not self._valid_review_start(auth, job):
@@ -1898,6 +2143,8 @@ class Owner:
             "VALUES(?,?,?,?,?,?,?,?,?)",
             tuple(notice[key] for key in NOTICE_FIELDS) + (notice_seal(auth, notice),),
         )
+        self._store_review_log_event(conn, auth, job["job_id"], "STARTED", job["review_started"],
+                                     status="STARTED", reason=REVIEW_LOG_REASONS["STARTED"])
         self._compact_pending_notices(conn, auth)
 
     def _store_notice(self, conn, auth, job, outcome, result, host):
@@ -1912,6 +2159,11 @@ class Owner:
             "VALUES(?,?,?,?,?,?,?,?,?)",
             tuple(notice[key] for key in NOTICE_FIELDS) + (notice_seal(auth, notice),),
         )
+        reason = payload["reason"] or EXPLANATION_UNAVAILABLE
+        self._store_review_log_event(
+            conn, auth, job["job_id"], "DECISION", notice["created"], status=payload["outcome"],
+            action=(payload["action"] if payload["outcome"] in ("APPLIED", "DUPLICATE")
+                    else payload["outcome"]), skill_name=payload["name"], reason=reason)
         self._compact_pending_notices(conn, auth)
 
     def _ack(self, conn, auth, job, outcome, result=None):
@@ -1969,8 +2221,10 @@ class Owner:
     def _render_notice(cls, row):
         payload = json.loads(row["payload_json"])
         if row["kind"] == "SUMMARY":
-            if payload["version"] == 2:
+            if payload["version"] in (2, 3):
                 event_counts = []
+                if payload.get("requests"):
+                    event_counts.append(f"REQUEST{'>=' if payload['saturated'] else '='}{payload['requests']}")
                 if payload["starts"]:
                     event_counts.append(f"START{'>=' if payload['saturated'] else '='}{payload['starts']}")
                 event_counts.extend(
@@ -1991,18 +2245,22 @@ class Owner:
                     f"({counts}; {cls._notice_time(payload['first_created'])} to "
                     f"{cls._notice_time(payload['last_created'])}); older per-notice names and "
                     "source identifiers were compacted. This is a summary, not a named success notice.")
-        if row["kind"] == "START":
+        if row["kind"] == "REQUEST":
+            result = f"Review requested. {payload['reason'].capitalize()}."
+        elif row["kind"] == "START":
             result = (f"Review started. Recorded authorized local worker entry at "
-                      f"{cls._notice_time(payload['started_at'])}; this does not prove a provider request was transmitted.")
+                      f"{cls._notice_time(payload['started_at'])}; this does not prove a provider request was transmitted. "
+                      f"Reason: {REVIEW_LOG_REASONS['STARTED']}.")
         else:
             outcome, action, name = payload["outcome"], payload["action"], payload["name"]
             if outcome == "APPLIED":
-                result = ("Created" if action == "CREATE" else "Updated") + f" skill '{name}'."
+                result = (("Created" if action == "CREATE" else "Updated") + f" skill '{name}'. "
+                          f"Reason: {EXPLANATION_UNAVAILABLE}.")
             elif outcome == "DUPLICATE":
                 result = ("Recovered the prior publication receipt for "
                           + ("created" if action == "CREATE" else "updated") + f" skill '{name}'; no new publication was made.")
             elif outcome == "NONE":
-                result = "Review completed with no skill change."
+                result = f"Review completed with no skill change. Reason: {EXPLANATION_UNAVAILABLE}."
             else:
                 result = f"No skill was published: {payload['reason']}."
                 if outcome == "BUDGET_REFUSED" and payload.get("version") == 2:
@@ -2125,6 +2383,7 @@ class Owner:
             return
         try:
             self._pump()
+            self._flush_review_log()
             if self.quiet:
                 # _pump has released the profile gate before acquiring the
                 # delivery lock, preserving the visible path's lock order.
@@ -2229,7 +2488,8 @@ class Owner:
             if not self._authorized(auth) or auth["generation"] != generation:
                 return
             job = dict(job_id=uuid.uuid4().hex, profile_id=self.entry.profile_id, store_id=self.entry.store_id,
-                       generation=generation, evidence_json=evidence_json, catalog_json=snapshot.public_json, host_json=host_json)
+                       generation=generation, evidence_json=evidence_json, catalog_json=snapshot.public_json,
+                       host_json=host_json, created=created)
             with diagnostic_stage("owner.preparation_persistence", job_id=job["job_id"], sqlite_busy_timeout_s=BUSY_SECONDS), closing(connect(self.entry)) as conn, conn:
                 if conn.execute("SELECT 1 FROM jobs WHERE status IN ('PREPARED','RUNNING','RESULT') LIMIT 1").fetchone():
                     return
@@ -2247,6 +2507,7 @@ class Owner:
                     for record in selected:
                         conn.execute("UPDATE evidence SET job_id=? WHERE seq=? AND generation=? AND job_id IS NULL",
                                      (job["job_id"], record["seq"], generation))
+                self._store_request_notice(conn, auth, job)
 
     def _loop(self):
         while not self._stop.is_set():

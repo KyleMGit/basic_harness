@@ -79,7 +79,7 @@ def test_default_owner_still_prints_and_acknowledges_valid_notices(tmp_path):
         assert ReviewService(roster, provider=lambda _: create_proposal("visible_skill")).once() == 1
         owner.pump()
         output = StringIO()
-        assert owner.deliver_notices(output) == 2
+        assert owner.deliver_notices(output) == 3
         assert "[Skill Review] Review started." in output.getvalue()
         assert "[Skill Review] Created skill 'visible_skill'" in output.getvalue()
         assert all(row["delivered"] and row["delivered"] > 0 for row in rows(owner, "notices"))
@@ -95,7 +95,7 @@ def test_quiet_startup_consumes_pending_backlog_and_unmuted_reconnect_does_not_r
         first.pump()
         assert ReviewService(roster, provider=lambda _: create_proposal("startup_skill")).once() == 1
         first.pump()
-        assert len(rows(first, "notices")) == 2
+        assert len(rows(first, "notices")) == 3
         assert all(row["delivered"] is None for row in rows(first, "notices"))
     finally:
         first.close()
@@ -131,7 +131,7 @@ def test_quiet_safe_shutdown_publishes_result_and_acknowledges_without_output(tm
         status = conn.execute("SELECT status FROM jobs ORDER BY seq DESC LIMIT 1").fetchone()[0]
         delivered = [row[0] for row in conn.execute("SELECT delivered FROM notices ORDER BY seq")]
     assert status == "APPLIED"
-    assert len(delivered) == 2 and all(value and value > 0 for value in delivered)
+    assert len(delivered) == 3 and all(value and value > 0 for value in delivered)
     assert "[Skill Review]" not in capsys.readouterr().out
 
 
@@ -347,7 +347,7 @@ def test_real_quiet_cli_consumes_result_while_foreground_busy_and_unmuted_cli_ha
             assert service.returncode == 0 and '"processed":1' in service.stdout
             wait_for(
                 lambda: (profile / "skills" / "boundary_skill.md").exists()
-                and _all_notices_settled(profile / "skill_review.db", minimum=2)
+                and _all_notices_settled(profile / "skill_review.db", minimum=3)
             )
             assert "Boundary foreground answer complete" not in "".join(output)
             assert "[Skill Review]" not in "".join(output)
@@ -356,7 +356,7 @@ def test_real_quiet_cli_consumes_result_while_foreground_busy_and_unmuted_cli_ha
                 status = conn.execute("SELECT status FROM jobs ORDER BY seq LIMIT 1").fetchone()[0]
                 delivered = [row[0] for row in conn.execute("SELECT delivered FROM notices ORDER BY seq")]
             assert status == "APPLIED"
-            assert len(delivered) == 2 and all(value and value > 0 for value in delivered)
+            assert len(delivered) == 3 and all(value and value > 0 for value in delivered)
 
             foreground_release.set()
             wait_for(lambda: "Boundary foreground answer complete" in "".join(output))

@@ -65,25 +65,24 @@ def test_authorized_worker_entry_records_one_start_before_blocked_review_result(
         assert rows(owner, "notices") == []
         owner.pump()
         assert rows(owner, "jobs")[-1]["status"] == "PREPARED"
-        assert rows(owner, "notices") == []
+        assert [row["kind"] for row in rows(owner, "notices")] == ["REQUEST"]
 
         worker = threading.Thread(target=service.once)
         worker.start()
         assert dispatched.wait(2)
         owner.pump()
         assert rows(owner, "jobs")[-1]["status"] == "RUNNING"
-        assert rows(owner, "notices") == []
+        assert [row["kind"] for row in rows(owner, "notices")] == ["REQUEST"]
 
         enter_worker.set()
         assert provider_entered.wait(2)
         running = rows(owner, "jobs")[-1]
         assert running["review_start_seal"]
-        assert rows(owner, "notices") == []  # The service cannot write the owner outbox.
+        assert [row["kind"] for row in rows(owner, "notices")] == ["REQUEST"]  # The service cannot write the owner outbox.
         owner.pump()
         pending = rows(owner, "notices")
-        assert len(pending) == 1
-        assert pending[0]["kind"] == "START"
-        start_payload = json.loads(pending[0]["payload_json"])
+        assert [row["kind"] for row in pending] == ["REQUEST", "START"]
+        start_payload = json.loads(pending[1]["payload_json"])
         assert set(start_payload) == {"version", "kind", "started_at", "source"}
         assert "Review started" in rendered(owner)
         assert len(calls) == 1
@@ -93,9 +92,10 @@ def test_authorized_worker_entry_records_one_start_before_blocked_review_result(
         assert not worker.is_alive()
         owner.pump()
         remaining = rows(owner, "notices")
-        assert [row["kind"] for row in remaining] == ["START", "DETAIL"]
+        assert [row["kind"] for row in remaining] == ["REQUEST", "START", "DETAIL"]
         assert remaining[0]["delivered"] is not None
-        assert remaining[1]["delivered"] is None
+        assert remaining[1]["delivered"] is not None
+        assert remaining[2]["delivered"] is None
         assert "Review completed with no skill change" in rendered(owner)
         assert len(calls) == 1
     finally:
@@ -118,14 +118,14 @@ def test_fast_result_preserves_start_before_final_after_source_cleanup(tmp_path)
         ).once() == 1
         job = rows(owner, "jobs")[-1]
         assert job["status"] == "RESULT" and job["review_start_seal"]
-        assert rows(owner, "notices") == []
+        assert [row["kind"] for row in rows(owner, "notices")] == ["REQUEST"]
 
         owner.pump()
         assert not rows(owner, "evidence")
         notices = rows(owner, "notices")
-        assert [row["kind"] for row in notices] == ["START", "DETAIL"]
-        assert notices[0]["created"] <= notices[1]["created"]
-        start = json.loads(notices[0]["payload_json"])
+        assert [row["kind"] for row in notices] == ["REQUEST", "START", "DETAIL"]
+        assert notices[0]["created"] <= notices[1]["created"] <= notices[2]["created"]
+        start = json.loads(notices[1]["payload_json"])
         assert start["source"]["session_ids"] == ["fast-session"]
         assert start["source"]["task_ids"] == ["fast-task"]
         output = rendered(owner)
@@ -158,7 +158,7 @@ def test_started_job_recovery_keeps_one_marker_and_suppresses_duplicate_start(tm
         marker = (started["review_started"], started["review_start_generation"],
                   started["review_start_seal"])
         owner.pump()
-        assert [row["kind"] for row in rows(owner, "notices")] == ["START"]
+        assert [row["kind"] for row in rows(owner, "notices")] == ["REQUEST", "START"]
         assert "Review started" in rendered(owner)
 
         assert ReviewService(
@@ -169,7 +169,7 @@ def test_started_job_recovery_keeps_one_marker_and_suppresses_duplicate_start(tm
                 recovered["review_start_seal"]) == marker
         owner.pump()
         notices = rows(owner, "notices")
-        assert [row["kind"] for row in notices] == ["START", "DETAIL"]
+        assert [row["kind"] for row in notices] == ["REQUEST", "START", "DETAIL"]
         assert len(calls) == 1
         assert "Review started" not in rendered(owner)
     finally:
@@ -204,7 +204,7 @@ def test_cross_profile_signed_start_cannot_authorize_or_notify_worker(tmp_path):
         ) is None
         alice.pump()
         assert calls == []
-        assert rows(alice, "notices") == []
+        assert [row["kind"] for row in rows(alice, "notices")] == ["REQUEST"]
         assert rows(bob, "notices") == []
     finally:
         alice.close()
@@ -255,7 +255,7 @@ def test_service_without_owner_added_start_columns_keeps_legacy_final_protocol(t
     try:
         owner.pump()
         notices = rows(owner, "notices")
-        assert [row["kind"] for row in notices] == ["DETAIL"]
+        assert [row["kind"] for row in notices] == ["REQUEST", "DETAIL"]
         assert "Review started" not in rendered(owner)
         assert rows(owner, "jobs")[-1]["status"] == "NONE"
     finally:
@@ -306,12 +306,12 @@ def test_committed_create_notice_is_durable_and_independently_acknowledged(tmp_p
 
         assert rows(owner, "jobs")[0]["status"] == "APPLIED"
         pending = rows(owner, "notices")
-        assert [row["kind"] for row in pending] == ["START", "DETAIL"]
+        assert [row["kind"] for row in pending] == ["REQUEST", "START", "DETAIL"]
         assert all(row["delivered"] is None for row in pending)
         assert "instructions" not in str(pending)
 
         output = StringIO()
-        assert owner.deliver_notices(output) == 2
+        assert owner.deliver_notices(output) == 3
         rendered = output.getvalue()
         assert "Skill Review" in rendered
         assert "Created skill 'learned_workflow'" in rendered
@@ -482,7 +482,7 @@ def test_print_before_ack_crash_can_repeat_and_success_then_suppresses(tmp_path)
         assert "no skill change" in first.getvalue()
         assert rows(owner, "notices")[0]["delivered"] is None
         second = StringIO()
-        assert owner.deliver_notices(second) == 2
+        assert owner.deliver_notices(second) == 3
         assert second.getvalue() == first.getvalue()
         assert owner.deliver_notices(StringIO()) == 0
     finally:
@@ -521,19 +521,20 @@ def test_detailed_cap_compacts_explicit_outcome_summary_without_blocking_learnin
                 provider = lambda _, i=index: create_proposal(f"bounded_{i}")
             complete(owner, roster, provider, task=f"capacity-{index}")
         pending = [row for row in rows(owner, "notices") if row["delivered"] is None]
-        assert len([row for row in pending if row["kind"] in ("START", "DETAIL")]) == NOTICE_DETAIL_COUNT
+        assert len([row for row in pending if row["kind"] in ("REQUEST", "START", "DETAIL")]) == NOTICE_DETAIL_COUNT
         summaries = [row for row in pending if row["kind"] == "SUMMARY"]
         assert len(summaries) == 1
         summary = json.loads(summaries[0]["payload_json"])
-        assert summary["count"] == 36
-        assert summary["starts"] == 18
-        assert summary["outcomes"] == {"APPLIED": 8, "FAILED": 1, "NONE": 9}
+        assert summary["count"] == 66
+        assert summary["requests"] == 22
+        assert summary["starts"] == 22
+        assert summary["outcomes"] == {"APPLIED": 10, "FAILED": 1, "NONE": 11}
         assert len(rows(owner, "jobs")) <= 32
         assert "bounded_28" in owner.store.list_skills()
 
         exact_summary = owner._render_notice(summaries[0])
-        assert "START=18" in exact_summary and "APPLIED=8" in exact_summary
-        assert "FAILED=1" in exact_summary and "NONE=9" in exact_summary
+        assert "REQUEST=22" in exact_summary and "START=22" in exact_summary
+        assert "FAILED=1" in exact_summary and "NONE=11" in exact_summary
         assert "review events" in exact_summary and "not distinct jobs or completed outcomes" in exact_summary
 
         # Exercise the bounded counter's explicit saturation path without a
@@ -554,7 +555,7 @@ def test_detailed_cap_compacts_explicit_outcome_summary_without_blocking_learnin
 
         text = rendered(owner)
         assert "at least 1000000 older review events were compacted" in text
-        assert "APPLIED>=1000000" in text and "FAILED>=1" in text and "NONE>=9" in text
+        assert "APPLIED>=1000000" in text and "FAILED>=1" in text and "NONE>=11" in text
         assert "not a named success notice" in text
     finally:
         owner.close()
@@ -631,14 +632,14 @@ def test_superseded_revision_is_quiet_and_fresh_revision_gets_its_own_notice(tmp
         instance.skill_review_owner.pump()
         assert rows(instance.skill_review_owner, "jobs")[0]["status"] == "SUPERSEDED"
         superseded_notices = rows(instance.skill_review_owner, "notices")
-        assert [row["kind"] for row in superseded_notices] == ["START"]
+        assert [row["kind"] for row in superseded_notices] == ["REQUEST", "START", "REQUEST"]
         assert "obsolete_notice" not in rendered(instance.skill_review_owner)
 
         instance.skill_review_owner.pump()
         assert ReviewService(roster, provider=lambda _: {"action": "NONE"}).once() == 1
         instance.skill_review_owner.pump()
         pending = rows(instance.skill_review_owner, "notices")
-        assert [row["kind"] for row in pending] == ["START", "START", "DETAIL"]
+        assert [row["kind"] for row in pending] == ["REQUEST", "START", "REQUEST", "START", "DETAIL"]
         payload = json.loads(pending[-1]["payload_json"])
         assert payload["outcome"] == "NONE"
         assert payload["source"]["revision"] >= 3
@@ -802,7 +803,7 @@ def test_legacy_generic_budget_detail_remains_deliverable(tmp_path):
         owner.close()
         owner = owner_for(roster, background=False)
         output = StringIO()
-        assert owner.deliver_notices(output) == 1
+        assert owner.deliver_notices(output) == 2
         assert "bounded review request was refused before a provider call" in output.getvalue()
         assert "reason=" not in output.getvalue() and "legacy unstructured detail" not in output.getvalue()
     finally:
@@ -890,18 +891,18 @@ def test_one_success_nonroutine_query_reaches_none_notice_only_after_final_resul
         owner.flush_session(instance.session_id)
         owner.pump()
         assert rows(owner, "jobs")[-1]["status"] == "PREPARED"
-        assert rows(owner, "notices") == []
+        assert [row["kind"] for row in rows(owner, "notices")] == ["REQUEST"]
 
         assert ReviewService(
             roster, provider=lambda request: requests.append(request) or {"action": "NONE"}
         ).once() == 1
         assert rows(owner, "jobs")[-1]["status"] == "RESULT"
-        assert rows(owner, "notices") == []
+        assert [row["kind"] for row in rows(owner, "notices")] == ["REQUEST"]
 
         owner.pump()
         assert rows(owner, "jobs")[-1]["status"] == "NONE"
         output = StringIO()
-        assert instance.deliver_skill_review_notices(output) == 2
+        assert instance.deliver_skill_review_notices(output) == 3
         assert "Review completed with no skill change" in output.getvalue()
         assert len(requests) == 1 and "business_result_omitted" in requests[0]
         assert json.dumps(instance.messages, sort_keys=True) == foreground_messages
@@ -954,18 +955,18 @@ def test_real_writer_export_reaches_success_notice_without_csv_contents(tmp_path
 
         owner.flush_session(instance.session_id)
         owner.pump()
-        assert rows(owner, "notices") == []
+        assert [row["kind"] for row in rows(owner, "notices")] == ["REQUEST"]
         assert ReviewService(
             roster,
             provider=lambda request: requests.append(request) or create_proposal("export_notice"),
         ).once() == 1
         assert rows(owner, "jobs")[-1]["status"] == "RESULT"
-        assert rows(owner, "notices") == []
+        assert [row["kind"] for row in rows(owner, "notices")] == ["REQUEST"]
 
         owner.pump()
         assert rows(owner, "jobs")[-1]["status"] == "APPLIED"
         output = StringIO()
-        assert instance.deliver_skill_review_notices(output) == 2
+        assert instance.deliver_skill_review_notices(output) == 3
         assert "Created skill 'export_notice'" in output.getvalue()
         assert len(requests) == 1 and "exported_result_omitted" in requests[0]
         assert "PRIVATE-CSV-ALPHA" not in requests[0]
@@ -994,7 +995,7 @@ def test_rich_and_untrusted_diagnostics_end_in_private_generic_failure_notices(t
         with patch("openai.OpenAI", return_value=client):
             assert ReviewService(roster, timeout=1.25, output_tokens=512).once() == 1
         assert rows(owner, "jobs")[-1]["status"] == "RESULT"
-        assert rows(owner, "notices") == []
+        assert [row["kind"] for row in rows(owner, "notices")] == ["REQUEST"]
 
         owner.pump()
         trusted_job = rows(owner, "jobs")[-1]
@@ -1125,9 +1126,9 @@ def test_successful_output_detail_is_not_reintroduced_by_concurrent_compaction(t
                 return written
 
         first = ArrivalDuringOutput()
-        assert owner.deliver_notices(first) == NOTICE_DETAIL_COUNT
+        assert owner.deliver_notices(first) == NOTICE_DETAIL_COUNT + 1
         second = StringIO()
-        assert owner.deliver_notices(second) == 2
+        assert owner.deliver_notices(second) == 3
         assert "new-after-snapshot" in second.getvalue()
         assert "compacted" not in second.getvalue()
     finally:
@@ -1150,13 +1151,13 @@ def test_successful_output_summary_is_not_mutated_by_concurrent_compaction(tmp_p
 
         first = BacklogDuringOutput()
         assert owner.deliver_notices(first) == NOTICE_DETAIL_COUNT + 1
-        assert "2 older review events were compacted" in first.getvalue()
+        assert "15 older review events were compacted" in first.getvalue()
 
         second = StringIO()
         assert owner.deliver_notices(second) == NOTICE_DETAIL_COUNT + 1
         output = second.getvalue()
-        assert "2 older review events were compacted" in output
-        assert "28 older review events were compacted" not in output
+        assert "15 older review events were compacted" in output
+        assert "54 older review events were compacted" not in output
         assert "new-12" in output
         assert "old-" not in output
     finally:
