@@ -120,6 +120,11 @@ Profile names are 1-64 letters, digits, hyphens, or underscores.
 and must name an already-existing directory; the override is not created and
 does not create an unused default profile workspace.
 
+For a server move, same-name profile removal, or path-bound review-state reset,
+follow the stopped-process and recoverable-backup procedure in
+[`docs/profile_maintenance.md`](docs/profile_maintenance.md). The maintenance
+commands are dry-run by default and never delete profile workspaces.
+
 `--read-only-dir` is repeatable. Each value must name an existing directory and
 must not overlap the writable workspace; values are canonicalized at startup.
 `read_file`, `list_directory`, `grep_search`, and
