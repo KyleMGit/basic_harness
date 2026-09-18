@@ -27,13 +27,15 @@ An open-source, terminal-native Python agent harness optimized for local models 
    - Pick up past sessions directly via `--resume <session_id>` or interactive `/resume <session_id>`.
    - View past session logs, dates, and step counts with `/sessions`.
 4. **Hermes Skill System & Intelligent Deduplication ([`skills.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/skills.py))**:
-   - Injects `<available_skills>` catalog and pre-turn keyword auto-injection.
+   - Publishes the `<available_skills>` catalog and adds bounded per-turn skill matching context.
    - Opt-in asynchronous skill review uses one host service and private per-profile queues; the owning agent validates CREATE/UPDATE/NONE proposals before publishing.
 5. **Two-Phase Context Compaction & Summarization ([`compaction.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/compaction.py))**:
    - Implements the **Security & Provenance Context-Checkpoint Summarizer** contract.
    - Host-side deterministic extraction for `<EXACT_ANCHORS>` and `<VERBATIM_USER_MESSAGES>` at the 40K token limit.
    - Preflights the exact summarizer request, reserves bounded output capacity, and chunks oversized history without splitting native or XML tool exchanges.
    - Can use a separately configured compactor model/context while defaulting to the primary model and context capacity.
+
+Skill matching ranks names, descriptions, and tags from the active canonical catalog. Ordinary matches provide only bounded name/description hints so the model can call `load_skill` when useful; complete instructions are projected automatically only for a narrow, explicit full-identifier request. Projected skill context is capped at 6,000 characters and omitted when the provider payload would exceed the configured context budget.
 6. **Interactive Review for Every System Command ([`agent.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/agent.py))**:
    - Every terminal command pauses for user approval: Run (`[Enter]/y`), Deny (`n`), Edit (`e`), or Steer with feedback.
 7. **Stateful Terminal Engine ([`terminal.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/terminal.py))**:

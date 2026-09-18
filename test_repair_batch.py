@@ -377,7 +377,9 @@ class TestSliceDBudgetPrivacyProvenance(unittest.TestCase):
             agent.run("raw task")
         self.assertEqual(agent.messages[1]["content"], "raw task")
         sent = agent.client.chat.completions.create.call_args.kwargs["messages"]
-        self.assertIn("safe procedure", sent[1]["content"])
+        self.assertNotIn("safe procedure", sent[1]["content"])
+        self.assertIn("match", sent[1]["content"])
+        self.assertIn("raw task", sent[1]["content"])
         self.assertEqual(agent.messages[0]["content"], original_prompt)
 
 

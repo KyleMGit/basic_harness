@@ -372,7 +372,7 @@ class TestMessageSequencingAndCommandProvenance(unittest.TestCase):
         user_message = next(message for message in agent.messages if message["role"] == "user")
         self.assertEqual(user_message["content"], "active task")
         provider_messages = agent.client.chat.completions.create.call_args.kwargs["messages"]
-        self.assertIn("RELEVANT LEARNED SKILLS", provider_messages[1]["content"])
+        self.assertIn("POSSIBLE SKILL MATCHES", provider_messages[1]["content"])
         self.assertIn("active task", provider_messages[1]["content"])
 
     def test_parallel_xml_results_are_one_correlated_user_turn(self):

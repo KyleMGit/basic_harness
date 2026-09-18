@@ -5,11 +5,13 @@ Supports native Markdown (SKILL.md, .md with YAML frontmatter) and JSON format.
 """
 
 import json
+import math
 import os
 import re
 import tempfile
+from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from safety import screen_prompt_content
 from skill_catalog import CanonicalCatalog
 from review_limits import (DEFAULT_PREPARED_INPUT_BYTES, DEFAULT_WIRE_BODY_BYTES,
@@ -111,45 +113,145 @@ tags: {tags_str}
         lines.append("</available_skills>")
         return "\n".join(lines)
 
-    def find_relevant_skills(self, query: str, top_k: int = 2, threshold: float = 0.10) -> List[Dict[str, Any]]:
+    _RETRIEVAL_STOPWORDS = frozenset({
+        "a", "an", "and", "are", "as", "at", "be", "by", "can", "do", "for",
+        "from", "help", "how", "i", "if", "in", "into", "is", "it", "me", "my",
+        "of", "on", "or", "please", "that", "the", "then", "this", "to", "use",
+        "with", "you", "your",
+    })
+    _GENERIC_RETRIEVAL_TERMS = frozenset({"sql", "query", "data", "table", "skill"})
+    _EXPLICIT_NEGATION = re.compile(
+        r"\b(?:do\s+not|don['’]t|not|never|without|avoid|exclude|instead\s+of)\b",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _normalize_retrieval_terms(cls, text: str) -> List[str]:
+        """Split separators, retain useful two-character terms, and stem conservatively."""
+        terms = []
+        for raw in re.findall(r"[a-z0-9]+", str(text).casefold()):
+            if len(raw) < 2:
+                continue
+            term = raw
+            if len(term) >= 4:
+                if len(term) >= 5 and term.endswith("ies"):
+                    term = term[:-3] + "y"
+                elif term.endswith("s") and not term.endswith(("ss", "us", "is")):
+                    term = term[:-1]
+            if term not in cls._RETRIEVAL_STOPWORDS:
+                terms.append(term)
+        return terms
+
+    @staticmethod
+    def _literal_identifier(value: str) -> str:
+        """Normalize only case and hyphen/underscore for literal identifier matching."""
+        return str(value).strip().casefold().replace("-", "_")
+
+    @classmethod
+    def _is_explicit_identifier_request(cls, query: str, skill_name: str) -> bool:
+        """Recognize the deliberately narrow full-identifier request syntax."""
+        if not skill_name or cls._EXPLICIT_NEGATION.search(query):
+            return False
+        stripped = query.strip()
+        if len(stripped) >= 2 and stripped[0] in "'\"`" and stripped[-1] == stripped[0]:
+            stripped = stripped[1:-1].strip()
+        if cls._literal_identifier(stripped) == cls._literal_identifier(skill_name):
+            return True
+
+        identifier_pattern = "".join(
+            "[-_]" if char in "-_" else re.escape(char)
+            for char in str(skill_name)
+        )
+        prefix = re.compile(
+            rf"^\s*(?:please\s+)?(?:use|load|apply|run|follow)\s+"
+            rf"(?:the\s+)?(?:skill\s+)?['\"`]?{identifier_pattern}['\"`]?"
+            rf"(?=$|[\s,.:;!?])",
+            re.IGNORECASE,
+        )
+        return prefix.search(query) is not None
+
+    def find_relevant_skills(self, query: str, top_k: int = 2, threshold: float = 0.0) -> List[Dict[str, Any]]:
+        """Rank one canonical snapshot with weighted BM25-style lexical scoring.
+
+        ``threshold`` is a raw score floor applied after conservative candidate
+        admission. The default zero floor preserves admitted exact-name matches;
+        caller-supplied positive floors remain authoritative. It is not a
+        probability or a confidence percentage.
+        Returned dictionaries are copies carrying transient retrieval evidence.
         """
-        Find skills relevant to a task query using token overlap and keyword matching.
-        """
+        if not isinstance(query, str) or not query.strip() or not isinstance(top_k, int) or top_k <= 0:
+            return []
+        query_terms = set(self._normalize_retrieval_terms(query))
+        if not query_terms:
+            return []
+
+        # This is the sole authoritative snapshot for ranking and explicit loading.
         all_skills = self.get_all_skills()
         if not all_skills:
             return []
 
-        def tokenize(text: str) -> Set[str]:
-            clean_text = re.sub(r"[_\-/\\]", " ", text.lower())
-            words = set(re.findall(r"\b[a-zA-Z0-9]{3,}\b", clean_text))
-            words.update(re.findall(r"\b[a-zA-Z0-9_\-]{3,}\b", text.lower()))
-            return words
-
-        query_tokens = tokenize(query)
-        if not query_tokens:
-            return []
-
-        scored_skills = []
+        documents = []
+        document_frequency = Counter()
         for skill in all_skills:
-            skill_text = f"{skill['name']} {skill.get('description', '')} {' '.join(skill.get('tags', []))}"
-            skill_tokens = tokenize(skill_text)
-            
-            if not skill_tokens:
+            name_terms = self._normalize_retrieval_terms(str(skill.get("name", "")))
+            raw_tags = skill.get("tags") or []
+            if not isinstance(raw_tags, (list, tuple, set)):
+                raw_tags = [raw_tags]
+            tag_terms = self._normalize_retrieval_terms(" ".join(map(str, raw_tags)))
+            description_terms = self._normalize_retrieval_terms(str(skill.get("description", "")))
+            combined = name_terms + tag_terms + description_terms
+            for term in set(combined):
+                document_frequency[term] += 1
+            documents.append((skill, name_terms, tag_terms, description_terms, combined))
+
+        document_count = len(documents)
+        average_length = sum(len(item[4]) for item in documents) / document_count or 1.0
+        k1, b = 1.2, 0.75
+        scored = []
+        for skill, name_terms, tag_terms, description_terms, combined in documents:
+            present = set(combined)
+            matched = query_terms & present
+            explicit = self._is_explicit_identifier_request(query, str(skill.get("name", "")))
+            distinctive = matched - self._GENERIC_RETRIEVAL_TERMS
+            name_or_tag = set(name_terms) | set(tag_terms)
+            unique_name_or_tag = any(
+                document_frequency[term] == 1 and term in name_or_tag
+                for term in distinctive
+            )
+            if not explicit and not (len(distinctive) >= 2 or unique_name_or_tag):
                 continue
 
-            intersection = query_tokens.intersection(skill_tokens)
-            score = len(intersection) / len(query_tokens.union(skill_tokens))
-            
-            # Boost score if query words match the skill name subwords directly
-            name_tokens = tokenize(skill["name"])
-            if query_tokens.intersection(name_tokens):
-                score += 0.35
+            name_counts = Counter(name_terms)
+            tag_counts = Counter(tag_terms)
+            description_counts = Counter(description_terms)
+            length_normalization = 1.0 - b + b * (len(combined) / average_length)
+            score = 0.0
+            for term in query_terms:
+                weighted_frequency = (
+                    3 * name_counts[term]
+                    + 2 * tag_counts[term]
+                    + description_counts[term]
+                )
+                if not weighted_frequency:
+                    continue
+                df = document_frequency[term]
+                idf = math.log(1.0 + (document_count - df + 0.5) / (df + 0.5))
+                score += idf * (
+                    weighted_frequency * (k1 + 1.0)
+                    / (weighted_frequency + k1 * length_normalization)
+                )
+            rounded_score = round(score, 12)
+            if rounded_score < threshold:
+                continue
+            result = dict(skill)
+            if isinstance(result.get("tags"), list):
+                result["tags"] = list(result["tags"])
+            result["_retrieval_score"] = rounded_score
+            result["_explicit_request"] = explicit
+            scored.append((explicit, rounded_score, self._safe_name(str(skill.get("name", ""))), result))
 
-            if score >= threshold:
-                scored_skills.append((score, skill))
-
-        scored_skills.sort(key=lambda x: x[0], reverse=True)
-        return [skill for _, skill in scored_skills[:top_k]]
+        scored.sort(key=lambda item: (-int(item[0]), -item[1], item[2]))
+        return [item[3] for item in scored[:top_k]]
 
     def list_skills(self) -> str:
         """List all available skills with summaries and file formats."""

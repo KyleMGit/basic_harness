@@ -506,7 +506,9 @@ Fix NoneType bug in main.py.
         self.assertEqual(agent.messages[1]["content"], "Create a new FastAPI router endpoint")
         injected = agent.client.chat.completions.create.call_args.kwargs["messages"][1]["content"]
         self.assertIn("fastapi_endpoint_pattern", injected)
-        self.assertIn("from fastapi import APIRouter", injected)
+        self.assertIn("How to write a standard FastAPI router with Pydantic schemas", injected)
+        self.assertIn("load_skill", injected)
+        self.assertNotIn("from fastapi import APIRouter", injected)
 
     def test_direct_skill_name_as_tool_call(self):
         from tools import registry as reg, skill_store as global_store

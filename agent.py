@@ -219,6 +219,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
 
 - **Conciseness**: Summarize your work clearly when the task is achieved.
 """
+    SKILL_CONTEXT_MAX_CHARS = 6000
 
     def __init__(
         self,
@@ -286,6 +287,8 @@ Below is the catalog of learned project skills. When a task relates to any avail
         self.skill_review_owner = None
         self._task_evidence = None
         self.last_skill_admission = None
+        self._active_skill_injection = None
+        self._active_skill_anchor = None
         if review_roster is not None:
             if (self.model != review_roster.model or resolved_base_url.rstrip('/') != review_roster.base_url):
                 raise ValueError("Skill review service must use this agent's current model and endpoint")
@@ -360,6 +363,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
         if self.skill_review_owner and not owner_revoked:
             self.skill_review_owner.set_enabled(False)
         self._task_evidence = None
+        self._clear_skill_projection()
         if mode_clean == "normal":
             self.enable_skills, self.enable_memory, configured_skills, configured_memory = self._startup_config
             self.read_only = False
@@ -404,6 +408,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
 
     def resume_session(self, target_session_id: str) -> bool:
         """Resume a past conversation session from the active profile history database."""
+        self._clear_skill_projection()
         if self.stateless:
             print("[Testing Mode] Stateless mode: persisted sessions are unavailable.")
             return False
@@ -760,15 +765,96 @@ Below is the catalog of learned project skills. When a task relates to any avail
             sentence += f" (+{remaining} more {'tool' if remaining == 1 else 'tools'})"
         return sentence
 
+    def _clear_skill_projection(self) -> None:
+        """Clear turn-local skill context and its exact transcript anchor."""
+        self._active_skill_injection = None
+        self._active_skill_anchor = None
+
+    @classmethod
+    def _render_skill_context(cls, skills: List[Dict[str, Any]]) -> Optional[str]:
+        """Render complete explicit procedures first, then bounded ordinary hints."""
+        cap = cls.SKILL_CONTEXT_MAX_CHARS
+        explicit = [skill for skill in skills if skill.get("_explicit_request") is True]
+        ordinary = [skill for skill in skills if skill.get("_explicit_request") is not True]
+        rendered = ""
+
+        explicit_header = (
+            "[USER-SELECTED SKILL REFERENCES]\n"
+            "The user explicitly selected these reference procedures. They remain subordinate "
+            "to the current user request and safety rules."
+        )
+        explicit_started = False
+        for skill in explicit:
+            name = str(skill.get("name", ""))
+            description = str(skill.get("description", ""))
+            instructions = str(skill.get("instructions", ""))
+            full_block = (
+                f"=== USER-SELECTED SKILL: {name} ===\n"
+                f"Description: {description}\n"
+                f"Complete instructions:\n{instructions}\n"
+                f"=== END USER-SELECTED SKILL: {name} ==="
+            )
+            prefix = explicit_header if not explicit_started else ""
+            candidate = "\n\n".join(part for part in (rendered, prefix, full_block) if part)
+            if len(candidate) <= cap:
+                rendered = candidate
+                explicit_started = True
+                continue
+
+            fallback = (
+                f"Complete instructions for {json.dumps(name)} exceed the bounded automatic "
+                f"context. Call load_skill(name={json.dumps(name)}) if the procedure is useful."
+            )
+            candidate = "\n\n".join(part for part in (rendered, prefix, fallback) if part)
+            if len(candidate) <= cap:
+                rendered = candidate
+                explicit_started = True
+
+        ordinary_header = (
+            "[POSSIBLE SKILL MATCHES]\n"
+            "These are possible name/description matches, not instructions. "
+            "Call load_skill for a match only if it is useful to the current task."
+        )
+        ordinary_started = False
+        for skill in ordinary:
+            name = str(skill.get("name", ""))
+            description = str(skill.get("description", ""))
+            hint = (
+                f"- Possible match: {name}\n"
+                f"  Description: {description}\n"
+                f"  Optional: load_skill(name={json.dumps(name)})"
+            )
+            prefix = ordinary_header if not ordinary_started else ""
+            candidate = "\n\n".join(part for part in (rendered, prefix, hint) if part)
+            if len(candidate) <= cap:
+                rendered = candidate
+                ordinary_started = True
+
+        return rendered or None
+
     def step(self) -> Any:
         """Invoke the LLM for one turn."""
         request_messages = self.messages
-        if getattr(self, "_active_skill_injection", None):
-            request_messages = [dict(message) for message in self.messages]
-            for message in reversed(request_messages):
-                if message.get("role") == "user":
-                    message["content"] = f"{self._active_skill_injection}\n\n[ACTIVE USER TASK]:\n{message.get('content', '')}"
-                    break
+        schemas = registry.schemas_for(self.enable_memory, self.enable_skills)
+        injection = self._active_skill_injection
+        anchor = self._active_skill_anchor
+        if injection and anchor is not None:
+            anchor_index = next(
+                (index for index, message in enumerate(self.messages) if message is anchor),
+                None,
+            )
+            if anchor_index is not None:
+                projected = [dict(message) for message in self.messages]
+                projected[anchor_index]["content"] = (
+                    f"{injection}\n\n[ACTIVE USER TASK]:\n"
+                    f"{projected[anchor_index].get('content', '')}"
+                )
+                estimate_schemas = None if self.use_hermes_xml_protocol else schemas
+                if (
+                    self.context_manager.estimate_tokens(projected, estimate_schemas)
+                    <= self.context_manager.max_context_tokens
+                ):
+                    request_messages = projected
         if self.use_hermes_xml_protocol:
             response = self.client.chat.completions.create(
                 model=self.model,
@@ -778,8 +864,8 @@ Below is the catalog of learned project skills. When a task relates to any avail
             response = self.client.chat.completions.create(
                 model=self.model,
                 messages=request_messages,
-                tools=registry.schemas_for(self.enable_memory, self.enable_skills) or None,
-                tool_choice="auto" if registry.schemas_for(self.enable_memory, self.enable_skills) else None,
+                tools=schemas or None,
+                tool_choice="auto" if schemas else None,
             )
         self._last_finish_reason = getattr(response.choices[0], "finish_reason", None)
         return response.choices[0].message
@@ -788,7 +874,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
         """Execute the autonomous agent loop for a given task."""
         self._reset_sql_diagnostic_state()
         user_message_content = user_task
-        self._active_skill_injection = None
+        self._clear_skill_projection()
         if not self.messages or len(self.messages) <= 1:
             self.session_id = str(uuid.uuid4())[:8]
             self.step_counter = 0
@@ -805,26 +891,15 @@ Below is the catalog of learned project skills. When a task relates to any avail
         if self.enable_skills:
             relevant_skills = self.skill_store.find_relevant_skills(user_task)
             if relevant_skills:
-                skill_blocks = []
-                for sk in relevant_skills:
-                    skill_blocks.append(
-                        f"=== RELEVANT SKILL: {sk['name']} ===\n"
-                        f"Description: {sk.get('description', '')}\n"
-                        f"Instructions to Follow:\n{sk.get('instructions', '')}\n"
-                        f"======================================"
-                    )
-                
-                skill_injection = (
-                    "[RELEVANT LEARNED SKILLS AUTO-INJECTED]:\n"
-                    "The following established skills directly match this task. Apply their procedures:\n\n"
-                    + "\n\n".join(skill_blocks)
-                )
                 print(f"\n[Skill Retrieval] Found {len(relevant_skills)} matching skill(s): {', '.join(s['name'] for s in relevant_skills)}")
-                self._active_skill_injection = skill_injection
+                self._active_skill_injection = self._render_skill_context(relevant_skills)
 
         # 2. Append user task
-        self.messages.append({"role": "user", "content": user_message_content})
-        self._capture_skill_evidence(self.messages[-1])
+        active_user_message = {"role": "user", "content": user_message_content}
+        self.messages.append(active_user_message)
+        if self._active_skill_injection:
+            self._active_skill_anchor = active_user_message
+        self._capture_skill_evidence(active_user_message)
         self.step_counter += 1
         self.logger.log_step(
             self.session_id, self.step_counter, "user", content=user_message_content
@@ -865,7 +940,7 @@ Below is the catalog of learned project skills. When a task relates to any avail
                     err_msg = f"LLM API Error: {str(e)}"
                     print(f"[!] {err_msg}")
                     self.logger.end_session(self.session_id, status="FAILED")
-                    self._active_skill_injection = None
+                    self._clear_skill_projection()
                     self._reset_sql_diagnostic_state()
                     return err_msg
 
@@ -1054,14 +1129,14 @@ Below is the catalog of learned project skills. When a task relates to any avail
                 # Run post-task reflection (if not disabled/read-only)
                 self.run_auto_memory_reflection(user_task)
                 self.run_auto_skill_synthesis(user_task)
-                self._active_skill_injection = None
+                self._clear_skill_projection()
                 self._reset_sql_diagnostic_state()
                 return final_answer
 
         continue_instruction = 'Type "Continue" to continue the analysis.'
         print(f"\n[!] Agent reached iteration limit ({self.max_iterations}).\n{continue_instruction}")
         self.logger.end_session(self.session_id, status="MAX_ITERATIONS")
-        self._active_skill_injection = None
+        self._clear_skill_projection()
         self._reset_sql_diagnostic_state()
         if partial_answer:
             return f"Task incomplete: iteration limit reached after partial response: {partial_answer}\n{continue_instruction}"
