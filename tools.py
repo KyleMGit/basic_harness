@@ -671,7 +671,11 @@ def read_user_profile() -> str:
 
 @registry.register(
     name="update_user_profile",
-    description="Update or append persistent preferences, technical background, or operational constraints in USER.md.",
+    description=(
+        "Reconcile durable USER.md preferences with ADD, REPLACE, or REMOVE. Legacy category+preference "
+        "calls remain ADDs. Use operations for one atomic per-store correction/consolidation batch; "
+        "REPLACE/REMOVE require exact old_text and only explicit visible corrections or retractions justify edits."
+    ),
     parameters={
         "type": "object",
         "properties": {
@@ -681,14 +685,44 @@ def read_user_profile() -> str:
             },
             "preference": {
                 "type": "string",
-                "description": "The specific user preference, background detail, or rule to record."
-            }
+                "description": "New durable preference for single ADD/REPLACE; omit for REMOVE."
+            },
+            "action": {
+                "type": "string", "default": "ADD",
+                "description": "Case-insensitive single-operation action."
+            },
+            "old_text": {
+                "type": "string", "description": "Exact existing bullet text required for single REPLACE/REMOVE."
+            },
+            "operations": {
+                "type": "array", "minItems": 1, "maxItems": 8,
+                "description": "Atomic USER.md batch; do not combine with single-operation fields.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "description": "Case-insensitive ADD, REPLACE, or REMOVE."},
+                        "category": {"type": "string"},
+                        "value": {"type": "string", "description": "Required for ADD/REPLACE; omit for REMOVE."},
+                        "old_text": {"type": "string", "description": "Required for REPLACE/REMOVE; omit for ADD."},
+                    },
+                    "required": ["action", "category"],
+                    "additionalProperties": False,
+                },
+            },
         },
-        "required": ["category", "preference"]
+        "additionalProperties": False,
     }
 )
-def update_user_profile(category: str, preference: str) -> str:
-    return user_profile_manager.update_preference(category=category, note=preference)
+def update_user_profile(
+    category: Optional[str] = None,
+    preference: Optional[str] = None,
+    action: str = "ADD",
+    old_text: Optional[str] = None,
+    operations: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    return user_profile_manager.update_preference(
+        category=category, note=preference, action=action, old_text=old_text, operations=operations
+    )
 
 
 @registry.register(
@@ -702,7 +736,11 @@ def read_project_memory() -> str:
 
 @registry.register(
     name="update_project_memory",
-    description="Update or append persistent architectural facts, environment notes, or resolved bug patterns in MEMORY.md.",
+    description=(
+        "Reconcile durable MEMORY.md facts with ADD, REPLACE, or REMOVE. Legacy category+fact calls remain "
+        "ADDs. Use operations for one atomic per-store correction/consolidation batch; REPLACE/REMOVE require "
+        "exact old_text and only explicit visible corrections, retractions, or verified facts justify edits."
+    ),
     parameters={
         "type": "object",
         "properties": {
@@ -712,11 +750,41 @@ def read_project_memory() -> str:
             },
             "fact": {
                 "type": "string",
-                "description": "The specific technical fact, architectural note, or convention to record."
-            }
+                "description": "New durable fact for single ADD/REPLACE; omit for REMOVE."
+            },
+            "action": {
+                "type": "string", "default": "ADD",
+                "description": "Case-insensitive single-operation action."
+            },
+            "old_text": {
+                "type": "string", "description": "Exact existing bullet text required for single REPLACE/REMOVE."
+            },
+            "operations": {
+                "type": "array", "minItems": 1, "maxItems": 8,
+                "description": "Atomic MEMORY.md batch; do not combine with single-operation fields.",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "description": "Case-insensitive ADD, REPLACE, or REMOVE."},
+                        "category": {"type": "string"},
+                        "value": {"type": "string", "description": "Required for ADD/REPLACE; omit for REMOVE."},
+                        "old_text": {"type": "string", "description": "Required for REPLACE/REMOVE; omit for ADD."},
+                    },
+                    "required": ["action", "category"],
+                    "additionalProperties": False,
+                },
+            },
         },
-        "required": ["category", "fact"]
+        "additionalProperties": False,
     }
 )
-def update_project_memory(category: str, fact: str) -> str:
-    return project_memory_manager.update_fact(category=category, fact=fact)
+def update_project_memory(
+    category: Optional[str] = None,
+    fact: Optional[str] = None,
+    action: str = "ADD",
+    old_text: Optional[str] = None,
+    operations: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    return project_memory_manager.update_fact(
+        category=category, fact=fact, action=action, old_text=old_text, operations=operations
+    )

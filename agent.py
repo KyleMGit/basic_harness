@@ -204,8 +204,9 @@ You have access to tools that allow you to inspect the system, manage files, sea
 - **Complete CSV Exports**: Never reconstruct a complete CSV from query-preview rows or pass those rows to `write_file`. For complete database CSV requests, call `export_teradata_csv` or `export_impala_csv` with the validated SQL and report the returned manifest.
 
 ### Memory Evolution & Learning Protocol:
-- **Operator Preferences (USER.md)**: When the user expresses a personal preference, workflow habit, formatting requirement, or gives you a correction (e.g. "I prefer pytest", "don't use pip", "keep answers under 3 bullets"), immediately call `update_user_profile(category, preference)`.
-- **Project Architecture & Facts (MEMORY.md)**: When you discover new architectural facts, environment variables, server ports, or resolve recurring bug patterns, immediately call `update_project_memory(category, fact)`.
+- **Operator Preferences (USER.md)**: Compare durable preferences against every existing entry. A paraphrase is a no-op; a new preference is ADD; an explicit visible correction/refinement is REPLACE; an explicit retraction is REMOVE.
+- **Project Architecture & Facts (MEMORY.md)**: Apply the same reconciliation to stable verified project facts. Never save business rows, temporary results, one-off filters, credentials, or speculation.
+- **Bounded edits**: REPLACE/REMOVE must target exact existing bullet text. Consolidate only entries affected by an explicit visible refinement/supersession, preserving all relevant facts in the replacement. Never remove unmentioned or stale-looking entries for tidiness.
 
 ### Operator Profile & Preferences (USER.md):
 {user_profile}
@@ -556,14 +557,21 @@ Below is the catalog of learned project skills. When a task relates to any avail
         if not self.auto_learn_memory or self.read_only:
             return
 
-        print("\n[Memory Reflection] Reviewing this task (one opt-in provider call)...")
-
-        result = self.memory_extractor.extract_and_update(
-            client=self.client,
-            model=self.model,
-            messages=self.messages,
-            task_summary=task_summary
+        print(
+            "\n[Memory Reflection] Reviewing this task "
+            "(one call normally, up to 3 overflow recovery calls)..."
         )
+
+        try:
+            result = self.memory_extractor.extract_and_update(
+                client=self.client,
+                model=self.model,
+                messages=self.messages,
+                task_summary=task_summary
+            )
+        except Exception as exc:
+            print(f"\n[Memory Reflection] Error: unexpected reflection failure: {exc}; learning was not saved.")
+            return
         refreshed = False
         if result.get("user_updated"):
             print(f"\n[Memory Evolution] User preference recorded in USER.md: {result['user_updated']}")
@@ -572,9 +580,17 @@ Below is the catalog of learned project skills. When a task relates to any avail
             print(f"\n[Memory Evolution] Project fact recorded in MEMORY.md: {result['project_updated']}")
             refreshed = True
 
+        errors = result.get("errors") or []
+        for error in errors:
+            print(f"\n[Memory Reflection] Error: {error}")
+
+        attempts = result.get("attempts")
+        if isinstance(attempts, int) and attempts > 1:
+            print(f"\n[Memory Reflection] Completed after {attempts} provider calls (including capacity recovery).")
+
         if refreshed:
             self.refresh_system_prompt()
-        else:
+        elif not errors:
             print("[Memory Reflection] No safe durable updates applied.")
 
     def run_auto_skill_synthesis(self, task_summary: str):
@@ -1283,7 +1299,10 @@ def parse_args():
     parser.add_argument(
         "--auto-memory",
         action="store_true",
-        help="Opt in to one visible post-task provider call for memory reflection (costs time/tokens)."
+        help=(
+            "Opt in to visible post-task memory reflection: one provider call normally, "
+            "up to 3 overflow recovery calls (costs time/tokens)."
+        )
     )
     parser.add_argument(
         "--no-auto-skills",

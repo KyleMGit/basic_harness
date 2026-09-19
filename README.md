@@ -23,6 +23,7 @@ An open-source, terminal-native Python agent harness optimized for local models 
    - `USER.md`: Stores operator profile, communication style, technical background, and safety constraints (`<user_profile>`).
    - `MEMORY.md`: Stores project architecture facts, tech stack details, and environment conventions (`<project_memory>`).
    - Tools: `read_user_profile`, `update_user_profile`, `read_project_memory`, `update_project_memory`.
+   - Update tools retain legacy category/value ADD calls and also accept case-insensitive `ADD`, `REPLACE`, or `REMOVE`, exact `old_text` targets, and an atomic `operations` batch per store. Whole-bullet matching collapses whitespace and case-folds without discarding punctuation; ambiguous, unsafe, duplicate-producing, or over-budget batches leave the original file unchanged.
 3. **Session Resumption & Trajectory Continuity ([`storage.py`](file:///C:/Users/Owner/.gemini/antigravity/scratch/coding_agent/storage.py))**:
    - Pick up past sessions directly via `--resume <session_id>` or interactive `/resume <session_id>`.
    - View past session logs, dates, and step counts with `/sessions`.
@@ -180,7 +181,10 @@ receives the bounded original request as labelled context-only evidence, while S
 metadata is retained only when all observed sources are supported catalog sources.
 The call returns without waiting for shared-service preparation or inference. The owning agent applies
 valid results while connected; disconnected results are retained. `--auto-memory`
-remains synchronous and can still delay completion. See
+remains synchronous and can still delay completion. It uses one provider call
+normally and at most three additional calls only to recover typed USER.md or
+MEMORY.md capacity overflows; malformed, unsafe, provider, and other write
+failures are terminal. See
 [asynchronous skill review setup and recovery](docs/async_skill_review.md) for
 disabled launches, safe mode switching, service supervision and admission outcomes.
 
@@ -277,7 +281,7 @@ are not on the recognized read-only allowlist:
 | **`--auto-skills`** | | `False` | Opts in to bounded durable local enqueue. Requires `--profile` and one supervised host service using the same profile root, model and endpoint; returns without waiting for review inference. |
 | **`--quiet-skill-reviews`** | | `False` | Suppresses agent skill-review messages and intentionally acknowledges valid durable notices without displaying them. Does not enable or disable reviews. |
 | **`--skill-review-roster <path>`** | | `None` | Selects the backward-compatible static allowlist mode. The profile must be listed and agent model/endpoint must match the roster. Omit for automatic discovery. |
-| **`--auto-memory`** | | `False` | Opts in to a visible synchronous post-task memory reflection provider call; its latency/tokens and completion delay remain unchanged. |
+| **`--auto-memory`** | | `False` | Opts in to visible synchronous post-task memory reflection: one provider call normally, with up to 3 additional calls only for capacity-overflow recovery. Its latency/tokens and completion delay remain visible. |
 | **`--no-auto-skills`**| | `False` | Compatibility alias that disables `--auto-skills`. |
 | **`--no-auto-memory`**| | `False` | Compatibility alias that disables `--auto-memory`. |
 | **`--xml`** | | `False` | Switches from OpenAI JSON tool calling to Hermes XML `<tool_call>` syntax. |
@@ -303,9 +307,9 @@ are not on the recognized read-only allowlist:
 | **`load_skill` / `<skill_name>()`** | `name` | Reads instructions and workflow details for any learned project skill. |
 | **`save_skill`** | `name`, `description`, `instructions` | Creates a procedural workflow in the active profile's skill catalog. Direct calls are CREATE-only and refuse normalized-name collisions; a different normalized name is allowed regardless of content similarity. Only the owning agent can publish a review UPDATE after validating its eligible target and revision. |
 | **`read_user_profile`** | *(none)* | Reads operator profile from `USER.md`. |
-| **`update_user_profile`** | `category`, `preference` | Appends or updates preferences in `USER.md`. |
+| **`update_user_profile`** | `category`, `preference`, `action`, `old_text`, `operations` | Atomically ADDs, exact-target REPLACEs/REMOVEs, or applies a bounded per-`USER.md` batch; legacy category/preference calls remain ADDs. |
 | **`read_project_memory`** | *(none)* | Reads project architecture facts from `MEMORY.md`. |
-| **`update_project_memory`** | `category`, `fact` | Appends or updates technical facts in `MEMORY.md`. |
+| **`update_project_memory`** | `category`, `fact`, `action`, `old_text`, `operations` | Atomically ADDs, exact-target REPLACEs/REMOVEs, or applies a bounded per-`MEMORY.md` batch; legacy category/fact calls remain ADDs. |
 
 ### Optional database query drivers
 
